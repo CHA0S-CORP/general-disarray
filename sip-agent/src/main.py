@@ -27,7 +27,7 @@ from config import Config
 
 from tool_manager import ToolManager
 from llm_engine import create_llm_engine
-from sip_handler import SIPHandler, PlaylistPlayer, PJSUA_AVAILABLE
+from sip_handler import SIPHandler, PJSUA_AVAILABLE
 from audio_pipeline import LowLatencyAudioPipeline, StreamingResponsePipeline, LatencyMetrics
 
 logging.basicConfig(
@@ -128,10 +128,9 @@ class LowLatencySIPAssistant:
             
         logger.info("Media ready")
         
-        # Initialize playlist player
+        # Initialize playlist player through SIPHandler (thread-safe)
         if PJSUA_AVAILABLE and call.pj_call and call.pj_call.aud_med:
-            if not hasattr(call, 'stream_player') or call.stream_player is None:
-                call.stream_player = PlaylistPlayer(call.pj_call.aud_med)
+            call.stream_player = self.sip_handler.get_playlist_player(call)
                 
         # Play greeting (use cached if available)
         greeting = "Ready for commands"
@@ -426,7 +425,7 @@ class LowLatencySIPAssistant:
             self.conversation_history = []
             
             if PJSUA_AVAILABLE and call.pj_call and call.pj_call.aud_med:
-                call.stream_player = PlaylistPlayer(call.pj_call.aud_med)
+                call.stream_player = self.sip_handler.get_playlist_player(call)
                 
             await asyncio.sleep(0.5)
             self.audio_pipeline.vad.reset()

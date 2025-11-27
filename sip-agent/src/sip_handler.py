@@ -70,12 +70,20 @@ class CallInfo:
     playback_queue: deque = None
     media_ready: bool = False
     stream_player: Any = None  # PlaylistPlayer
+    # NEW: Ring buffer for real-time audio capture
+    audio_ring_buffer: deque = None
+    audio_ring_lock: Any = None
     
     def __post_init__(self):
         if self.audio_buffer is None:
             self.audio_buffer = deque(maxlen=1000)
         if self.playback_queue is None:
             self.playback_queue = deque()
+        if self.audio_ring_buffer is None:
+            # Ring buffer holds ~2 seconds of audio at 16kHz, 20ms chunks
+            self.audio_ring_buffer = deque(maxlen=100)
+        if self.audio_ring_lock is None:
+            self.audio_ring_lock = threading.Lock()
             
     @property
     def duration(self) -> float:
@@ -106,6 +114,8 @@ class SIPCall(pj.Call if PJSUA_AVAILABLE else object):
         self.aud_med: Any = None
         self.recorder: Any = None
         self.player: Any = None
+        self.audio_sink: Any = None  # AudioCaptureSink for file-based capture
+        self.direct_sink: Any = None  # DirectAudioCaptureSink if available
         
     def onCallState(self, prm):
         """Called when call state changes (PJSIP thread)."""
@@ -131,8 +141,9 @@ class SIPCall(pj.Call if PJSUA_AVAILABLE else object):
                mi.status == pj.PJSUA_CALL_MEDIA_ACTIVE:
                 
                 self.aud_med = self.getAudioMedia(mi.index)
+                sample_rate = self.handler.config.sample_rate
                 
-                # Set up recording
+                # Set up audio recording (file-based, reliable)
                 try:
                     import tempfile
                     fd, record_path = tempfile.mkstemp(suffix='.wav', prefix='sip_in_')
@@ -145,9 +156,36 @@ class SIPCall(pj.Call if PJSUA_AVAILABLE else object):
                     self.recorder.createRecorder(record_path)
                     self.aud_med.startTransmit(self.recorder)
                     
-                    logger.info(f"Recording to: {record_path}")
+                    # Create the capture helper for reading from the file
+                    if self.call_info:
+                        self.audio_sink = AudioCaptureSink(self.call_info, sample_rate)
+                    
+                    logger.info(f"Recording to: {record_path} at {sample_rate}Hz")
+                    
                 except Exception as e:
-                    logger.error(f"Failed to set up recording: {e}")
+                    logger.error(f"Failed to set up audio recording: {e}")
+                    import traceback
+                    traceback.print_exc()
+                
+                # Try direct capture if available (may not work on all builds)
+                if DIRECT_CAPTURE_AVAILABLE and self.call_info:
+                    try:
+                        self.direct_sink = DirectAudioCaptureSink(self.call_info, sample_rate)
+                        
+                        fmt = pj.MediaFormatAudio()
+                        fmt.type = pj.PJMEDIA_TYPE_AUDIO
+                        fmt.clockRate = sample_rate
+                        fmt.channelCount = 1
+                        fmt.bitsPerSample = 16
+                        fmt.frameTimeUsec = 20000  # 20ms
+                        
+                        self.direct_sink.createPort("direct_capture", fmt)
+                        self.aud_med.startTransmit(self.direct_sink)
+                        
+                        logger.info("Direct audio capture enabled")
+                    except Exception as e:
+                        logger.debug(f"Direct capture not available: {e}")
+                        self.direct_sink = None
                 
                 if self.call_info:
                     self.call_info.media_ready = True
@@ -156,6 +194,18 @@ class SIPCall(pj.Call if PJSUA_AVAILABLE else object):
     def _cleanup_media(self):
         """Clean up media resources (PJSIP thread only)."""
         try:
+            # Clean up direct audio capture sink (if used)
+            if self.direct_sink and self.aud_med:
+                try:
+                    self.aud_med.stopTransmit(self.direct_sink)
+                except:
+                    pass
+                self.direct_sink = None
+            
+            # Clean up file-based audio capture
+            # (AudioCaptureSink doesn't need stopTransmit - it reads from file)
+            self.audio_sink = None
+                
             if self.recorder and self.aud_med:
                 try:
                     self.aud_med.stopTransmit(self.recorder)
@@ -183,6 +233,130 @@ class SIPCall(pj.Call if PJSUA_AVAILABLE else object):
                 
         except Exception as e:
             logger.debug(f"Media cleanup error: {e}")
+
+
+# ============================================================================
+# Real-time Audio Capture Sink
+# ============================================================================
+
+class AudioCaptureSink:
+    """
+    Audio capture using a recorder + periodic file reading.
+    
+    PJSUA2's AudioMediaPort Python bindings can be unreliable,
+    so we use a hybrid approach:
+    1. Record to a WAV file
+    2. Periodically read new audio data from the file
+    3. Push chunks to a ring buffer for async processing
+    
+    This works reliably across different PJSUA2 builds.
+    """
+    
+    def __init__(self, call_info: CallInfo, sample_rate: int = 16000):
+        self.call_info = call_info
+        self.sample_rate = sample_rate
+        self._file_pos = 0
+        self._header_size = 44  # Standard WAV header size
+        self._frame_count = 0
+        self._last_read_time = 0
+        self._min_read_interval = 0.02  # 20ms minimum between reads
+        
+    def read_new_audio(self) -> Optional[bytes]:
+        """
+        Read any new audio data from the recording file.
+        Call this periodically from the PJSIP thread.
+        Returns None if no new data, or bytes of new audio.
+        """
+        if not self.call_info or not self.call_info.record_file:
+            return None
+            
+        now = time.time()
+        if now - self._last_read_time < self._min_read_interval:
+            return None
+        self._last_read_time = now
+            
+        try:
+            file_path = self.call_info.record_file
+            if not os.path.exists(file_path):
+                return None
+                
+            file_size = os.path.getsize(file_path)
+            
+            # Skip if file hasn't grown
+            if file_size <= self._file_pos:
+                return None
+                
+            # First read: skip header
+            if self._file_pos == 0:
+                self._file_pos = self._header_size
+                
+            # Read new data
+            with open(file_path, 'rb') as f:
+                f.seek(self._file_pos)
+                new_data = f.read(file_size - self._file_pos)
+                
+            if new_data:
+                self._file_pos = file_size
+                self._frame_count += 1
+                
+                # Push to ring buffer
+                with self.call_info.audio_ring_lock:
+                    self.call_info.audio_ring_buffer.append(new_data)
+                    
+                if self._frame_count % 50 == 0:
+                    logger.debug(f"Captured {len(new_data)} bytes (read #{self._frame_count})")
+                    
+                return new_data
+                
+        except Exception as e:
+            if "No such file" not in str(e):
+                logger.error(f"Audio read error: {e}")
+                
+        return None
+
+
+# Alternative: Direct AudioMediaPort approach (for newer PJSUA2 builds)
+if PJSUA_AVAILABLE:
+    try:
+        class DirectAudioCaptureSink(pj.AudioMediaPort):
+            """
+            Direct audio capture using PJSUA2 AudioMediaPort.
+            This may not work on all PJSUA2 Python builds.
+            """
+            
+            def __init__(self, call_info: CallInfo, sample_rate: int = 16000):
+                super().__init__()
+                self.call_info = call_info
+                self.sample_rate = sample_rate
+                self._frame_count = 0
+                
+            def onFrameRequested(self, frame):
+                """Called when PJSIP needs audio to send (outbound)."""
+                pass
+                
+            def onFrameReceived(self, frame):
+                """Called when audio frame is received from remote party."""
+                if not self.call_info or not frame.buf:
+                    return
+                    
+                try:
+                    audio_data = bytes(frame.buf)
+                    
+                    with self.call_info.audio_ring_lock:
+                        self.call_info.audio_ring_buffer.append(audio_data)
+                        
+                    self._frame_count += 1
+                    if self._frame_count % 100 == 0:
+                        logger.debug(f"Direct capture: {self._frame_count} frames")
+                        
+                except Exception as e:
+                    logger.error(f"Direct capture error: {e}")
+                    
+        DIRECT_CAPTURE_AVAILABLE = True
+    except Exception:
+        DIRECT_CAPTURE_AVAILABLE = False
+else:
+    DIRECT_CAPTURE_AVAILABLE = False
 
 
 # ============================================================================
@@ -485,6 +659,12 @@ class SIPHandler:
                 player.stop_all()
                 del self._playlist_players[call_id]
                 
+        # Poll audio capture for each active call
+        for call_id, call in list(self.active_calls.items()):
+            if call.audio_sink and call.call_info:
+                # Read new audio from file and push to ring buffer
+                call.audio_sink.read_new_audio()
+                
     def _execute_command(self, cmd: str, args: tuple, kwargs: dict) -> Any:
         """Execute a command (PJSIP thread only)."""
         try:
@@ -764,15 +944,63 @@ class SIPHandler:
             
     async def receive_audio(self, call_info: CallInfo, timeout: float = 0.1) -> Optional[bytes]:
         """
-        Receive audio from a call.
+        Receive audio from a call's ring buffer.
         
-        Note: In real implementation, this would read from the recorder.
-        For now, returns None to indicate no new audio.
+        Returns concatenated audio chunks if available, None if buffer is empty.
+        The ring buffer is populated by AudioCaptureSink.read_new_audio().
         """
-        # TODO: Implement proper audio capture
-        # This would involve reading from call_info.record_file
-        # or setting up a custom AudioMedia sink
+        if not call_info or not call_info.is_active:
+            return None
+            
+        # Ensure ring buffer is initialized
+        if not hasattr(call_info, 'audio_ring_buffer') or call_info.audio_ring_buffer is None:
+            await asyncio.sleep(timeout)
+            return None
+            
+        if not hasattr(call_info, 'audio_ring_lock') or call_info.audio_ring_lock is None:
+            await asyncio.sleep(timeout)
+            return None
+            
+        # Calculate expected chunk size for the timeout period
+        # At 16kHz, 20ms frames = 640 bytes per frame
+        # timeout of 0.03 = ~1-2 frames expected
+        
+        start_time = time.time()
+        collected = []
+        
+        while time.time() - start_time < timeout:
+            # Try to get audio from ring buffer
+            try:
+                with call_info.audio_ring_lock:
+                    if call_info.audio_ring_buffer:
+                        chunk = call_info.audio_ring_buffer.popleft()
+                        collected.append(chunk)
+                    else:
+                        break
+            except Exception as e:
+                logger.debug(f"Ring buffer read error: {e}")
+                break
+                    
+            # Small yield to prevent tight loop
+            await asyncio.sleep(0.001)
+            
+        if collected:
+            return b''.join(collected)
+            
+        # Wait a bit if nothing was collected
         await asyncio.sleep(timeout)
+        
+        # Try one more time after waiting
+        try:
+            with call_info.audio_ring_lock:
+                if call_info.audio_ring_buffer:
+                    chunks = list(call_info.audio_ring_buffer)
+                    call_info.audio_ring_buffer.clear()
+                    if chunks:
+                        return b''.join(chunks)
+        except Exception as e:
+            logger.debug(f"Final ring buffer read error: {e}")
+                    
         return None
         
     async def send_audio(self, call_info: CallInfo, audio_data: bytes):
@@ -795,50 +1023,3 @@ class SIPHandler:
             
         # Enqueue for playback
         player.enqueue_file(wav_path)
-
-
-# ============================================================================
-# Asterisk ARI Handler (Alternative)
-# ============================================================================
-
-class AsteriskARIHandler:
-    """Alternative SIP handler using Asterisk ARI."""
-    
-    def __init__(self, config: Config, on_call_callback: Callable):
-        self.config = config
-        self.on_call_callback = on_call_callback
-        self.ari_url = os.getenv("ARI_URL", "http://localhost:8088")
-        self.ari_user = os.getenv("ARI_USER", "asterisk")
-        self.ari_password = os.getenv("ARI_PASSWORD", "asterisk")
-        self.app_name = "sip-ai-assistant"
-        
-    async def start(self):
-        """Connect to Asterisk ARI."""
-        try:
-            import ari
-            self.client = ari.connect(
-                self.ari_url,
-                self.ari_user,
-                self.ari_password
-            )
-            self.client.on_channel_event('StasisStart', self._on_stasis_start)
-            self.client.run(apps=self.app_name)
-        except ImportError:
-            logger.warning("ari-py not installed")
-            
-    def _on_stasis_start(self, channel, event):
-        """Handle new channel."""
-        asyncio.run_coroutine_threadsafe(
-            self._handle_channel(channel),
-            asyncio.get_event_loop()
-        )
-        
-    async def _handle_channel(self, channel):
-        """Handle incoming channel."""
-        call_info = CallInfo(
-            call_id=channel.id,
-            remote_uri=channel.json.get('caller', {}).get('number', 'unknown'),
-            is_active=True,
-            start_time=time.time()
-        )
-        await self.on_call_callback(call_info)
