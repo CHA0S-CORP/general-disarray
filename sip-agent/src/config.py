@@ -126,6 +126,8 @@ TOOLS (format: [TOOL:NAME:params]):
   Optional: destination=NUMBER (only if calling a different number)
 - HANGUP: [TOOL:HANGUP]
 
+use tools when appropriate to help the user. Phrases like goodbye or thank you often indicate the end of the call.
+
 Be helpful and concise."""
 
 

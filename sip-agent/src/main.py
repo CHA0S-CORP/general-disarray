@@ -318,6 +318,11 @@ class SIPAIAssistant:
         self._processing = True
         
         try:
+            # Play acknowledgment so user knows we heard them
+            ack = self.get_random_acknowledgment()
+            logger.info(f"Assistant: {ack}")
+            await self._speak(ack)
+            
             response = await self._generate_response(text)
             
             if response:
