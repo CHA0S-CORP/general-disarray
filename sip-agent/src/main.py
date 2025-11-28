@@ -400,17 +400,40 @@ class SIPAIAssistant:
         
     async def make_outbound_call(self, uri: str, message: str):
         """Make an outbound call and play a message, then start interactive session."""
-        # Format URI if it's just an extension/number
+        import re
+        
+        # Parse SIP URI - handle formats like:
+        # "Display Name" <sip:user@domain>
+        # <sip:user@domain>
+        # sip:user@domain
+        # user@domain
+        # extension
+        
+        original_uri = uri
+        
+        # Extract URI from angle brackets if present (e.g., "Name" <sip:420@domain>)
+        angle_match = re.search(r'<(sip:[^>]+)>', uri)
+        if angle_match:
+            uri = angle_match.group(1)
+        elif '<' in uri and '>' in uri:
+            # Try to extract anything in angle brackets
+            angle_match = re.search(r'<([^>]+)>', uri)
+            if angle_match:
+                uri = angle_match.group(1)
+                if not uri.startswith('sip:'):
+                    uri = f"sip:{uri}"
+        
+        # If still no sip: prefix, build the URI
         if not uri.startswith('sip:'):
-            # Strip any existing sip: prefix or angle brackets
-            clean_uri = uri.replace('<', '').replace('>', '').replace('sip:', '')
+            # Strip any remaining angle brackets or quotes
+            clean_uri = uri.replace('<', '').replace('>', '').replace('"', '').strip()
             # If it doesn't have an @, add the domain
             if '@' not in clean_uri:
                 uri = f"sip:{clean_uri}@{self.config.sip_domain}"
             else:
                 uri = f"sip:{clean_uri}"
                 
-        logger.info(f"Making outbound call to {uri}")
+        logger.info(f"Making outbound call to {uri} (from: {original_uri})")
         try:
             call_info = await self.sip_handler.make_call(uri)
             if call_info:
