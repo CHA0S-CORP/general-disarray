@@ -94,13 +94,24 @@ class SIPAIAssistant:
             "Sorry, can you say that again?"
         ]
         
+        self.followup_phrases = [
+            "Is there anything else I can help you with?",
+            "Can I help you with anything else?",
+            "Is there something else I can assist with?",
+            "Anything else I can do for you?",
+            "What else can I help you with?",
+            "Is there anything else?",
+            "Do you need help with anything else?"
+        ]
+        
         # Combined list for pre-caching
         self._phrases_to_cache = (
             self.acknowledgments + 
             self.thinking_phrases + 
             self.greeting_phrases + 
             self.goodbye_phrases +
-            self.error_phrases
+            self.error_phrases +
+            self.followup_phrases
         )
         
     async def start(self):
@@ -177,6 +188,10 @@ class SIPAIAssistant:
     def get_random_error(self) -> str:
         """Get a random error/retry phrase."""
         return random.choice(self.error_phrases)
+        
+    def get_random_followup(self) -> str:
+        """Get a random follow-up phrase."""
+        return random.choice(self.followup_phrases)
         
     async def _on_call_received(self, call_info):
         """Handle incoming call."""
@@ -314,7 +329,7 @@ class SIPAIAssistant:
                     "content": response
                 })
                 
-                # Synthesize and play
+                # Synthesize and play response
                 await self._speak(response)
                 
         except Exception as e:
@@ -379,7 +394,7 @@ class SIPAIAssistant:
         self._processing = False
         
     async def make_outbound_call(self, uri: str, message: str):
-        """Make an outbound call and play a message."""
+        """Make an outbound call and play a message, then start interactive session."""
         # Format URI if it's just an extension/number
         if not uri.startswith('sip:'):
             # Strip any existing sip: prefix or angle brackets
@@ -412,16 +427,52 @@ class SIPAIAssistant:
                 # Small delay after answer for audio to stabilize
                 await asyncio.sleep(1)
                 
-                # Play message
+                # Play the callback message
                 audio = await self.audio_pipeline.synthesize(message)
                 if audio:
                     await self.sip_handler.send_audio(call_info, audio)
                     # Wait for audio to play (estimate based on audio length)
                     audio_duration = len(audio) / (self.config.sample_rate * 2)
-                    await asyncio.sleep(audio_duration + 1)
+                    await asyncio.sleep(audio_duration + 0.5)
+
+                # Now start interactive session
+                try:
+                    # Cancel any existing audio loop
+                    if self._audio_loop_task and not self._audio_loop_task.done():
+                        self._audio_loop_task.cancel()
+                        try:
+                            await self._audio_loop_task
+                        except asyncio.CancelledError:
+                            pass
                     
-                # Hang up
-                await self.sip_handler.hangup_call(call_info)
+                    logger.info(f"Starting interactive session with: {uri}")
+                    
+                    self.current_call = call_info
+                    self.conversation_history = []
+                    self._processing = False
+                    
+                    # Ask if they need anything else
+                    followup = self.get_random_followup()
+                    logger.info(f"Assistant: {followup}")
+                    await self._speak(followup)
+                    
+                    # Start listening loop (runs until call ends)
+                    logger.info("Listening...")
+                    self._audio_loop_task = asyncio.create_task(self._audio_processing_loop())
+                    
+                    # Wait for the audio loop to complete (call ends)
+                    await self._audio_loop_task
+                    
+                except asyncio.CancelledError:
+                    logger.info("Outbound call session cancelled")
+                except Exception as e:
+                    logger.error(f"Error in interactive session: {e}", exc_info=True)
+                finally:
+                    # Clean up when session ends
+                    if call_info.is_active:
+                        await self.sip_handler.hangup_call(call_info)
+                    self.current_call = None
+                    
                 logger.info(f"Outbound call to {uri} completed")
             else:
                 logger.error(f"Failed to connect outbound call to {uri}")

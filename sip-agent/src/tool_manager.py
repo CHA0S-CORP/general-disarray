@@ -131,24 +131,25 @@ class TimerTool(BaseTool):
 class CallbackTool(BaseTool):
     """
     Schedule a callback call.
+    If no number is specified, calls back the current caller.
     """
     
     name = "CALLBACK"
-    description = "Schedule a callback call"
+    description = "Schedule a callback call. If no destination specified, calls back the current caller."
     
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
-        # Note: Actual execution for LLM calls is often intercepted by ToolManager
-        # This fallback logic ensures manual calls still work.
         delay = int(params.get('delay', 60))
         message = params.get('message', 'This is your scheduled callback')
         uri = params.get('uri')
-        destination = params.get('destination') # Handle alternative param name
+        destination = params.get('destination')
         
+        # Use provided URI/destination, or fall back to caller's number
         target = uri or destination
         
-        # Get caller URI if not specified
+        # If no target specified, use the current caller's number
         if not target and self.assistant.current_call:
-            target = self.assistant.current_call.remote_uri
+            target = getattr(self.assistant.current_call, 'remote_uri', None)
+            logger.info(f"No callback number specified, using caller: {target}")
             
         if not target:
             return ToolResult(
@@ -325,11 +326,11 @@ class ToolManager:
             
         try:
             # --- INTERCEPT CALLBACK TOOL ---
-            # We handle this manually to ensure 'destination' is passed correctly
+            # Handle callback manually to ensure caller's number is used by default
             if tool_name == "CALLBACK":
                 delay = int(tool_call.params.get("delay", 60))
                 message = tool_call.params.get("message", "This is your scheduled callback")
-                destination = tool_call.params.get("destination") 
+                destination = tool_call.params.get("destination") or tool_call.params.get("uri")
                 
                 # Sanitize destination
                 if destination:
@@ -339,6 +340,7 @@ class ToolManager:
                 if not destination or destination.upper() == "CALLER_NUMBER":
                     if self.assistant.current_call:
                         destination = getattr(self.assistant.current_call, 'remote_uri', None)
+                        logger.info(f"Using caller's number for callback: {destination}")
                     if not destination:
                         return ToolResult(
                             status=ToolStatus.FAILED,
@@ -347,7 +349,7 @@ class ToolManager:
                 
                 logger.info(f"Processing CALLBACK: delay={delay}, dest={destination}")
                 
-                # Call App Logic directly
+                # Schedule the callback
                 await self.assistant.schedule_callback(delay, message, destination)
                 
                 return ToolResult(

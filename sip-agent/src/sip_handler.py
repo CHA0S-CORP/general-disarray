@@ -634,6 +634,27 @@ class SIPHandler:
                 # Process our command queue
                 self._process_commands()
                 
+            # Cleanup in PJSIP thread (after loop exits)
+            logger.info("PJSIP thread shutting down...")
+            try:
+                # Hangup all calls
+                for call in list(self.active_calls.values()):
+                    try:
+                        prm = pj.CallOpParam()
+                        call.hangup(prm)
+                    except:
+                        pass
+                self.active_calls.clear()
+                
+                # Destroy endpoint
+                if self.endpoint:
+                    self.endpoint.libDestroy()
+                    self.endpoint = None
+                    
+                logger.info("PJSIP cleanup complete")
+            except Exception as e:
+                logger.error(f"PJSIP cleanup error: {e}")
+                
         except Exception as e:
             logger.error(f"PJSIP thread error: {e}")
             import traceback
@@ -671,28 +692,20 @@ class SIPHandler:
         
     async def stop(self):
         """Stop the SIP handler."""
+        logger.info("Stopping SIP handler...")
         self._running = False
         
-        # Stop all playlist players
-        for player in self._playlist_players.values():
-            player.stop_all()
-        self._playlist_players.clear()
+        # Stop all playlist players (thread-safe)
+        with self._playlist_lock:
+            for player in self._playlist_players.values():
+                player.stop_all()
+            self._playlist_players.clear()
         
-        # Hangup calls
-        for call in list(self.active_calls.values()):
-            try:
-                await self.hangup_call(call.call_info)
-            except:
-                pass
-                
-        if self.endpoint:
-            try:
-                self.endpoint.libDestroy()
-            except:
-                pass
-                
+        # Wait for PJSIP thread to finish its cleanup
         if self._pj_thread:
             self._pj_thread.join(timeout=5)
+            if self._pj_thread.is_alive():
+                logger.warning("PJSIP thread did not exit cleanly")
             
         logger.info("SIP handler stopped")
         
@@ -864,4 +877,3 @@ class SIPHandler:
             
         # Enqueue for playback
         player.enqueue_file(wav_path)
-

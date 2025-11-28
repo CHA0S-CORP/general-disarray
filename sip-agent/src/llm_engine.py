@@ -196,7 +196,7 @@ class LLMEngine:
         elif "call" in last_user_msg and "back" in last_user_msg:
             return "I'll call you back. [TOOL:CALLBACK:delay=60,message=Callback as requested]"
         elif "bye" in last_user_msg or "goodbye" in last_user_msg:
-            return "Goodbye! Have a great day!"
+            return "Goodbye! Have a great day! [TOOL:HANGUP]"
         elif "help" in last_user_msg:
             return "I can help you with timers, reminders, and callbacks. What would you like me to do?"
         else:
