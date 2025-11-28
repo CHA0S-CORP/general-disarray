@@ -637,18 +637,49 @@ class SIPHandler:
             # Cleanup in PJSIP thread (after loop exits)
             logger.info("PJSIP thread shutting down...")
             try:
-                # Hangup all calls
+                # Hangup all calls first
                 for call in list(self.active_calls.values()):
                     try:
+                        # Clear the call_info reference to break circular refs
+                        if hasattr(call, 'call_info') and call.call_info:
+                            call.call_info.pj_call = None
+                            call.call_info = None
                         prm = pj.CallOpParam()
                         call.hangup(prm)
                     except:
                         pass
+                
+                # Process events to let hangups complete
+                for _ in range(10):
+                    try:
+                        self.endpoint.libHandleEvents(100)
+                    except:
+                        break
+                
+                # Clear call references before destroying library
                 self.active_calls.clear()
+                
+                # Delete account before destroying library
+                if self.account:
+                    try:
+                        self.account.shutdown()
+                    except:
+                        pass
+                    self.account = None
+                
+                # Process remaining events
+                for _ in range(5):
+                    try:
+                        self.endpoint.libHandleEvents(50)
+                    except:
+                        break
                 
                 # Destroy endpoint
                 if self.endpoint:
-                    self.endpoint.libDestroy()
+                    try:
+                        self.endpoint.libDestroy()
+                    except:
+                        pass
                     self.endpoint = None
                     
                 logger.info("PJSIP cleanup complete")
@@ -701,9 +732,12 @@ class SIPHandler:
                 player.stop_all()
             self._playlist_players.clear()
         
+        # Give PJSIP thread time to notice the flag and start cleanup
+        await asyncio.sleep(0.2)
+        
         # Wait for PJSIP thread to finish its cleanup
         if self._pj_thread:
-            self._pj_thread.join(timeout=5)
+            self._pj_thread.join(timeout=10)
             if self._pj_thread.is_alive():
                 logger.warning("PJSIP thread did not exit cleanly")
             

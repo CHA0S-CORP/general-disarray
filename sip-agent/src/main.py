@@ -147,6 +147,17 @@ class SIPAIAssistant:
         logger.info("Stopping...")
         self.running = False
         
+        # Cancel audio processing loop if running
+        if self._audio_loop_task and not self._audio_loop_task.done():
+            self._audio_loop_task.cancel()
+            try:
+                await self._audio_loop_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Clear current call reference
+        self.current_call = None
+        
         await self.tool_manager.stop()
         await self.sip_handler.stop()
         await self.audio_pipeline.stop()
