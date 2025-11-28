@@ -1,11 +1,11 @@
 """
-Low-Latency Audio Pipeline with Piper TTS
-==========================================
-All ML inference offloaded to dedicated API services:
-- Whisper API (speaches/faster-whisper-server) for STT
-- Piper TTS via Wyoming protocol for TTS
+Low-Latency Audio Pipeline with Speaches (Unified STT + TTS)
+=============================================================
+All ML inference offloaded to a single Speaches API server:
+- Whisper API for STT (OpenAI-compatible /v1/audio/transcriptions)
+- Piper/Kokoro for TTS (OpenAI-compatible /v1/audio/speech)
 
-Piper is extremely fast - typically < 100ms for short phrases.
+This simplifies deployment to a single ML service container.
 """
 
 import asyncio
@@ -153,17 +153,18 @@ class FastVoiceActivityDetector:
 
 
 # ============================================================================
-# Whisper API Client (OpenAI-compatible)
+# Whisper API Client (OpenAI-compatible) - via Speaches
 # ============================================================================
 
 class WhisperAPIClient:
     """
     Whisper API client using OpenAI-compatible endpoints.
+    Uses Speaches server for transcription.
     """
     
     def __init__(self, config: Config):
         self.config = config
-        self.base_url = config.whisper_api_url.rstrip('/')
+        self.base_url = config.speaches_api_url.rstrip('/')
         self.model = config.whisper_model
         self.language = config.whisper_language
         self.client: Optional[httpx.AsyncClient] = None
@@ -177,7 +178,7 @@ class WhisperAPIClient:
             response = await self.client.get(f"{self.base_url}/health")
             if response.status_code == 200:
                 self.available = True
-                logger.info(f"Whisper API available at {self.base_url}")
+                logger.info(f"Whisper API (Speaches) available at {self.base_url}")
             else:
                 logger.warning(f"Whisper API returned status {response.status_code}")
         except Exception as e:
@@ -235,62 +236,63 @@ class WhisperAPIClient:
 
 
 # ============================================================================
-# Piper TTS Client (Wyoming Protocol)
+# Speaches TTS Client (OpenAI-compatible /v1/audio/speech)
 # ============================================================================
 
-class PiperClient:
+class SpeachesTTSClient:
     """
-    Piper TTS client using Wyoming protocol with the wyoming library.
+    TTS client using Speaches OpenAI-compatible API.
     
-    Piper outputs 22050Hz 16-bit mono audio by default.
+    Uses the /v1/audio/speech endpoint with Piper or Kokoro models.
+    Returns audio in the configured format (wav by default).
     """
     
+    # Sample rates for different TTS backends
     PIPER_SAMPLE_RATE = 22050
+    KOKORO_SAMPLE_RATE = 24000
     
     def __init__(self, config: Config):
         self.config = config
-        self.host = config.piper_host
-        self.port = config.piper_port
-        self.voice = config.piper_voice
+        self.base_url = config.speaches_api_url.rstrip('/')
+        self.model = config.tts_model
+        self.voice = config.tts_voice
+        self.response_format = config.tts_response_format
+        self.speed = config.tts_speed
         self.available = False
         
         # Audio cache for common phrases
         self.audio_cache: dict = {}
         self.cache_enabled = True
         
-        # Wyoming imports
-        self._wyoming_available = False
-        try:
-            from wyoming.client import AsyncClient
-            from wyoming.tts import Synthesize
-            from wyoming.audio import AudioChunk
-            self._wyoming_available = True
-        except ImportError:
-            logger.warning("wyoming library not available")
+        # HTTP client
+        self.client: Optional[httpx.AsyncClient] = None
+        
+        # Determine expected sample rate based on model
+        if 'kokoro' in self.model.lower():
+            self.tts_sample_rate = self.KOKORO_SAMPLE_RATE
+        else:
+            self.tts_sample_rate = self.PIPER_SAMPLE_RATE
         
     async def initialize(self):
-        """Test connection to Piper."""
-        if not self._wyoming_available:
-            logger.error("Wyoming library not installed")
-            return
-            
+        """Test connection to Speaches TTS API."""
+        self.client = httpx.AsyncClient(timeout=60.0)
+        
         try:
-            from wyoming.client import AsyncClient
-            
-            uri = f"tcp://{self.host}:{self.port}"
-            async with AsyncClient.from_uri(uri) as client:
-                # Connection successful
-                pass
+            # Test the health endpoint
+            response = await self.client.get(f"{self.base_url}/health")
+            if response.status_code == 200:
+                self.available = True
+                logger.info(f"Speaches TTS available at {self.base_url}")
+                logger.info(f"TTS model: {self.model}, voice: {self.voice}")
                 
-            self.available = True
-            logger.info(f"Piper TTS available at {self.host}:{self.port}")
-            
-            # Pre-cache common phrases
-            if self.cache_enabled:
-                await self._precache_phrases()
+                # Pre-cache common phrases
+                if self.cache_enabled:
+                    await self._precache_phrases()
+            else:
+                logger.warning(f"Speaches TTS health check failed: {response.status_code}")
                 
         except Exception as e:
-            logger.warning(f"Piper TTS not available: {e}")
+            logger.warning(f"Speaches TTS not available: {e}")
             self.available = False
             
     async def _precache_phrases(self):
@@ -308,7 +310,7 @@ class PiperClient:
                 audio = await self._synthesize_raw(phrase)
                 if audio:
                     # Resample to target rate
-                    audio = self._resample(audio, self.PIPER_SAMPLE_RATE, self.config.sample_rate)
+                    audio = self._resample(audio, self.tts_sample_rate, self.config.sample_rate)
                     self.audio_cache[phrase.lower()] = audio
             except Exception as e:
                 logger.warning(f"Failed to cache '{phrase}': {e}")
@@ -316,8 +318,9 @@ class PiperClient:
         logger.info(f"Cached {len(self.audio_cache)} phrases")
         
     async def close(self):
-        """Close client (no persistent connection)."""
-        pass
+        """Close the HTTP client."""
+        if self.client:
+            await self.client.aclose()
         
     def get_cached(self, text: str) -> Optional[bytes]:
         """Get pre-cached audio if available."""
@@ -325,50 +328,58 @@ class PiperClient:
         
     async def _synthesize_raw(self, text: str) -> bytes:
         """
-        Synthesize text using Wyoming protocol with wyoming library.
+        Synthesize text using Speaches TTS API (OpenAI-compatible).
         """
-        if not self.available or not self._wyoming_available:
+        if not self.available or not self.client:
             return b''
             
         try:
-            from wyoming.client import AsyncClient
-            from wyoming.tts import Synthesize
-            from wyoming.audio import AudioChunk
+            # Build request payload (OpenAI-compatible format)
+            payload = {
+                "model": self.model,
+                "voice": self.voice,
+                "input": text,
+                "response_format": self.response_format,
+                "speed": self.speed
+            }
             
-            uri = f"tcp://{self.host}:{self.port}"
-            audio_chunks = []
+            response = await self.client.post(
+                f"{self.base_url}/v1/audio/speech",
+                json=payload,
+                timeout=30.0
+            )
             
-            async with AsyncClient.from_uri(uri) as client:
-                # Send synthesize request
-                await client.write_event(Synthesize(text=text).event())
+            if response.status_code == 200:
+                audio_data = response.content
                 
-                # Read audio chunks
-                while True:
-                    event = await asyncio.wait_for(
-                        client.read_event(),
-                        timeout=30.0
-                    )
+                # If response is WAV, extract raw PCM data
+                if self.response_format == "wav" and audio_data[:4] == b'RIFF':
+                    audio_data = self._extract_wav_data(audio_data)
                     
-                    if event is None:
-                        break
-                        
-                    if event.type == "audio-stop":
-                        break
-                        
-                    if event.type == "audio-chunk":
-                        chunk = AudioChunk.from_event(event)
-                        audio_chunks.append(chunk.audio)
-                        
-            if audio_chunks:
-                return b''.join(audio_chunks)
-            return b''
-            
+                return audio_data
+            else:
+                logger.error(f"TTS API error: {response.status_code} - {response.text}")
+                return b''
+                
         except asyncio.TimeoutError:
-            logger.warning("Piper response timeout")
+            logger.warning("TTS response timeout")
             return b''
         except Exception as e:
-            logger.error(f"Piper synthesis error: {e}")
+            logger.error(f"TTS synthesis error: {e}")
             return b''
+            
+    def _extract_wav_data(self, wav_bytes: bytes) -> bytes:
+        """Extract raw PCM data from WAV file, also detect sample rate."""
+        try:
+            wav_buffer = io.BytesIO(wav_bytes)
+            with wave.open(wav_buffer, 'rb') as wav:
+                # Update sample rate from actual file
+                self.tts_sample_rate = wav.getframerate()
+                return wav.readframes(wav.getnframes())
+        except Exception as e:
+            logger.warning(f"Failed to extract WAV data: {e}")
+            # Return as-is if extraction fails
+            return wav_bytes
             
     async def synthesize(self, text: str) -> bytes:
         """Synthesize with cache check and resampling."""
@@ -379,25 +390,26 @@ class PiperClient:
             return cached
             
         if not self.available:
-            logger.warning("Piper not available")
+            logger.warning("Speaches TTS not available")
             return b''
             
         start = time.time()
         audio = await self._synthesize_raw(text)
         
         if audio:
-            # Resample from Piper's 22050Hz to target rate (usually 16000Hz)
-            audio = self._resample(audio, self.PIPER_SAMPLE_RATE, self.config.sample_rate)
+            # Resample to target rate (usually 16000Hz for SIP)
+            audio = self._resample(audio, self.tts_sample_rate, self.config.sample_rate)
             
             elapsed = (time.time() - start) * 1000
-            logger.info(f"Piper TTS: {elapsed:.0f}ms for '{text[:30]}...'")
+            logger.info(f"Speaches TTS: {elapsed:.0f}ms for '{text[:30]}...'")
             
         return audio
         
     async def synthesize_stream(self, text: str) -> AsyncGenerator[bytes, None]:
         """
-        Stream synthesis - Piper is fast enough that we can just
-        synthesize the whole thing and yield it in chunks.
+        Stream synthesis - synthesize whole thing and yield in chunks.
+        
+        Note: Speaches may support true streaming in future versions.
         """
         audio = await self.synthesize(text)
         
@@ -430,18 +442,18 @@ class PiperClient:
 
 
 # ============================================================================
-# Optimized Audio Pipeline (API-based)
+# Optimized Audio Pipeline (API-based with Speaches)
 # ============================================================================
 
 class LowLatencyAudioPipeline:
     """
-    Low-latency audio pipeline using API-based STT and Piper TTS.
+    Low-latency audio pipeline using Speaches for both STT and TTS.
     
     Target latencies:
     - STT: < 300ms (via Whisper API)
     - LLM TTFT: < 500ms  
-    - TTS: < 100ms (Piper is very fast)
-    - Total: < 900ms
+    - TTS: < 150ms (Piper via Speaches)
+    - Total: < 950ms
     """
     
     def __init__(self, config: Config):
@@ -450,7 +462,7 @@ class LowLatencyAudioPipeline:
         # Components
         self.vad = FastVoiceActivityDetector(config)
         self.stt = WhisperAPIClient(config)
-        self.tts = PiperClient(config)
+        self.tts = SpeachesTTSClient(config)
         
         # Audio buffer
         self.audio_buffer = bytearray()
@@ -475,14 +487,14 @@ class LowLatencyAudioPipeline:
         logger.info(f"Pipeline ready in {load_time:.0f}ms")
         
         if self.stt.available:
-            logger.info(f"Whisper API ready at {self.config.whisper_api_url}")
+            logger.info(f"Whisper API ready at {self.config.speaches_api_url}")
         else:
             logger.warning("Whisper API not available")
             
         if self.tts.available:
-            logger.info(f"Piper TTS ready, {len(self.tts.audio_cache)} phrases cached")
+            logger.info(f"Speaches TTS ready, {len(self.tts.audio_cache)} phrases cached")
         else:
-            logger.warning("Piper TTS not available")
+            logger.warning("Speaches TTS not available")
             
     async def stop(self):
         """Cleanup."""

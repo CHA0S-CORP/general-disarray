@@ -3,8 +3,7 @@
 SIP AI Assistant - API-based Architecture
 ==========================================
 All ML inference offloaded to dedicated services:
-- Whisper API for STT
-- Piper for TTS
+- Speaches API for STT (Whisper) and TTS (Piper/Kokoro)
 - vLLM for LLM
 
 This container is lightweight - just orchestration.
@@ -222,65 +221,50 @@ class SIPAIAssistant:
         try:
             logger.info(f"Playing greeting: {greeting}")
             # This should hit the cache since we pre-cached it
-            audio = await asyncio.wait_for(
-                self.audio_pipeline.synthesize(greeting),
-                timeout=10.0
-            )
+            audio = await self.audio_pipeline.synthesize(greeting)
             if audio:
-                logger.info(f"Got audio: {len(audio)} bytes")
                 await self._play_audio(audio)
-            else:
-                logger.warning("TTS returned no audio for greeting")
-        except asyncio.TimeoutError:
-            logger.warning("Greeting TTS timed out")
         except Exception as e:
-            logger.error(f"Greeting error: {e}", exc_info=True)
+            logger.error(f"Error playing greeting: {e}")
             
     async def _audio_processing_loop(self):
         """Main audio processing loop."""
         logger.info("Audio processing loop started")
         
-        # Wait for media to be ready
-        await asyncio.sleep(0.5)
-        
-        last_position = 0
-        
-        while self.running and self.current_call and getattr(self.current_call, 'is_active', False):
+        while self.running and self.current_call:
             try:
-                # Check if we have a recording file
-                record_file = getattr(self.current_call, 'record_file', None)
-                
-                if record_file and os.path.exists(record_file):
-                    try:
-                        # Read new audio from recording
-                        with open(record_file, 'rb') as f:
-                            f.seek(0, 2)  # End of file
-                            current_size = f.tell()
+                # Check call state
+                if not getattr(self.current_call, 'is_active', False):
+                    logger.info("Call ended, stopping audio loop")
+                    break
+                    
+                # Wait for media to be ready
+                if not getattr(self.current_call, 'media_ready', False):
+                    await asyncio.sleep(0.1)
+                    continue
+                    
+                try:
+                    # Try to receive audio
+                    audio_chunk = await self.sip_handler.receive_audio(
+                        self.current_call, 
+                        timeout=0.1
+                    )
+                    
+                    if audio_chunk:
+                        # Check for barge-in
+                        if self._processing and self.audio_pipeline.has_speech(audio_chunk):
+                            logger.info("Barge-in detected")
+                            await self._handle_barge_in()
                             
-                            if current_size > last_position + 3200:  # At least 100ms of audio
-                                f.seek(last_position)
-                                audio_chunk = f.read(current_size - last_position)
-                                last_position = current_size
-                                
-                                # Skip WAV header on first read
-                                if last_position < 100:
-                                    audio_chunk = audio_chunk[44:] if len(audio_chunk) > 44 else audio_chunk
-                                    
-                                if audio_chunk:
-                                    # Check for barge-in
-                                    if self._processing and self.audio_pipeline.has_speech(audio_chunk):
-                                        logger.info("Barge-in detected")
-                                        await self._handle_barge_in()
-                                        
-                                    # Process through VAD/STT
-                                    transcription = await self.audio_pipeline.process_audio(audio_chunk)
-                                    
-                                    if transcription:
-                                        await self._handle_transcription(transcription)
-                                        
-                    except Exception as e:
-                        logger.debug(f"Audio read error: {e}")
+                        # Process through VAD/STT
+                        transcription = await self.audio_pipeline.process_audio(audio_chunk)
                         
+                        if transcription:
+                            await self._handle_transcription(transcription)
+                            
+                except Exception as e:
+                    logger.debug(f"Audio read error: {e}")
+                    
                 await asyncio.sleep(0.05)  # 50ms polling interval
                     
             except Exception as e:

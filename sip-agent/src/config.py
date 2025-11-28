@@ -1,9 +1,8 @@
 """
-Low-Latency Configuration with Piper TTS
-=========================================
+Low-Latency Configuration with Speaches (Unified STT + TTS)
+============================================================
 All ML inference offloaded to dedicated API services:
-- Whisper API for STT
-- Piper for TTS (fast, local)
+- Speaches API for both STT (Whisper) and TTS (Piper/Kokoro)
 - vLLM for LLM
 """
 
@@ -49,12 +48,26 @@ class Config:
     silence_duration_ms: int = field(default_factory=lambda: int(os.getenv("SILENCE_TIMEOUT_MS", "500")))
     
     # ===================
-    # Whisper API Configuration (STT)
+    # Speaches API Configuration (Unified STT + TTS)
     # ===================
-    whisper_api_url: str = field(default_factory=lambda: os.getenv("WHISPER_API_URL", "http://localhost:8001"))
+    speaches_api_url: str = field(default_factory=lambda: os.getenv("SPEACHES_API_URL", "http://localhost:8001"))
+    
+    # STT (Whisper) settings
     whisper_model: str = field(default_factory=lambda: os.getenv("WHISPER_MODEL", "Systran/faster-distil-whisper-small.en"))
     whisper_language: str = field(default_factory=lambda: os.getenv("WHISPER_LANGUAGE", "en"))
     whisper_response_format: str = "json"
+    
+    # TTS settings (Piper/Kokoro via Speaches)
+    tts_model: str = field(default_factory=lambda: os.getenv("TTS_MODEL", "rhasspy/piper-voices"))
+    tts_voice: str = field(default_factory=lambda: os.getenv("TTS_VOICE", "en_US-lessac-medium"))
+    tts_response_format: str = field(default_factory=lambda: os.getenv("TTS_RESPONSE_FORMAT", "wav"))
+    tts_speed: float = field(default_factory=lambda: float(os.getenv("TTS_SPEED", "1.0")))
+    
+    # Legacy compatibility aliases
+    @property
+    def whisper_api_url(self) -> str:
+        """Alias for backward compatibility."""
+        return self.speaches_api_url
     
     # ===================
     # LLM Configuration
@@ -70,13 +83,6 @@ class Config:
     llm_top_p: float = 0.85
     
     max_conversation_turns: int = 10
-    
-    # ===================
-    # Piper TTS Configuration
-    # ===================
-    piper_host: str = field(default_factory=lambda: os.getenv("PIPER_HOST", "localhost"))
-    piper_port: int = field(default_factory=lambda: int(os.getenv("PIPER_PORT", "10200")))
-    piper_voice: str = field(default_factory=lambda: os.getenv("PIPER_VOICE", "en_US-lessac-medium"))
     
     # ===================
     # Tools
