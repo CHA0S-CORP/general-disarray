@@ -1,11 +1,10 @@
-# Docker Compose for SIP AI Assistant with Fish Speech + Whisper API
-# ===================================================================
+# Docker Compose for SIP AI Assistant with Speaches (STT + TTS) + vLLM
+# =====================================================================
 # Optimized for GB10/Grace Blackwell with 100GB+ VRAM
 #
 # Services:
 #   - vllm: LLM server (Llama 3.1 70B)
-#   - whisper: Faster-Whisper STT server (OpenAI-compatible API)
-#   - fish-speech: Fish Speech / OpenAudio TTS server (streaming)
+#   - speaches: Unified STT (Whisper) + TTS (Piper/Kokoro) server
 #   - sip-agent: Main SIP application
 
 services:
@@ -52,29 +51,32 @@ services:
     restart: unless-stopped
 
   # ============================================================================
-  # Whisper Server - Speech-to-Text (OpenAI-compatible API)
-  # Uses speaches/faster-whisper-server
+  # Speaches Server - Unified STT (Whisper) + TTS (Piper/Kokoro)
+  # OpenAI-compatible API for both transcription and speech synthesis
   # ============================================================================
-  whisper:
+  speaches:
     image: ghcr.io/speaches-ai/speaches:latest-cuda
-    container_name: sip-ai-whisper
+    container_name: sip-ai-speaches
     runtime: nvidia
     ipc: host
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-      # Use smaller/faster distilled model
-      - WHISPER__MODEL=Systran/faster-distil-whisper-small.en
-      - WHISPER__COMPUTE_TYPE=float32 
+      # STT Settings (Whisper)
+      - WHISPER__MODEL=${WHISPER_MODEL:-Systran/faster-distil-whisper-small.en}
+      - WHISPER__COMPUTE_TYPE=float16
       - WHISPER__DEVICE=cuda
-      # Faster inference settings
       - WHISPER__INFERENCE_CONFIG__BEAM_SIZE=1
       - WHISPER__INFERENCE_CONFIG__LANGUAGE=${WHISPER_LANGUAGE:-en}
       - WHISPER__INFERENCE_CONFIG__VAD_FILTER=true
       - WHISPER__INFERENCE_CONFIG__BEST_OF=1
+      # TTS is configured via API request parameters (model/voice)
+      # Default TTS model can be set here if needed:
+      # - TTS__DEFAULT_MODEL=${TTS_MODEL:-rhasspy/piper-voices}
     ports:
       - "8001:8000"
     volumes:
-      - ./cache/whisper-cache:/home/ubuntu/.cache/huggingface/hub
+      - ./cache/speaches-cache:/home/ubuntu/.cache/huggingface/hub
+      - ./cache/piper-voices:/home/ubuntu/.local/share/piper_voices
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -91,26 +93,6 @@ services:
     restart: unless-stopped
 
   # ============================================================================
-  # Piper TTS - Fast local text-to-speech
-  # https://github.com/rhasspy/piper
-  # ============================================================================
-  piper:
-    image: rhasspy/wyoming-piper:latest
-    container_name: sip-ai-piper
-    command: --voice en_US-amy-medium
-    ports:
-      - "10200:10200"
-    volumes:
-      - ./cache/piper:/data
-    # healthcheck:
-    #   test: ["CMD-SHELL", "echo '{}' | nc -w 1 localhost 10200 || exit 1"]
-    #   interval: 30s
-    #   timeout: 10s
-    #   retries: 3
-    #   start_period: 60s
-    restart: unless-stopped
-
-  # ============================================================================
   # SIP AI Assistant - Main application (lightweight, no local models)
   # ============================================================================
   sip-agent:
@@ -121,23 +103,23 @@ services:
     depends_on:
       vllm:
         condition: service_healthy
-      whisper:
+      speaches:
         condition: service_healthy
-      # piper:
-      #   condition: service_healthy
     environment:
       # LLM settings
       - LLM_BACKEND=vllm
       - LLM_BASE_URL=http://vllm:8000/v1
       - LLM_MODEL=${LLM_MODEL:-meta-llama/Llama-3.1-70B-Instruct}
-      # Whisper API settings
-      - WHISPER_API_URL=http://whisper:8000
-      - WHISPER_MODEL=Systran/faster-distil-whisper-small.en
+      # Speaches API settings (unified STT + TTS)
+      - SPEACHES_API_URL=http://speaches:8000
+      # STT settings
+      - WHISPER_MODEL=${WHISPER_MODEL:-Systran/faster-distil-whisper-small.en}
       - WHISPER_LANGUAGE=${WHISPER_LANGUAGE:-en}
-      # Piper TTS settings
-      - PIPER_HOST=piper
-      - PIPER_PORT=10200
-      - PIPER_VOICE=${PIPER_VOICE:-en_US-lessac-medium}
+      # TTS settings (Piper via Speaches)
+      - TTS_MODEL=${TTS_MODEL:-rhasspy/piper-voices}
+      - TTS_VOICE=${TTS_VOICE:-en_US-lessac-medium}
+      - TTS_RESPONSE_FORMAT=${TTS_RESPONSE_FORMAT:-wav}
+      - TTS_SPEED=${TTS_SPEED:-1.0}
       # SIP settings
       - SIP_USER=${SIP_USER:-ai-assistant}
       - SIP_PASSWORD=${SIP_PASSWORD:-}

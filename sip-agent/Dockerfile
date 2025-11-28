@@ -2,8 +2,7 @@
 # SIP AI Assistant - Lightweight Container
 # ============================================================================
 # All ML inference is offloaded to dedicated API services:
-# - Whisper API for STT
-# - Fish Speech API for TTS  
+# - Speaches API for STT (Whisper) and TTS (Piper/Kokoro)
 # - vLLM for LLM
 #
 # This container only needs:

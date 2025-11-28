@@ -15,6 +15,7 @@ import time
 import signal
 import asyncio
 import logging
+import random
 from typing import Optional, List, Dict
 
 import numpy as np
@@ -60,10 +61,51 @@ class SIPAIAssistant:
         self._audio_loop_task = None
         self._call_lock = asyncio.Lock()
         
-        # Pre-cached acknowledgments
+        # Pre-cached phrases for instant playback
         self.acknowledgments = [
-            "Okay", "Got it", "One moment", "Sure", "Copy that"
+            "Okay.", "Got it.", "One moment.", "Sure.", "Copy that.",
+            "Alright.", "No problem.", "On it.", "You got it.", "Absolutely.",
+            "Sure thing.", "Will do.", "Of course.", "Right away.", "Consider it done."
         ]
+        
+        self.thinking_phrases = [
+            "Let me think about that.",
+            "Give me a second.",
+            "Let me check.",
+            "One moment please.",
+            "Hmm, let me see."
+        ]
+        
+        self.greeting_phrases = [
+            "Hello! How can I help you today?",
+            "Hi there! What can I do for you?",
+            "Hello! How may I assist you?",
+            "Hey! What can I help you with?"
+        ]
+        
+        self.goodbye_phrases = [
+            "Goodbye!",
+            "Take care!",
+            "Have a great day!",
+            "Bye for now!",
+            "Talk to you later!"
+        ]
+        
+        self.error_phrases = [
+            "Sorry, I didn't catch that.",
+            "Could you repeat that please?",
+            "I didn't quite get that.",
+            "Sorry, can you say that again?"
+        ]
+        
+        # Combined list for pre-caching
+        self._phrases_to_cache = (
+            self.acknowledgments + 
+            self.thinking_phrases + 
+            self.greeting_phrases + 
+            self.goodbye_phrases +
+            self.error_phrases
+        )
         
     async def start(self):
         """Start all components."""
@@ -76,6 +118,9 @@ class SIPAIAssistant:
         
         logger.info("Starting audio pipeline...")
         await self.audio_pipeline.start()
+        
+        # Pre-cache common phrases
+        await self._precache_phrases()
         
         logger.info("Starting SIP handler...")
         await self.sip_handler.start()
@@ -101,6 +146,41 @@ class SIPAIAssistant:
         await self.llm_engine.stop()
         
         logger.info("Stopped.")
+        
+    async def _precache_phrases(self):
+        """Pre-generate audio for common phrases."""
+        logger.info(f"Pre-caching {len(self._phrases_to_cache)} phrases...")
+        
+        cached = 0
+        for phrase in self._phrases_to_cache:
+            try:
+                audio = await self.audio_pipeline.synthesize(phrase)
+                if audio:
+                    cached += 1
+            except Exception as e:
+                logger.warning(f"Failed to cache '{phrase}': {e}")
+                
+        logger.info(f"Pre-cached {cached}/{len(self._phrases_to_cache)} phrases")
+        
+    def get_random_acknowledgment(self) -> str:
+        """Get a random acknowledgment phrase."""
+        return random.choice(self.acknowledgments)
+        
+    def get_random_thinking(self) -> str:
+        """Get a random thinking/processing phrase."""
+        return random.choice(self.thinking_phrases)
+        
+    def get_random_greeting(self) -> str:
+        """Get a random greeting phrase."""
+        return random.choice(self.greeting_phrases)
+        
+    def get_random_goodbye(self) -> str:
+        """Get a random goodbye phrase."""
+        return random.choice(self.goodbye_phrases)
+        
+    def get_random_error(self) -> str:
+        """Get a random error/retry phrase."""
+        return random.choice(self.error_phrases)
         
     async def _on_call_received(self, call_info):
         """Handle incoming call."""
@@ -136,11 +216,12 @@ class SIPAIAssistant:
                 logger.error(f"Error handling call: {e}", exc_info=True)
         
     async def _play_greeting(self):
-        """Play initial greeting."""
-        greeting = "Hello! How can I help you today?"
+        """Play initial greeting (uses pre-cached audio)."""
+        greeting = self.get_random_greeting()
         
         try:
-            logger.info(f"Synthesizing greeting: {greeting}")
+            logger.info(f"Playing greeting: {greeting}")
+            # This should hit the cache since we pre-cached it
             audio = await asyncio.wait_for(
                 self.audio_pipeline.synthesize(greeting),
                 timeout=10.0
@@ -247,7 +328,7 @@ class SIPAIAssistant:
                 
         except Exception as e:
             logger.error(f"Response error: {e}")
-            await self._speak("Sorry, I had trouble with that.")
+            await self._speak(self.get_random_error())
             
         finally:
             self._processing = False
@@ -263,7 +344,7 @@ class SIPAIAssistant:
             return response
         except Exception as e:
             logger.error(f"LLM error: {e}")
-            return "I'm sorry, could you repeat that?"
+            return self.get_random_error()
             
     async def _speak(self, text: str):
         """Synthesize and play text."""
