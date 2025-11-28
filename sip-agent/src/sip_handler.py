@@ -410,8 +410,9 @@ class SIPHandler:
         self.account: Optional[SIPAccount] = None
         self.active_calls: Dict[str, SIPCall] = {}
         
-        # Playlist players per call
+        # Playlist players per call (protected by lock)
         self._playlist_players: Dict[str, PlaylistPlayer] = {}
+        self._playlist_lock = threading.Lock()
         
         self._running = False
         self._pj_thread: Optional[threading.Thread] = None
@@ -425,12 +426,14 @@ class SIPHandler:
         self._cmd_lock = threading.Lock()
         
     def get_playlist_player(self, call_info: CallInfo) -> PlaylistPlayer:
-        """Get or create playlist player for a call."""
-        if call_info.call_id not in self._playlist_players:
-            self._playlist_players[call_info.call_id] = PlaylistPlayer(
-                self, call_info.call_id
-            )
-        return self._playlist_players[call_info.call_id]
+        """Get or create playlist player for a call (thread-safe)."""
+        call_id = call_info.call_id  # Extract string first to avoid accessing CallInfo in lock
+        with self._playlist_lock:
+            if call_id not in self._playlist_players:
+                self._playlist_players[call_id] = PlaylistPlayer(
+                    self, call_id
+                )
+            return self._playlist_players[call_id]
         
     def _queue_command(self, cmd: str, *args, **kwargs) -> Any:
         """Queue a command to run in PJSIP thread and wait for result."""
@@ -475,8 +478,11 @@ class SIPHandler:
             except queue.Empty:
                 break
                 
-        # Poll playlist players
-        for call_id, player in list(self._playlist_players.items()):
+        # Poll playlist players (with lock to avoid race with get_playlist_player)
+        with self._playlist_lock:
+            players_to_poll = list(self._playlist_players.items())
+            
+        for call_id, player in players_to_poll:
             if call_id in self.active_calls:
                 call = self.active_calls[call_id]
                 if call.aud_med:
@@ -484,7 +490,9 @@ class SIPHandler:
             else:
                 # Call ended, clean up player
                 player.stop_all()
-                del self._playlist_players[call_id]
+                with self._playlist_lock:
+                    if call_id in self._playlist_players:
+                        del self._playlist_players[call_id]
                 
     def _execute_command(self, cmd: str, args: tuple, kwargs: dict) -> Any:
         """Execute a command (PJSIP thread only)."""
@@ -699,9 +707,10 @@ class SIPHandler:
             call_id = call.call_info.call_id
             if call_id in self.active_calls:
                 del self.active_calls[call_id]
-            if call_id in self._playlist_players:
-                self._playlist_players[call_id].stop_all()
-                del self._playlist_players[call_id]
+            with self._playlist_lock:
+                if call_id in self._playlist_players:
+                    self._playlist_players[call_id].stop_all()
+                    del self._playlist_players[call_id]
                 
     async def hangup_call(self, call_info: CallInfo):
         """Hangup a call."""
@@ -855,3 +864,4 @@ class SIPHandler:
             
         # Enqueue for playback
         player.enqueue_file(wav_path)
+

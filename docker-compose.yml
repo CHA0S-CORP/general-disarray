@@ -63,7 +63,7 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       # STT Settings (Whisper)
       - WHISPER__MODEL=${WHISPER_MODEL:-Systran/faster-distil-whisper-small.en}
-      - WHISPER__COMPUTE_TYPE=float16
+      - WHISPER__COMPUTE_TYPE=default
       - WHISPER__DEVICE=cuda
       - WHISPER__INFERENCE_CONFIG__BEAM_SIZE=1
       - WHISPER__INFERENCE_CONFIG__LANGUAGE=${WHISPER_LANGUAGE:-en}

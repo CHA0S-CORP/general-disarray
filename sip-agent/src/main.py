@@ -10,16 +10,16 @@ This container is lightweight - just orchestration.
 """
 
 import time
+import random
 import signal
 import asyncio
 import logging
-import random
 from typing import List, Dict
 
-from config import Config, get_config
-from tool_manager import ToolManager
-from llm_engine import create_llm_engine
 from sip_handler import SIPHandler
+from tool_manager import ToolManager
+from config import Config, get_config
+from llm_engine import create_llm_engine
 from audio_pipeline import LowLatencyAudioPipeline
 
 logging.basicConfig(
