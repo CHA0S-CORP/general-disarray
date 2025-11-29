@@ -1,3 +1,5 @@
 #!/bin/bash
-clear
-python ./sip-agent/src/view-logs.py
+while true; do
+    clear
+    python ./sip-agent/src/view-logs.py
+done
