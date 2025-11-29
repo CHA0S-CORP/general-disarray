@@ -1,479 +1,298 @@
 # SIP AI Assistant
 
-A fully local AI voice assistant that communicates via SIP (Session Initiation Protocol). Designed for NVIDIA GB10/Grace Blackwell with ≤100GB VRAM, supporting single-user real-time conversations.
-
-## Features
-
-- **Fully Local**: No cloud dependencies - all processing happens on your hardware
-- **SIP Integration**: Standard telephony protocol, works with any SIP client/trunk
-- **Real-time STT**: Whisper large-v3 for accurate speech recognition
-- **Local LLM**: Llama 3.1 70B via vLLM for intelligent responses
-- **Natural TTS**: Piper TTS for high-quality voice synthesis
-- **Tool Calling**: Built-in support for timers, callbacks, and extensible tools
-- **Low Latency**: Optimized for conversational response times
+A voice-based AI assistant that answers phone calls via SIP, powered by local LLM inference. Supports natural conversations, timers, callbacks, and extensible tools.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        SIP AI Assistant                         │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│   ┌─────────┐    ┌──────────────┐    ┌─────────────────────┐   │
-│   │   SIP   │◄──►│    Audio     │◄──►│       LLM           │   │
-│   │ Handler │    │   Pipeline   │    │      Engine         │   │
-│   │(PJSUA2) │    │              │    │                     │   │
-│   └─────────┘    │ ┌──────────┐ │    │ ┌─────────────────┐ │   │
-│                  │ │   VAD    │ │    │ │   vLLM Server   │ │   │
-│   ┌─────────┐    │ │(WebRTC)  │ │    │ │  (Llama 70B)    │ │   │
-│   │  Tool   │◄───┤ ├──────────┤ │    │ └─────────────────┘ │   │
-│   │ Manager │    │ │   STT    │ │    │                     │   │
-│   │         │    │ │(Whisper) │ │    │ ┌─────────────────┐ │   │
-│   │ Timers  │    │ ├──────────┤ │    │ │  Tool Parser    │ │   │
-│   │Callbacks│    │ │   TTS    │ │    │ └─────────────────┘ │   │
-│   └─────────┘    │ │ (Piper)  │ │    └─────────────────────┘   │
-│                  │ └──────────┘ │                               │
-│                  └──────────────┘                               │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Docker Compose                               │
+├─────────────────┬─────────────────────┬─────────────────────────────┤
+│                 │                     │                             │
+│    vLLM         │     Speaches        │      SIP Agent              │
+│    Server       │     (STT + TTS)     │      (Orchestrator)         │
+│                 │                     │                             │
+│  ┌───────────┐  │  ┌───────────────┐  │  ┌───────────────────────┐  │
+│  │ LLM Model │  │  │ Whisper (STT) │  │  │  PJSIP Call Handler   │  │
+│  │ (Qwen2.5) │  │  │ Kokoro (TTS)  │  │  │  Audio Pipeline       │  │
+│  └───────────┘  │  └───────────────┘  │  │  Tool Manager         │  │
+│                 │                     │  │  LLM Client            │  │
+│  Port: 8000     │  Port: 8001         │  └───────────────────────┘  │
+│                 │                     │                             │
+└─────────────────┴─────────────────────┴─────────────────────────────┘
+                                              │
+                                              ▼
+                                    ┌───────────────────┐
+                                    │   SIP Server      │
+                                    │   (Asterisk/      │
+                                    │    FreeSWITCH)    │
+                                    └───────────────────┘
 ```
 
-## Requirements
+**Components:**
 
-### Hardware
-- NVIDIA GPU with ≤100GB VRAM (designed for GB10/Grace Blackwell)
-- 64GB+ system RAM recommended
-- Fast NVMe storage for model loading
+| Service | Purpose | Model/Tech |
+|---------|---------|------------|
+| **vLLM** | LLM inference | Qwen2.5-7B-Instruct (configurable) |
+| **Speaches** | Speech-to-Text | Whisper (configurable size) |
+| **Speaches** | Text-to-Speech | Kokoro-82M with af_heart voice |
+| **SIP Agent** | Orchestration | PJSIP + Python asyncio |
 
-### Software
-- Ubuntu 22.04 or 24.04
-- NVIDIA Driver 535+
-- CUDA 12.1+
-- Python 3.10+
-- Docker (optional, for containerized deployment)
+## Features
+
+- **Natural Conversations** - Context-aware multi-turn dialogue
+- **Voice Activity Detection** - Automatic speech endpoint detection
+- **Barge-in Support** - Interrupt the assistant mid-response
+- **Timers** - "Set a timer for 5 minutes"
+- **Callbacks** - "Call me back in 10 minutes"
+- **Extensible Tools** - Easy to add new capabilities
+- **JSON Structured Logging** - Filterable event stream
+- **Pre-cached Phrases** - Low-latency greetings and acknowledgments
+
+## Prerequisites
+
+- Docker & Docker Compose
+- NVIDIA GPU with CUDA support
+- SIP server (Asterisk, FreeSWITCH, etc.)
+- ~16GB+ VRAM recommended for default models
 
 ## Quick Start
 
-### Option 1: Docker Deployment (Recommended)
+1. **Clone and configure:**
+   ```bash
+   cp .env.example .env
+   # Edit .env with your settings
+   ```
 
-```bash
-# Clone or copy the project
-cd sip-ai-assistant
+2. **Start services:**
+   ```bash
+   docker compose up -d
+   ```
 
-# Create environment file
-cat > .env << EOF
-HF_TOKEN=your_huggingface_token
-LLM_MODEL=meta-llama/Llama-3.1-70B-Instruct
-WHISPER_MODEL=large-v3
-SIP_USER=ai-assistant
-SIP_DOMAIN=localhost
-EOF
+3. **View logs:**
+   ```bash
+   ./view-logs.py
+   ```
 
-# Start services
-docker compose up -d
-
-# View logs
-docker compose logs -f sip-assistant
-```
-
-### Option 2: Native Installation
-
-```bash
-# Make setup script executable
-chmod +x setup.sh
-
-# Run installation (as root)
-sudo ./setup.sh
-
-# Configure SIP settings
-sudo nano /etc/sip-ai-assistant/config.env
-
-# Start services
-sudo systemctl start vllm
-sudo systemctl start sip-ai-assistant
-
-# Enable on boot
-sudo systemctl enable vllm sip-ai-assistant
-```
+4. **Call the SIP extension** configured in your `.env`
 
 ## Configuration
 
 ### Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SIP_USER` | ai-assistant | SIP username |
-| `SIP_PASSWORD` | (empty) | SIP password |
-| `SIP_DOMAIN` | localhost | SIP domain |
-| `SIP_PORT` | 5060 | SIP port |
-| `SIP_REGISTRAR` | (empty) | SIP registrar server |
-| `LLM_MODEL` | meta-llama/Llama-3.1-70B-Instruct | LLM model name |
-| `LLM_BASE_URL` | http://localhost:8000/v1 | vLLM API endpoint |
-| `WHISPER_MODEL` | large-v3 | Whisper model size |
-| `PIPER_MODEL` | en_US-amy-medium | Piper voice model |
-| `LOG_LEVEL` | INFO | Logging verbosity |
-
-### SIP Provider Integration
-
-To connect to a SIP provider or PBX:
+Copy `.env.example` to `.env` and configure:
 
 ```bash
-# Edit configuration
-sudo nano /etc/sip-ai-assistant/config.env
+# SIP Configuration
+SIP_USER=1000                    # SIP extension/username
+SIP_PASSWORD=secret              # SIP password
+SIP_DOMAIN=pbx.example.com       # SIP server domain
+SIP_REGISTRAR=pbx.example.com    # SIP registrar (optional)
 
-# Add your provider details:
-SIP_USER=your_extension
-SIP_PASSWORD=your_password
-SIP_DOMAIN=sip.provider.com
-SIP_REGISTRAR=sip.provider.com
+# LLM Configuration
+LLM_MODEL=Qwen/Qwen2.5-7B-Instruct  # HuggingFace model ID
+LLM_API_URL=http://vllm:8000/v1     # vLLM endpoint
+
+# Speech Configuration
+SPEACHES_URL=http://speaches:8001   # Speaches API endpoint
+WHISPER_MODEL=base                  # tiny, base, small, medium, large
+WHISPER_COMPUTE_TYPE=auto           # auto, int8, float16, float32
+TTS_MODEL=kokoro                    # TTS model
+TTS_VOICE=af_heart                  # Voice preset
+
+# Audio Settings
+SAMPLE_RATE=16000                   # Audio sample rate
+
+# Callback Settings
+CALLBACK_RING_TIMEOUT=30            # Seconds to wait for answer
+CALLBACK_RETRY_ATTEMPTS=2           # Retry failed callbacks
+CALLBACK_RETRY_DELAY=30             # Seconds between retries
+
+# Tempest Weather API (optional)
+TEMPEST_STATION_ID=12345            # Your Tempest station ID
+TEMPEST_API_TOKEN=your-token        # API token from tempestwx.com
 ```
 
-### Asterisk Integration
+### System Prompt
 
-For robust telephony, integrate with Asterisk:
-
-```ini
-; /etc/asterisk/pjsip.conf
-[ai-assistant]
-type=endpoint
-context=from-internal
-disallow=all
-allow=ulaw
-allow=alaw
-auth=ai-assistant-auth
-aors=ai-assistant-aor
-
-[ai-assistant-auth]
-type=auth
-auth_type=userpass
-username=ai-assistant
-password=your_password
-
-[ai-assistant-aor]
-type=aor
-contact=sip:ai-assistant@localhost:5060
-```
-
-## Usage
-
-### Making a Call
-
-Connect any SIP client to:
-```
-sip:ai-assistant@your-server:5060
-```
-
-### Voice Commands
-
-The assistant responds to natural conversation. Built-in capabilities include:
-
-**Timers:**
-- "Set a timer for 5 minutes"
-- "Remind me in 30 seconds"
-- "Set a 1 hour timer"
-
-**Callbacks:**
-- "Call me back in 10 minutes"
-- "Give me a wake-up call in 2 hours"
-
-**Status:**
-- "What timers do I have?"
-- "Check my callbacks"
-
-**Control:**
-- "Cancel all timers"
-- "Goodbye" (ends call)
-
-## Extending with Custom Tools
-
-Add custom tools by creating a new tool class:
+Edit `config.py` to customize the assistant's personality and behavior:
 
 ```python
-from tool_manager import BaseTool, ToolResult, ToolStatus
+SYSTEM_PROMPT = """You are a helpful AI voice assistant...
 
-class WeatherTool(BaseTool):
-    name = "WEATHER"
-    description = "Get weather information"
-    
-    async def execute(self, params):
-        city = params.get('city', 'unknown')
-        # Your weather API logic here
-        return ToolResult(
-            status=ToolStatus.SUCCESS,
-            message=f"The weather in {city} is sunny and 72 degrees"
-        )
-
-# Register in main.py
-assistant.tool_manager.register_tool(WeatherTool(assistant))
+Available tools:
+- TIMER: [TOOL:TIMER:duration=SECONDS,message=TEXT]
+- CALLBACK: [TOOL:CALLBACK:delay=SECONDS,message=TEXT]
+- WEATHER: [TOOL:WEATHER]
+- HANGUP: [TOOL:HANGUP]
+"""
 ```
 
-Update the system prompt in `config.py` to inform the LLM about the new tool.
+## Tools
 
-## Voice Cloning
+The assistant supports inline tool calls in responses:
 
-The assistant supports voice cloning to use a custom voice for TTS. This allows you to create a unique voice identity from just 5-30 seconds of reference audio.
+### Timer
+```
+User: "Set a timer for 5 minutes"
+Assistant: "I've set a timer for 5 minutes. [TOOL:TIMER:duration=300,message=Your 5 minute timer is done!]"
+```
 
-### Supported Backends
+### Callback
+```
+User: "Call me back in 10 minutes to remind me about the meeting"
+Assistant: "I'll call you back in 10 minutes. [TOOL:CALLBACK:delay=600,message=This is your reminder about the meeting]"
+```
 
-| Backend | Quality | Speed | VRAM | Notes |
-|---------|---------|-------|------|-------|
-| XTTS v2 | ⭐⭐⭐⭐⭐ | Medium | ~6GB | Best quality, multilingual |
-| Chatterbox | ⭐⭐⭐⭐ | Fast | ~4GB | Good balance |
-| OpenVoice | ⭐⭐⭐⭐ | Medium | ~4GB | Style transfer |
-| Fish Speech | ⭐⭐⭐ | Fast | ~3GB | Streaming support |
+### Weather
+```
+User: "What's the weather like?"
+Assistant: "Let me check. [TOOL:WEATHER] It's 72 degrees, 45% humidity, with wind from the northwest at 8 mph."
+```
+Requires `TEMPEST_STATION_ID` and `TEMPEST_API_TOKEN` to be configured. Get these from [tempestwx.com/settings/tokens](https://tempestwx.com/settings/tokens).
 
-### Quick Start with Voice Cloning
+### Hangup
+```
+User: "Goodbye"
+Assistant: "Goodbye! Have a great day. [TOOL:HANGUP]"
+```
+
+## Log Viewer
+
+The included `view-logs.py` script provides filtered, formatted log output:
 
 ```bash
-# 1. Enable voice cloning in .env
-VOICE_CLONING_ENABLED=true
-VOICE_CLONING_BACKEND=xtts
+# View interesting events only (default)
+./view-logs.py
 
-# 2. Create a voice profile from your recording
-python voice_manager.py create my_voice recording.wav --test
+# View all logs
+./view-logs.py -a
 
-# 3. Set as default (or specify in .env)
-python voice_manager.py set-default my_voice
+# Tail specific service
+./view-logs.py sip-agent
 ```
 
-### Creating Voice Profiles
+**Event Types:**
 
-Use the `voice_manager.py` CLI tool:
+| Icon | Event | Description |
+|------|-------|-------------|
+| 🔥 | `warming_up` | Service starting |
+| ✅ | `ready` | Service ready |
+| 📞 | `call_start` | Incoming/outgoing call |
+| 📴 | `call_end` | Call ended |
+| 🎤 | `user_speech` | User transcription |
+| 🤖 | `assistant_response` | LLM response |
+| 💬 | `assistant_ack` | Acknowledgment ("Okay", "Got it") |
+| 🔧 | `tool_call` | Tool invoked |
+| 📋 | `task_scheduled` | Timer/callback scheduled |
+| ⏰ | `timer_set` | Timer created |
+| 🔔 | `timer_fired` | Timer completed |
+| 📲 | `callback_scheduled` | Callback scheduled |
+| 🌤️ | `weather_fetch` | Weather data retrieved |
+| ⚡ | `task_execute` | Task executing |
+| ✋ | `barge_in` | User interrupted |
 
-```bash
-# Create from a single recording
-python voice_manager.py create assistant_voice reference.wav
+**Sample Output:**
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ⟵ CALL #1: sip:420@10.42.252.54
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# Create from multiple samples (better quality)
-python voice_manager.py create assistant_voice sample1.wav sample2.wav sample3.wav
+00:15:23     🎤 User: Set a timer for 30 seconds
+00:15:24     💬 Assistant: Okay
+00:15:25       🔧 Tool called: TIMER (params=delay=30, message=...)
+00:15:25       📋 Task scheduled: timer in 30s
+00:15:26     🤖 Assistant: I've set a timer for 30 seconds
+00:15:55       🔔 Timer fired: Your timer is done
 
-# Create with options
-python voice_manager.py create my_voice recording.wav \
-    --language en \
-    --description "Main assistant voice" \
-    --default \
-    --test
-
-# List all profiles
-python voice_manager.py list
-
-# Test a profile
-python voice_manager.py test my_voice "Hello, this is a test!" --play
-
-# Delete a profile
-python voice_manager.py delete old_voice
+──────────────────────────────────────────────────────────────────────
+  ✗ CALL ENDED
+──────────────────────────────────────────────────────────────────────
 ```
 
-### Programmatic Voice Cloning
+## Project Structure
 
-```python
-from audio_pipeline import AudioPipeline
-from config import Config
-
-config = Config()
-config.voice_cloning_enabled = True
-config.voice_cloning_backend = "xtts"
-
-pipeline = AudioPipeline(config)
-await pipeline.start()
-
-# Create a voice profile
-await pipeline.create_voice_profile(
-    name="my_voice",
-    reference_audio="/path/to/recording.wav",
-    description="My custom voice",
-    language="en",
-    set_as_default=True
-)
-
-# List available profiles
-profiles = pipeline.list_voice_profiles()
-print(f"Available voices: {profiles}")
-
-# Synthesize with cloned voice
-audio = await pipeline.synthesize("Hello world!", voice_profile="my_voice")
-
-# Switch default voice
-pipeline.set_voice_profile("other_voice")
 ```
-
-### Tips for Best Results
-
-**Recording Reference Audio:**
-- Use 5-30 seconds of clean speech
-- Minimize background noise
-- Speak naturally in your normal voice
-- Record in a quiet room
-- Use consistent volume and tone
-- Multiple short samples often work better than one long one
-
-**Supported Audio Formats:**
-- WAV (recommended)
-- MP3
-- FLAC
-- OGG
-
-**VRAM Considerations:**
-With voice cloning enabled, total VRAM usage:
-- vLLM (Llama 70B): ~80GB
-- Whisper large-v3: ~5GB
-- XTTS v2: ~6GB
-- Total: ~91GB (fits in 100GB)
-
-For tighter memory, use a smaller LLM or Whisper model.
-
-## Performance Tuning
-
-### GPU Memory Optimization
-
-For 100GB VRAM allocation (with voice cloning):
-- vLLM: ~80GB (Llama 70B with KV cache)
-- Whisper large-v3: ~5GB
-- Voice Cloning (XTTS): ~6GB
-- System overhead: ~9GB
-
-Without voice cloning:
-- vLLM: ~80GB
-- Whisper large-v3: ~5GB
-- Piper TTS: ~0.1GB
-- System overhead: ~15GB
-
-Adjust `gpu-memory-utilization` in vLLM if needed:
-```bash
-# In docker-compose.yml or vllm.service
---gpu-memory-utilization 0.80  # 80% of available memory
+sip-agent-speaches/
+├── docker-compose.yml    # Service definitions
+├── Dockerfile            # SIP agent container
+├── .env.example          # Configuration template
+├── requirements.txt      # Python dependencies
+├── main.py               # Main orchestrator
+├── sip_handler.py        # PJSIP call handling
+├── audio_pipeline.py     # STT/TTS via Speaches API
+├── llm_engine.py         # LLM client (vLLM/OpenAI API)
+├── tool_manager.py       # Timer, callback, tool framework
+├── config.py             # Configuration and system prompt
+├── view-logs.py          # Log viewer script
+└── README.md             # This file
 ```
-
-### Latency Optimization
-
-1. **Reduce max_model_len** for faster inference:
-   ```bash
-   --max-model-len 4096  # Instead of 8192
-   ```
-
-2. **Use faster Whisper model** for lower latency:
-   ```bash
-   WHISPER_MODEL=medium  # Instead of large-v3
-   ```
-
-3. **Adjust TTS speed**:
-   ```python
-   # In config.py
-   piper_length_scale: float = 0.9  # Faster speech
-   ```
-
-### Smaller Models for Lower VRAM
-
-If you have less than 100GB VRAM:
-
-| VRAM | Recommended LLM | Whisper |
-|------|-----------------|---------|
-| 80GB | Llama 3.1 70B (4-bit) | large-v3 |
-| 48GB | Llama 3.1 70B (4-bit) | medium |
-| 24GB | Llama 3.1 8B | medium |
-| 16GB | Llama 3.1 8B (4-bit) | small |
 
 ## Troubleshooting
 
-### SIP Registration Failed
+### "Requested float16 compute type, but device does not support"
+Set `WHISPER_COMPUTE_TYPE=auto` in `.env` to auto-detect the best compute type.
 
-```bash
-# Check network connectivity
-telnet sip.provider.com 5060
+### Call connects but no audio
+- Check SIP server NAT settings
+- Verify RTP ports are open (10000-10100)
+- Check `SIP_DOMAIN` matches your server
 
-# Verify credentials
-journalctl -u sip-ai-assistant | grep -i "registration"
+### Slow response times
+- Use a smaller Whisper model (`tiny` or `base`)
+- Ensure GPU is being utilized (check `nvidia-smi`)
+- Pre-cache common phrases (enabled by default)
 
-# Enable debug logging
-LOG_LEVEL=DEBUG
+### PJSIP assertion errors on shutdown
+These are cosmetic and don't affect operation. The cleanup sequence handles them gracefully.
+
+### Tool calls not working
+Ensure the LLM response contains the exact format:
+```
+[TOOL:TOOLNAME:param1=value1,param2=value2]
 ```
 
-### No Audio
+## Hardware Requirements
 
-```bash
-# Check audio codecs
-journalctl -u sip-ai-assistant | grep -i "codec"
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| GPU VRAM | 8GB | 16GB+ |
+| System RAM | 16GB | 32GB |
+| CPU | 4 cores | 8+ cores |
 
-# Verify RTP ports are open
-sudo ss -ulnp | grep -E "1000[0-9]"
-```
+**Tested Configurations:**
+- NVIDIA RTX 4090 (24GB) - All models
+- NVIDIA DGX Spark GB10 - With ARM64 compatibility fixes
+- NVIDIA RTX 3080 (10GB) - Smaller models
 
-### LLM Timeout
+## Extending
 
-```bash
-# Check vLLM status
-curl http://localhost:8000/health
+### Adding New Tools
 
-# View vLLM logs
-journalctl -u vllm -f
+1. Create a tool class in `tool_manager.py`:
+   ```python
+   class WeatherTool(BaseTool):
+       name = "WEATHER"
+       description = "Get current weather"
+       
+       async def execute(self, params: Dict[str, Any]) -> ToolResult:
+           location = params.get('location', 'default')
+           # Implement weather lookup
+           return ToolResult(
+               status=ToolStatus.SUCCESS,
+               message=f"The weather in {location} is sunny"
+           )
+   ```
 
-# Reduce model size if OOM
-LLM_MODEL=meta-llama/Llama-3.1-8B-Instruct
-```
+2. Register in `ToolManager.start()`:
+   ```python
+   self.register_tool(WeatherTool(self.assistant))
+   ```
 
-### Whisper Errors
-
-```bash
-# Verify CUDA is available
-python3 -c "import torch; print(torch.cuda.is_available())"
-
-# Check Whisper model loading
-python3 -c "from faster_whisper import WhisperModel; m = WhisperModel('large-v3', device='cuda')"
-```
-
-## API Reference
-
-### REST API (if enabled)
-
-```bash
-# Health check
-GET /health
-
-# List active calls
-GET /calls
-
-# Make outbound call
-POST /calls
-{
-  "uri": "sip:user@domain.com",
-  "message": "Hello, this is a test call"
-}
-
-# Cancel scheduled tasks
-DELETE /tasks/{task_id}
-```
-
-## Development
-
-### Running Tests
-
-```bash
-# Install test dependencies
-pip install pytest pytest-asyncio pytest-cov
-
-# Run tests
-pytest tests/ -v
-
-# With coverage
-pytest tests/ --cov=. --cov-report=html
-```
-
-### Project Structure
-
-```
-sip-ai-assistant/
-├── main.py              # Application entry point
-├── config.py            # Configuration management
-├── sip_handler.py       # SIP communication (PJSUA2)
-├── audio_pipeline.py    # VAD, STT, TTS processing
-├── llm_engine.py        # LLM inference with tool calling
-├── tool_manager.py      # Tool system and scheduling
-├── requirements.txt     # Python dependencies
-├── setup.sh             # Installation script
-├── Dockerfile           # Container build
-├── docker-compose.yml   # Container orchestration
-└── README.md            # This file
-```
+3. Update system prompt in `config.py`:
+   ```
+   - WEATHER: [TOOL:WEATHER:location=CITY]
+   ```
 
 ## License
 
@@ -482,7 +301,7 @@ MIT License - See LICENSE file for details.
 ## Acknowledgments
 
 - [PJSIP](https://www.pjsip.org/) - SIP stack
-- [faster-whisper](https://github.com/SYSTRAN/faster-whisper) - Optimized Whisper inference
-- [vLLM](https://github.com/vllm-project/vllm) - High-throughput LLM serving
-- [Piper](https://github.com/rhasspy/piper) - Fast neural TTS
-- [WebRTC VAD](https://github.com/wiseman/py-webrtcvad) - Voice activity detection
+- [Speaches](https://github.com/speaches-ai/speaches) - STT/TTS API
+- [vLLM](https://github.com/vllm-project/vllm) - LLM inference
+- [Whisper](https://github.com/openai/whisper) - Speech recognition
+- [Kokoro](https://huggingface.co/hexgrad/Kokoro-82M) - Text-to-speech

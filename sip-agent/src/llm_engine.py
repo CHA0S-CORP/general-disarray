@@ -5,13 +5,11 @@ Handles LLM inference with tool calling support.
 Supports multiple backends: vLLM, Ollama, LM Studio.
 """
 
-import asyncio
-import json
-import logging
 import re
+import logging
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
+from typing import List, Dict, Any, Optional, Tuple
 
 try:
     from openai import AsyncOpenAI
@@ -27,8 +25,10 @@ except ImportError:
 
 from config import Config
 
-logger = logging.getLogger(__name__)
 
+
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class ToolCall:
@@ -114,11 +114,20 @@ class LLMEngine:
         # Parse and execute any tool calls
         response_text, tool_results = await self._process_tool_calls(response_text)
         
-        # If tools were called, we might want to incorporate results
-        if tool_results:
-            # For voice, we typically just confirm the action was taken
-            # The tool call is already parsed out of the response
-            pass
+        # Append results from informational tools (like WEATHER)
+        # These tools return data that should be spoken to the user
+        for result in tool_results:
+            tool_name = result.get("tool", "")
+            tool_result = result.get("result")
+            
+            # For informational tools, append the result message
+            if tool_name in ("WEATHER", "STATUS") and tool_result:
+                if hasattr(tool_result, 'message') and tool_result.message:
+                    # Add the result to the response
+                    if response_text:
+                        response_text = f"{response_text} {tool_result.message}"
+                    else:
+                        response_text = tool_result.message
             
         return response_text
         
@@ -196,7 +205,7 @@ class LLMEngine:
         elif "call" in last_user_msg and "back" in last_user_msg:
             return "I'll call you back. [TOOL:CALLBACK:delay=60,message=Callback as requested]"
         elif "bye" in last_user_msg or "goodbye" in last_user_msg:
-            return "Goodbye! Have a great day!"
+            return "Goodbye! Have a great day! [TOOL:HANGUP]"
         elif "help" in last_user_msg:
             return "I can help you with timers, reminders, and callbacks. What would you like me to do?"
         else:
@@ -206,10 +215,12 @@ class LLMEngine:
         """Parse and execute tool calls from response."""
         tool_results = []
         
-        # Find tool calls in format: [TOOL:name:param1=val1,param2=val2]
-        pattern = r'\[TOOL:(\w+):([^\]]+)\]'
-        matches = list(re.finditer(pattern, response))
+        # Find tool calls in format: [TOOL:name:param1=val1,param2=val2] or [TOOL:name]
+        pattern_with_params = r'\[TOOL:(\w+):([^\]]+)\]'
+        pattern_no_params = r'\[TOOL:(\w+)\]'
         
+        # Process tools with parameters
+        matches = list(re.finditer(pattern_with_params, response))
         for match in matches:
             tool_name = match.group(1)
             params_str = match.group(2)
@@ -219,7 +230,6 @@ class LLMEngine:
             for param in params_str.split(','):
                 if '=' in param:
                     key, value = param.split('=', 1)
-                    # Try to convert to appropriate type
                     value = self._parse_param_value(value)
                     params[key.strip()] = value
                     
@@ -229,7 +239,6 @@ class LLMEngine:
                 raw=match.group(0)
             )
             
-            # Execute tool
             try:
                 result = await self.tool_manager.execute_tool(tool_call)
                 tool_results.append({
@@ -244,9 +253,39 @@ class LLMEngine:
                     "params": params,
                     "error": str(e)
                 })
+        
+        # Process tools without parameters (e.g., HANGUP)
+        # Remove already-matched sections first to avoid double-matching
+        temp_response = re.sub(pattern_with_params, '', response)
+        matches_no_params = list(re.finditer(pattern_no_params, temp_response))
+        
+        for match in matches_no_params:
+            tool_name = match.group(1)
+            
+            tool_call = ToolCall(
+                name=tool_name,
+                params={},
+                raw=match.group(0)
+            )
+            
+            try:
+                result = await self.tool_manager.execute_tool(tool_call)
+                tool_results.append({
+                    "tool": tool_name,
+                    "params": {},
+                    "result": result
+                })
+            except Exception as e:
+                logger.error(f"Tool execution error: {e}")
+                tool_results.append({
+                    "tool": tool_name,
+                    "params": {},
+                    "error": str(e)
+                })
                 
-        # Remove tool calls from response text
-        clean_response = re.sub(pattern, '', response).strip()
+        # Remove all tool calls from response text
+        clean_response = re.sub(pattern_with_params, '', response)
+        clean_response = re.sub(pattern_no_params, '', clean_response).strip()
         
         return clean_response, tool_results
         

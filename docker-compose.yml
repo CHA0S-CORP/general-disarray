@@ -1,10 +1,16 @@
-# Docker Compose for SIP AI Assistant
-# ====================================
-# For GB10/Grace Blackwell with 100GB+ VRAM
-
+# Docker Compose for SIP AI Assistant with Speaches (STT + TTS) + vLLM
+# =====================================================================
+# Optimized for GB10/Grace Blackwell with 100GB+ VRAM
+#
+# Services:
+#   - vllm: LLM server (Llama 3.1 70B)
+#   - speaches: Unified STT (Whisper) + TTS (Piper/Kokoro) server
+#   - sip-agent: Main SIP application
 
 services:
+  # ============================================================================
   # vLLM Server - Serves the LLM
+  # ============================================================================
   vllm:
     image: nvcr.io/nvidia/vllm:25.11-py3
     container_name: sip-ai-vllm
@@ -22,16 +28,13 @@ services:
       vllm serve
       ${LLM_MODEL:-meta-llama/Llama-3.1-70B-Instruct}
       --port 8000
-      --gpu-memory-utilization 0.90
+      --gpu-memory-utilization 0.50
       --max-model-len 8192
-      --enforce-eager
       --trust-remote-code
-      --tensor-parallel-size 1
     ports:
       - "8000:8000"
     volumes:
-      - huggingface-cache:/root/.cache/huggingface
-      - tiktoken-cache:/root/.cache/tiktoken
+      - ./cache/huggingface-cache:/root/.cache/huggingface
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -47,59 +50,45 @@ services:
               capabilities: [gpu]
     restart: unless-stopped
 
-  # riva:
-  #   image: nvcr.io/nvidia/riva/riva-speech:2.13.1
-  #   container_name: sip-ai-riva
-  #   # Use host network so bot can access localhost:50051 easily
-  #   network_mode: host 
-  #   command: start-riva-server
-  #   volumes:
-  #     # CRITICAL: You must initialize models here first (see instructions below)
-  #     - ./riva_model_repo:/data
-  #   environment:
-  #     - RIVA_URI=0.0.0.0:50051
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         devices:
-  #           - driver: nvidia
-  #             count: 1  # Dedicate 1 GPU to Riva if possible, or share 'all'
-  #             capabilities: [gpu]
-
-  # SIP AI Assistant
-  sip-assistant:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: sip-ai-assistant
-    network_mode: "host"
+  # ============================================================================
+  # Speaches Server - Unified STT (Whisper) + TTS (Piper/Kokoro)
+  # OpenAI-compatible API for both transcription and speech synthesis
+  # ============================================================================
+  speaches:
+    image: ghcr.io/speaches-ai/speaches:latest-cuda
+    container_name: sip-ai-speaches
     runtime: nvidia
-    depends_on:
-      vllm:
-        condition: service_healthy
+    ipc: host
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-      - LLM_BACKEND=vllm
-      - LLM_BASE_URL=http://localhost:8000/v1
-      - LLM_MODEL=${LLM_MODEL:-meta-llama/Llama-3.1-70B-Instruct}
-      - WHISPER_MODEL=${WHISPER_MODEL:-large-v3}
-      - WHISPER_DEVICE=cuda
-      - PIPER_MODEL=${PIPER_MODEL:-en_US-amy-medium}
-      - PIPER_MODEL_PATH=/opt/piper/models
-      - SIP_USER=${SIP_USER:-ai-assistant}
-      - SIP_PASSWORD=${SIP_PASSWORD:-}
-      - SIP_DOMAIN=${SIP_DOMAIN:-localhost}
-      - SIP_PORT=${SIP_PORT:-5060}
-      - SIP_REGISTRAR=${SIP_REGISTRAR:-}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # STT Settings (Whisper)
+      - WHISPER__MODEL=${WHISPER_MODEL:-Systran/faster-distil-whisper-small.en}
+      # Use 'auto' for compute type - float16 may not be supported on all GPUs
+      # Options: auto, int8, int8_float16, int8_float32, int8_bfloat16, 
+      #          int16, float16, bfloat16, float32
+      - WHISPER__COMPUTE_TYPE=${WHISPER_COMPUTE_TYPE:-default}
+      - WHISPER__DEVICE=cuda
+      - WHISPER__INFERENCE_CONFIG__BEAM_SIZE=1
+      - WHISPER__INFERENCE_CONFIG__LANGUAGE=${WHISPER_LANGUAGE:-en}
+      - WHISPER__INFERENCE_CONFIG__VAD_FILTER=true
+      - WHISPER__INFERENCE_CONFIG__BEST_OF=1
+      # Model TTL settings - prevent unloading (-1 = never unload)
+      - STT_MODEL_TTL=-1
+      - TTS_MODEL_TTL=-1
+      - VAD_MODEL_TTL=-1
+      - PORT=8001
+      # TTS is configured via API request parameters (model/voice)
     ports:
-      - "5060:5060/udp"
-      - "5060:5060/tcp"
-      - "10000-10100:10000-10100/udp"  # RTP ports
+      - "8001:8001"
     volumes:
-      - ./data:/app/data
-      - whisper-cache:/root/.cache/huggingface
-      - piper-models:/opt/piper/models
+      - ./cache/speaches-cache:/home/ubuntu/.cache/huggingface/hub
+      - ./cache/piper-voices:/home/ubuntu/.local/share/piper_voices
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
     deploy:
       resources:
         reservations:
@@ -109,14 +98,65 @@ services:
               capabilities: [gpu]
     restart: unless-stopped
 
-  
+  # ============================================================================
+  # SIP AI Assistant - Main application (lightweight, no local models)
+  # ============================================================================
+  sip-agent:
+    build:
+      context: sip-agent/
+      dockerfile: Dockerfile
+    container_name: sip-ai-assistant
+    depends_on:
+      vllm:
+        condition: service_healthy
+      speaches:
+        condition: service_healthy
+    environment:
+      # LLM settings
+      - LLM_BACKEND=vllm
+      - LLM_BASE_URL=http://vllm:8000/v1
+      - LLM_MODEL=${LLM_MODEL:-meta-llama/Llama-3.1-70B-Instruct}
+      - LLM_MAX_TOKENS=${LLM_MAX_TOKENS:-512}
+      - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.6}
+      - LLM_TOP_P=${LLM_TOP_P:-0.85}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      # Speaches API settings (unified STT + TTS)
+      - SPEACHES_API_URL=http://speaches:8001
+      # STT settings
+      - WHISPER_MODEL=${WHISPER_MODEL:-Systran/faster-distil-whisper-small.en}
+      - WHISPER_LANGUAGE=${WHISPER_LANGUAGE:-en}
+      - MIN_SPEECH_DURATION_MS=${MIN_SPEECH_DURATION_MS:-200}
+      - MAX_SPEECH_DURATION_S=${MAX_SPEECH_DURATION_S:-8.0}
+      - SILENCE_TIMEOUT_MS=${SILENCE_TIMEOUT_MS:-750}
+      # TTS settings (Kokoro via Speaches - auto-downloaded on first use)
+      - TTS_MODEL=${TTS_MODEL:-speaches-ai/Kokoro-82M-v1.0-ONNX}
+      - TTS_VOICE=${TTS_VOICE:-af_heart}
+      - TTS_RESPONSE_FORMAT=${TTS_RESPONSE_FORMAT:-wav}
+      - TTS_SPEED=${TTS_SPEED:-1.0}
+      # SIP settings
+      - SIP_USER=${SIP_USER:-ai-assistant}
+      - SIP_PASSWORD=${SIP_PASSWORD:-}
+      - SIP_DOMAIN=${SIP_DOMAIN:-localhost}
+      - SIP_PORT=${SIP_PORT:-5060}
+      - SIP_REGISTRAR=${SIP_REGISTRAR:-}
+      # General
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # Tools
+      - CALLBACK_RING_TIMEOUT=${CALLBACK_RING_TIMEOUT:-30}
+      - TEMPEST_STATION_ID=${TEMPEST_STATION_ID:-}
+      - TEMPEST_API_TOKEN=${TEMPEST_API_TOKEN:-}
+    ports:
+      - "5060:5060/udp"
+      - "5060:5060/tcp"
+      - "10000-10100:10000-10100/udp"  # RTP ports
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
 
-volumes:
-  huggingface-cache:
-  whisper-cache:
-  piper-models:
-  tiktoken-cache:
 
+# ============================================================================
+# Networks
+# ============================================================================
 networks:
   default:
     driver: bridge

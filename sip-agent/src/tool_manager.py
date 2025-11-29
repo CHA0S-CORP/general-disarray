@@ -5,15 +5,17 @@ Manages callable tools for the AI assistant.
 Includes timer, callback, and extensible tool framework.
 """
 
+import json
+import uuid
 import asyncio
 import logging
+import httpx
+
+from enum import Enum
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
-from enum import Enum
-import json
-import uuid
 
 if TYPE_CHECKING:
     from main import SIPAIAssistant
@@ -21,6 +23,16 @@ if TYPE_CHECKING:
 from config import Config
 
 logger = logging.getLogger(__name__)
+
+
+def log_event(log, level, msg, event=None, **data):
+    """Helper to log structured events."""
+    extra = {}
+    if event:
+        extra['event_type'] = event
+    if data:
+        extra['event_data'] = data
+    log.log(level, msg, extra=extra)
 
 
 class ToolStatus(Enum):
@@ -104,7 +116,8 @@ class TimerTool(BaseTool):
             target_uri=None  # Timer plays on current call
         )
         
-        logger.info(f"Timer set: {duration}s, message: {message}")
+        log_event(logger, logging.INFO, f"Timer set: {duration}s",
+                 event="timer_set", duration=duration, message=message, task_id=task_id)
         
         return ToolResult(
             status=ToolStatus.SUCCESS,
@@ -131,24 +144,25 @@ class TimerTool(BaseTool):
 class CallbackTool(BaseTool):
     """
     Schedule a callback call.
+    If no number is specified, calls back the current caller.
     """
     
     name = "CALLBACK"
-    description = "Schedule a callback call"
+    description = "Schedule a callback call. If no destination specified, calls back the current caller."
     
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
-        # Note: Actual execution for LLM calls is often intercepted by ToolManager
-        # This fallback logic ensures manual calls still work.
         delay = int(params.get('delay', 60))
         message = params.get('message', 'This is your scheduled callback')
         uri = params.get('uri')
-        destination = params.get('destination') # Handle alternative param name
+        destination = params.get('destination')
         
+        # Use provided URI/destination, or fall back to caller's number
         target = uri or destination
         
-        # Get caller URI if not specified
+        # If no target specified, use the current caller's number
         if not target and self.assistant.current_call:
-            target = self.assistant.current_call.remote_uri
+            target = getattr(self.assistant.current_call, 'remote_uri', None)
+            logger.info(f"No callback number specified, using caller: {target}")
             
         if not target:
             return ToolResult(
@@ -164,7 +178,8 @@ class CallbackTool(BaseTool):
             target_uri=target
         )
         
-        logger.info(f"Callback scheduled: {delay}s, uri: {target}")
+        log_event(logger, logging.INFO, f"Callback scheduled: {delay}s to {target}",
+                 event="callback_scheduled", delay=delay, uri=target, task_id=task_id)
         
         return ToolResult(
             status=ToolStatus.SUCCESS,
@@ -180,11 +195,198 @@ class HangupTool(BaseTool):
     description = "End the current call"
     
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
-        # The main loop handles actual hangup based on response
+        # Actually hang up the call
+        if self.assistant.current_call:
+            try:
+                # Schedule hangup after a short delay to allow goodbye message to play
+                async def delayed_hangup():
+                    await asyncio.sleep(3)  # Wait for TTS to finish
+                    if self.assistant.current_call:
+                        await self.assistant.sip_handler.hangup_call(self.assistant.current_call)
+                        logger.info("Call ended via HANGUP tool")
+                asyncio.create_task(delayed_hangup())
+                return ToolResult(
+                    status=ToolStatus.SUCCESS,
+                    message="Ending call"
+                )
+            except Exception as e:
+                logger.error(f"Hangup error: {e}")
+                return ToolResult(
+                    status=ToolStatus.FAILED,
+                    message=f"Failed to end call: {e}"
+                )
         return ToolResult(
-            status=ToolStatus.SUCCESS,
-            message="Ending call"
+            status=ToolStatus.FAILED,
+            message="No active call to end"
         )
+
+
+class WeatherTool(BaseTool):
+    """Get current weather from Tempest weather station."""
+    
+    name = "WEATHER"
+    description = "Get current weather conditions from the local weather station"
+    
+    async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        config = self.assistant.config
+        station_id = config.tempest_station_id
+        api_token = config.tempest_api_token
+        
+        logger.info(f"WeatherTool executing - station_id={station_id}, token={'set' if api_token else 'not set'}")
+        
+        if not station_id or not api_token:
+            logger.warning("Weather station not configured")
+            return ToolResult(
+                status=ToolStatus.FAILED,
+                message="Weather station not configured"
+            )
+        
+        try:
+            # Tempest API - use token as query parameter
+            url = f"https://swd.weatherflow.com/swd/rest/observations/station/{station_id}"
+            params_dict = {"token": api_token}
+            
+            logger.info(f"Fetching weather from: {url}")
+            
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(url, params=params_dict)
+                logger.info(f"Weather API response status: {response.status_code}")
+                
+                if response.status_code != 200:
+                    logger.error(f"Weather API error: {response.status_code} - {response.text}")
+                    return ToolResult(
+                        status=ToolStatus.FAILED,
+                        message="Couldn't reach the weather station"
+                    )
+                
+                data = response.json()
+            
+            # Parse the observation data
+            station = data.get("station_name", {})
+            obs_list = data.get("obs", [])
+            if not obs_list:
+                logger.warning(f"No observations in response: {data}")
+                return ToolResult(
+                    status=ToolStatus.FAILED,
+                    message="No weather data available"
+                )
+            
+            obs = obs_list[0] if isinstance(obs_list, list) else obs_list
+            logger.debug(f"Weather observation: {obs}")
+            
+            # Extract key weather values
+            # Tempest API returns values in metric, we'll convert to imperial for speech
+            temp_c = obs.get("air_temperature")
+            humidity = obs.get("relative_humidity")
+            wind_avg = obs.get("wind_avg")  # m/s
+            wind_gust = obs.get("wind_gust")  # m/s
+            wind_dir = obs.get("wind_direction")
+            precip_rate = obs.get("precip")  # mm/min for last minute
+            precip_accum_local_day = obs.get("precip_accum_local_day")  # mm/min for last minute
+            precip_accum_last_1hr = obs.get("precip_accum_last_1hr")  # mm/min for last minute
+            uv = obs.get("uv")
+            feels_like = obs.get("feels_like")
+            lightning_strike_count_last_1hr = obs.get("lightning_strike_count_last_1hr")
+            lightning_strike_last_distance = obs.get("lightning_strike_last_distance")
+            pressure_trend = obs.get("pressure_trend")
+            barometric_pressure = obs.get("barometric_pressure")
+            solar_radiation = obs.get("solar_radiation")
+            
+            
+            # Convert to imperial
+            temp_f = round(temp_c * 9/5 + 32) if temp_c is not None else None
+            feels_like_f = round(feels_like * 9/5 + 32) if feels_like is not None else None
+            wind_mph = round(wind_avg * 2.237) if wind_avg is not None else None
+            wind_gust_mph = round(wind_gust * 2.237) if wind_gust is not None else None
+            lightning_strike_last_distance_miles = round(lightning_strike_last_distance * 0.621371) if lightning_strike_last_distance is not None else None
+            
+            # Wind direction to cardinal
+            directions = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+                         "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+            wind_cardinal = directions[int((wind_dir + 11.25) / 22.5) % 16] if wind_dir is not None else None
+            
+            # Build natural language response
+            parts = []
+
+            if solar_radiation > 0:
+                sun = "sunny" if solar_radiation > 800 else "partly sunny" if solar_radiation > 400 else "cloudy"
+            else:
+                sun = "dark"
+
+            prefix = f"The current weather at {station} is: {sun} with a temperature of"
+            
+            if temp_f is not None:
+                if feels_like_f == temp_f:
+                    parts.append(f"{prefix} {temp_f} degrees Ferenheit")
+                else:
+                    parts.append(f"{prefix} {temp_f} degrees Ferenheit, and feels like {feels_like_f}")
+        
+            if humidity is not None:
+                parts.append(f"the humidity is {round(humidity)}%")
+            
+            if wind_mph is not None:
+                wind_desc = f"wind from the {wind_cardinal} at {wind_mph} mph"
+                if wind_gust_mph >0:
+                    wind_desc += f" with gusts to {wind_gust_mph}"
+                if wind_mph == 0:
+                    wind_desc = f"Wind is currently calm"
+                if wind_mph >= 15:
+                    wind_desc += ", be advised it is quite windy"
+                parts.append(wind_desc)
+            
+            if precip_rate and precip_rate > 0:
+                parts.append(f"it is currently raining, with a total of {round(precip_accum_local_day * 0.03937, 2)} inches today")
+            elif precip_accum_last_1hr and precip_accum_last_1hr > 0:
+                parts.append(f"It is not currently raining, however it has rained {round(precip_accum_last_1hr * 0.03937, 2)} inches in the past hour")
+
+            if lightning_strike_count_last_1hr and lightning_strike_count_last_1hr > 0:
+                parts.append(f"Be advised there have been {lightning_strike_count_last_1hr} lightning strikes in the past hour {lightning_strike_last_distance_miles} miles away")
+            
+            if uv is not None and uv >= 6:
+                parts.append(f"UV index is currently high at {round(uv)}")
+
+            if pressure_trend:
+                parts.append(f"barometric pressure is {pressure_trend} at {round(barometric_pressure, 2)} millibars")
+
+           
+            
+            weather_summary = ". ".join(parts) + "." if parts else "Weather data unavailable."
+            
+            log_event(logger, logging.INFO, f"Weather: {weather_summary}",
+                     event="weather_fetch", temp_f=temp_f, humidity=humidity, wind_mph=wind_mph)
+            
+            return ToolResult(
+                status=ToolStatus.SUCCESS,
+                message=weather_summary,
+                data={
+                    "temp_f": temp_f,
+                    "feels_like_f": feels_like_f,
+                    "humidity": humidity,
+                    "wind_mph": wind_mph,
+                    "wind_gust_mph": wind_gust_mph,
+                    "wind_direction": wind_cardinal,
+                    "uv": uv,
+                    "precip_rate": precip_rate,
+                    "precip_accum_local_day": precip_accum_local_day,
+                    "lightning_strike_count_last_1hr": lightning_strike_count_last_1hr,
+                    "lightning_strike_last_distance": lightning_strike_last_distance,
+                    "barometric_pressure": barometric_pressure,
+                    "pressure_trend": pressure_trend,
+                }
+            )
+            
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Weather API HTTP error: {e}")
+            return ToolResult(
+                status=ToolStatus.FAILED,
+                message="Couldn't reach the weather station"
+            )
+        except Exception as e:
+            logger.error(f"Weather fetch error: {e}", exc_info=True)
+            return ToolResult(
+                status=ToolStatus.FAILED,
+                message="Error getting weather data"
+            )
 
 
 class StatusTool(BaseTool):
@@ -256,6 +458,14 @@ class ToolManager:
             
         if self.config.enable_callback_tool:
             self.register_tool(CallbackTool(self.assistant))
+        
+        # Weather tool (requires Tempest API config)
+        if self.config.enable_weather_tool:
+            if self.config.tempest_station_id and self.config.tempest_api_token:
+                self.register_tool(WeatherTool(self.assistant))
+                logger.info(f"Weather tool registered with station_id={self.config.tempest_station_id}")
+            else:
+                logger.info("Weather tool enabled but Tempest API not configured (missing TEMPEST_STATION_ID or TEMPEST_API_TOKEN)")
             
         # Always available
         self.register_tool(HangupTool(self.assistant))
@@ -292,6 +502,14 @@ class ToolManager:
         """Execute a tool call with interception."""
         tool_name = tool_call.name.upper()
         
+        # Log tool invocation (convert params to simple dict for JSON)
+        try:
+            params_dict = {k: str(v) for k, v in tool_call.params.items()}
+        except:
+            params_dict = {}
+        log_event(logger, logging.INFO, f"Tool called: {tool_name}",
+                 event="tool_call", tool=tool_name, params=params_dict)
+        
         if tool_name not in self.tools:
             return ToolResult(status=ToolStatus.FAILED, message=f"Unknown tool: {tool_name}")
             
@@ -306,24 +524,35 @@ class ToolManager:
             
         try:
             # --- INTERCEPT CALLBACK TOOL ---
-            # We handle this manually to ensure 'destination' is passed correctly
+            # Handle callback manually to ensure caller's number is used by default
             if tool_name == "CALLBACK":
                 delay = int(tool_call.params.get("delay", 60))
-                message = tool_call.params.get("message", "Callback notification")
-                destination = tool_call.params.get("destination") 
+                message = tool_call.params.get("message", "This is your scheduled callback")
+                destination = tool_call.params.get("destination") or tool_call.params.get("uri")
                 
                 # Sanitize destination
                 if destination:
                     destination = str(destination).strip()
                 
-                logger.info(f"Processing CALLBACK: delay={delay}, dest={destination}")
+                # Use caller's number if not specified or if explicitly "CALLER_NUMBER"
+                if not destination or destination.upper() == "CALLER_NUMBER":
+                    if self.assistant.current_call:
+                        destination = getattr(self.assistant.current_call, 'remote_uri', None)
+                        logger.info(f"Using caller's number for callback: {destination}")
+                    if not destination:
+                        return ToolResult(
+                            status=ToolStatus.FAILED,
+                            message="No callback number available - please specify a number"
+                        )
                 
-                # Call App Logic directly
+                logger.debug(f"Processing CALLBACK: delay={delay}, dest={destination}")
+                
+                # Schedule the callback
                 await self.assistant.schedule_callback(delay, message, destination)
                 
                 return ToolResult(
                     status=ToolStatus.SUCCESS,
-                    message=f"Callback scheduled for {destination if destination else 'caller'}"
+                    message=f"I'll call you back in {self._format_delay(delay)}"
                 )
             # -------------------------------
 
@@ -356,7 +585,9 @@ class ToolManager:
         )
         
         self.scheduled_tasks[task_id] = task
-        logger.info(f"Scheduled task {task_id}: {task_type} in {delay_seconds}s")
+        log_event(logger, logging.INFO, f"Task scheduled: {task_type} in {delay_seconds}s",
+                 event="task_scheduled", task_id=task_id, task_type=task_type, 
+                 delay=delay_seconds, target=str(target_uri) if target_uri else None)
         
         return task_id
         
@@ -410,7 +641,8 @@ class ToolManager:
                 
     async def _execute_scheduled_task(self, task: ScheduledTask):
         """Execute a scheduled task."""
-        logger.info(f"Executing scheduled task: {task.id} ({task.task_type})")
+        log_event(logger, logging.INFO, f"Executing task: {task.id} ({task.task_type})",
+                 event="task_execute", task_id=task.id, task_type=task.task_type)
         
         try:
             if task.task_type == "timer":
@@ -425,6 +657,8 @@ class ToolManager:
             
     async def _execute_timer(self, task: ScheduledTask):
         """Execute a timer - speak the message on current call."""
+        log_event(logger, logging.INFO, f"Timer fired: {task.message}",
+                 event="timer_fired", task_id=task.id, message=task.message)
         if self.assistant.current_call and self.assistant.current_call.is_active:
             # Use streaming if available for consistent voice
             if hasattr(self.assistant, '_stream_response'):
@@ -440,6 +674,9 @@ class ToolManager:
             logger.error(f"Callback {task.id} has no target URI")
             return
             
+        log_event(logger, logging.INFO, f"Executing callback to {task.target_uri}",
+                 event="callback_execute", task_id=task.id, uri=task.target_uri)
+        
         # Make the call
         for attempt in range(self.config.callback_retry_attempts):
             try:
@@ -447,7 +684,8 @@ class ToolManager:
                     task.target_uri,
                     task.message
                 )
-                logger.info(f"Callback {task.id} completed")
+                log_event(logger, logging.INFO, f"Callback completed: {task.id}",
+                         event="callback_complete", task_id=task.id)
                 return
             except Exception as e:
                 logger.warning(f"Callback attempt {attempt + 1} failed: {e}")
@@ -477,6 +715,24 @@ class ToolManager:
         ]
         for task_id in to_remove:
             del self.scheduled_tasks[task_id]
+            
+    def _format_delay(self, seconds: int) -> str:
+        """Format delay for natural speech."""
+        if seconds < 60:
+            return f"{seconds} seconds"
+        elif seconds < 3600:
+            minutes = seconds // 60
+            remaining = seconds % 60
+            if remaining == 0:
+                return f"{minutes} minute{'s' if minutes != 1 else ''}"
+            return f"{minutes} minute{'s' if minutes != 1 else ''} and {remaining} seconds"
+        else:
+            hours = seconds // 3600
+            minutes = (seconds % 3600) // 60
+            parts = [f"{hours} hour{'s' if hours != 1 else ''}"]
+            if minutes:
+                parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+            return " and ".join(parts)
 
 
 # Convenience function for creating custom tools

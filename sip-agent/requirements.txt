@@ -1,0 +1,39 @@
+# SIP AI Assistant Dependencies (Lightweight)
+# ============================================
+# All ML inference is offloaded to Speaches API service:
+# - Whisper API for STT (OpenAI-compatible /v1/audio/transcriptions)
+# - Piper/Kokoro for TTS (OpenAI-compatible /v1/audio/speech)
+# - vLLM for LLM
+#
+# This container only handles audio processing and API orchestration.
+
+# Audio processing
+numpy>=1.24.0
+scipy>=1.10.0
+webrtcvad>=2.0.10
+soundfile>=0.12.0
+
+# HTTP clients for API communication
+httpx>=0.25.0
+aiohttp>=3.9.0
+aiofiles>=23.0.0
+
+# OpenAI-compatible client for LLM
+openai>=1.12.0
+
+# Async utilities
+aiocache>=0.12.0
+
+# Scheduling (for timers/callbacks)
+APScheduler>=3.10.0
+
+# Configuration
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+
+# Logging
+structlog>=23.0.0
+
+# HTTP server for health checks (optional)
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
