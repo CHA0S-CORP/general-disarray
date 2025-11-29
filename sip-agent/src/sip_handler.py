@@ -156,21 +156,14 @@ class SIPCall(pj.Call if PJSUA_AVAILABLE else object):
                 
     def _cleanup_media(self):
         """Clean up media resources (PJSIP thread only)."""
+        # Note: When call disconnects, PJSIP automatically disconnects all media.
+        # We just need to clear our references and clean up files.
+        # Calling stopTransmit() on disconnected media causes PJ_EINVAL errors.
+        
         try:
-            if self.recorder and self.aud_med:
-                try:
-                    self.aud_med.stopTransmit(self.recorder)
-                except:
-                    pass
-                self.recorder = None
-                
-            if self.player and self.aud_med:
-                try:
-                    self.player.stopTransmit(self.aud_med)
-                except:
-                    pass
-                self.player = None
-                
+            # Clear references (don't try to stop transmit - already done by PJSIP)
+            self.recorder = None
+            self.player = None
             self.aud_med = None
             
             # Clean up recording file
@@ -372,8 +365,10 @@ class PlaylistPlayer:
     def _cleanup_player(self, pj_call: SIPCall):
         """Clean up current player (PJSIP thread only)."""
         if self._pj_player:
+            # Only try to stop transmission if call is still active
+            # When call disconnects, PJSIP already cleaned up the media
             try:
-                if pj_call.aud_med:
+                if pj_call.aud_med and pj_call.call_info and pj_call.call_info.is_active:
                     self._pj_player.stopTransmit(pj_call.aud_med)
             except:
                 pass
