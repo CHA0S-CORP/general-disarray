@@ -150,9 +150,28 @@ services:
       - "5060:5060/udp"
       - "5060:5060/tcp"
       - "10000-10100:10000-10100/udp"  # RTP ports
+      - ${API_PORT:-8080}:${API_PORT:-8080}                     # API server port
     volumes:
       - ./data:/app/data
     restart: unless-stopped
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_HOST=0.0.0.0
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - WEBHOOK_URL=http://n8n:5678/
+      - GENERIC_TIMEZONE=America/Los_Angeles
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+volumes:
+  n8n_data:
 
 
 # ============================================================================

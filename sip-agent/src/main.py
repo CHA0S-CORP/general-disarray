@@ -168,7 +168,15 @@ class SIPAIAssistant:
         )
         
     async def start(self):
-        """Start all components."""
+        """Start all components and run main loop."""
+        await self.start_components()
+        
+        # Keep running
+        while self.running:
+            await asyncio.sleep(1)
+            
+    async def start_components(self):
+        """Start all components (without main loop)."""
         log_event(logger, logging.INFO, "Starting SIP AI Assistant...",
                  event="warming_up", phase="init")
         self.running = True
@@ -198,10 +206,16 @@ class SIPAIAssistant:
         sip_uri = f"sip:{self.config.sip_user}@{self.config.sip_domain}"
         log_event(logger, logging.INFO, f"SIP AI Assistant ready! URI: {sip_uri}",
                  event="ready", sip_uri=sip_uri)
-        
-        # Keep running
-        while self.running:
-            await asyncio.sleep(1)
+    
+    async def run_loop(self, shutdown_event: asyncio.Event = None):
+        """Run main loop until shutdown."""
+        try:
+            while self.running:
+                if shutdown_event and shutdown_event.is_set():
+                    break
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            pass
             
     async def stop(self):
         """Stop all components."""
@@ -626,21 +640,60 @@ async def main():
     # Handle shutdown
     loop = asyncio.get_event_loop()
     
+    shutdown_event = asyncio.Event()
+    
     def shutdown_handler():
         logger.info("Shutdown signal received")
-        asyncio.create_task(assistant.stop())
+        shutdown_event.set()
         
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, shutdown_handler)
-        
+    
+    # Start API server
+    api_port = int(os.environ.get("API_PORT", "8080"))
+    api_task = None
+    
     try:
-        await assistant.start()
+        # Start assistant
+        await assistant.start_components()
+        
+        # Create and start API
+        from api import create_api
+        import uvicorn
+        
+        app = create_api(assistant)
+        
+        uvicorn_config = uvicorn.Config(
+            app, 
+            host="0.0.0.0", 
+            port=api_port,
+            log_level="warning",
+            access_log=False
+        )
+        server = uvicorn.Server(uvicorn_config)
+        
+        log_event(logger, logging.INFO, f"API server starting on port {api_port}",
+                 event="api_started", port=api_port)
+        
+        # Run server in background
+        api_task = asyncio.create_task(server.serve())
+        
+        # Run assistant main loop
+        await assistant.run_loop(shutdown_event)
+        
     except Exception as e:
         logger.error(f"Fatal error: {e}")
         raise
     finally:
+        if api_task:
+            api_task.cancel()
+            try:
+                await api_task
+            except asyncio.CancelledError:
+                pass
         await assistant.stop()
 
 
 if __name__ == "__main__":
+    import os
     asyncio.run(main())

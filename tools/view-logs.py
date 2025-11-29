@@ -34,11 +34,24 @@ EVENT_STYLE = {
     # System events
     'warming_up': ('🔥', C.YELLOW, 'system'),
     'ready': ('✅', C.GREEN, 'system'),
+    'api_started': ('🌐', C.GREEN, 'system'),
     
     # Call lifecycle
     'call_start': ('📞', C.GREEN, 'call'),
     'call_end': ('📴', C.RED, 'call'),
     'call_timeout': ('📴', C.RED, 'call'),
+    
+    # Outbound calls
+    'outbound_call_initiated': ('📤', C.BLUE, 'call'),
+    'outbound_call_dialing': ('📞', C.YELLOW, 'call'),
+    'outbound_call_answered': ('📞', C.GREEN, 'call'),
+    'outbound_call_no_answer': ('📴', C.RED, 'call'),
+    'outbound_call_message_played': ('🔊', C.GREEN, 'call'),
+    'outbound_call_ack_played': ('✅', C.GREEN, 'call'),
+    'outbound_call_choice_collected': ('✅', C.GREEN, 'call'),
+    'outbound_call_choice_no_match': ('❓', C.YELLOW, 'call'),
+    'outbound_call_webhook': ('🔗', C.BLUE, 'call'),
+    'outbound_call_webhook_success': ('✅', C.GREEN, 'call'),
     
     # Speech/conversation
     'user_speech': ('🎤', C.CYAN, 'speech'),

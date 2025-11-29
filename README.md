@@ -45,6 +45,7 @@ A voice-based AI assistant that answers phone calls via SIP, powered by local LL
 - **Barge-in Support** - Interrupt the assistant mid-response
 - **Timers** - "Set a timer for 5 minutes"
 - **Callbacks** - "Call me back in 10 minutes"
+- **Outbound Call API** - REST API for notification calls with response collection
 - **Extensible Tools** - Easy to add new capabilities
 - **JSON Structured Logging** - Filterable event stream
 - **Pre-cached Phrases** - Low-latency greetings and acknowledgments
@@ -157,6 +158,115 @@ User: "Goodbye"
 Assistant: "Goodbye! Have a great day. [TOOL:HANGUP]"
 ```
 
+## Outbound Call API
+
+The assistant includes a REST API for initiating outbound notification calls with optional response collection.
+
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | Health check |
+| POST | `/call` | Initiate outbound call |
+| GET | `/call/{call_id}` | Check call status |
+
+### Basic Notification Call
+
+Send a message to an extension (no webhook needed for simple notifications):
+
+```bash
+curl -X POST http://localhost:8080/call \
+  -H "Content-Type: application/json" \
+  -d '{
+    "message": "Hello, this is a reminder about your appointment tomorrow at 2pm.",
+    "extension": "1001",
+    "ring_timeout": 30
+  }'
+```
+
+**Response:**
+```json
+{
+  "call_id": "out-1234567890-1",
+  "status": "queued",
+  "message": "Call initiated"
+}
+```
+
+### Call with Choice Collection
+
+Prompt the user for a response (webhook required to receive the choice):
+
+```bash
+curl -X POST http://localhost:8080/call \
+  -H "Content-Type: application/json" \
+  -d '{
+    "message": "Hello, this is a reminder about your appointment tomorrow at 2pm.",
+    "extension": "1001",
+    "callback_url": "https://example.com/webhook",
+    "ring_timeout": 30,
+    "choice": {
+      "prompt": "Would you like to confirm or cancel? Say yes to confirm or no to cancel.",
+      "options": [
+        {"value": "confirmed", "synonyms": ["yes", "yeah", "yep", "confirm", "okay", "sure"]},
+        {"value": "cancelled", "synonyms": ["no", "nope", "cancel", "nevermind"]}
+      ],
+      "timeout_seconds": 15,
+      "repeat_count": 2
+    }
+  }'
+```
+
+### Webhook Payload
+
+After the call completes, a POST request is sent to your `callback_url`:
+
+```json
+{
+  "call_id": "out-1234567890-1",
+  "status": "completed",
+  "extension": "1001",
+  "duration_seconds": 45.2,
+  "message_played": true,
+  "choice_response": "confirmed",
+  "choice_raw_text": "yes I confirm",
+  "error": null
+}
+```
+
+**Status Values:**
+- `completed` - Call answered, message played
+- `no_answer` - Call not answered within ring timeout
+- `failed` - Call failed to connect
+- `busy` - Extension was busy
+
+### Request Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `message` | string | Yes | Message to speak to recipient |
+| `extension` | string | Yes | SIP extension or full URI |
+| `callback_url` | string | If choice | Webhook URL for results (required when using choice) |
+| `ring_timeout` | int | No | Seconds to wait for answer (default: 30) |
+| `call_id` | string | No | Custom call ID for tracking |
+| `choice` | object | No | Choice prompt configuration |
+
+### Choice Configuration
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `prompt` | string | Yes | Question to ask the user |
+| `options` | array | Yes | List of valid choices |
+| `timeout_seconds` | int | No | Wait time for response (default: 30) |
+| `repeat_count` | int | No | Times to repeat if no response (default: 2) |
+
+### Choice Option
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `value` | string | Yes | Value returned in webhook |
+| `synonyms` | array | No | Alternative phrases that map to this choice |
+
 ## Log Viewer
 
 The included `view-logs.py` script provides filtered, formatted log output:
@@ -178,8 +288,14 @@ The included `view-logs.py` script provides filtered, formatted log output:
 |------|-------|-------------|
 | 🔥 | `warming_up` | Service starting |
 | ✅ | `ready` | Service ready |
+| 🌐 | `api_started` | API server started |
 | 📞 | `call_start` | Incoming/outgoing call |
 | 📴 | `call_end` | Call ended |
+| 📤 | `outbound_call_initiated` | Outbound call queued |
+| 📞 | `outbound_call_answered` | Outbound call answered |
+| 🔊 | `outbound_call_message_played` | Message played |
+| ✅ | `outbound_call_choice_collected` | User choice collected |
+| 🔗 | `outbound_call_webhook` | Webhook sent |
 | 🎤 | `user_speech` | User transcription |
 | 🤖 | `assistant_response` | LLM response |
 | 💬 | `assistant_ack` | Acknowledgment ("Okay", "Got it") |
@@ -219,6 +335,7 @@ sip-agent-speaches/
 ├── .env.example          # Configuration template
 ├── requirements.txt      # Python dependencies
 ├── main.py               # Main orchestrator
+├── api.py                # REST API for outbound calls
 ├── sip_handler.py        # PJSIP call handling
 ├── audio_pipeline.py     # STT/TTS via Speaches API
 ├── llm_engine.py         # LLM client (vLLM/OpenAI API)
