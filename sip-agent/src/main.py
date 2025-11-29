@@ -127,7 +127,7 @@ class SIPAIAssistant:
         
         self.greeting_phrases = [
             "Hello Professor! What chaos can I help you with today?",
-            "Im sorry dave, im afraid i cant do that.",
+            "Im sorry dave, i'm afraid i can't do that.",
             "What do you want, human?",
             # "Hey! What can I help you with?"
         ]

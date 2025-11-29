@@ -325,9 +325,9 @@ class WeatherTool(BaseTool):
                 parts.append(f"the humidity is {round(humidity)}%")
             
             if wind_mph is not None:
-                wind_desc = f"wind from the {wind_cardinal} at {wind_mph} mph"
+                wind_desc = f"wind from the {wind_cardinal} at {wind_mph} miles per hour"
                 if wind_gust_mph >0:
-                    wind_desc += f" with gusts to {wind_gust_mph}"
+                    wind_desc += f", gusting to {wind_gust_mph} miles per hour"
                 if wind_mph == 0:
                     wind_desc = f"Wind is currently calm"
                 if wind_mph >= 15:

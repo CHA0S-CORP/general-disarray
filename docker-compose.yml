@@ -105,7 +105,8 @@ services:
     build:
       context: sip-agent/
       dockerfile: Dockerfile
-    container_name: sip-ai-assistant
+    container_name: sip-agent
+    image: chaoscorp/sip-agent:latest-gb10
     depends_on:
       vllm:
         condition: service_healthy
