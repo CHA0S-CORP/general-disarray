@@ -214,13 +214,13 @@ def print_header(show_all: bool):
     print(f"{C.WHITE}{'═' * 70}{C.NC}")
     print(f"{C.WHITE}  SIP AI Assistant - Event Log{C.NC}")
     print(f"{C.WHITE}{'═' * 70}{C.NC}")
-    if show_all:
-        print(f"{C.GRAY}  Mode: ALL logs{C.NC}")
-    else:
-        print(f"{C.GRAY}  Showing: calls, speech, tools, tasks, errors{C.NC}")
-        print(f"{C.GRAY}  Use -a to show all logs{C.NC}")
-    print(f"{C.WHITE}{'─' * 70}{C.NC}")
-    print()
+    # if show_all:
+    #     print(f"{C.GRAY}  Mode: ALL logs{C.NC}")
+    # else:
+    #     print(f"{C.GRAY}  Showing: calls, speech, tools, tasks, errors{C.NC}")
+    #     print(f"{C.GRAY}  Use -a to show all logs{C.NC}")
+    # print(f"{C.WHITE}{'─' * 70}{C.NC}")
+    # print()
 
 def process_stream(stream, show_all: bool):
     for line in stream:
@@ -250,7 +250,6 @@ def main():
             process_stream(sys.stdin, args.all)
         else:
             cmd = ['docker', 'compose', 'logs', '--tail', '0', '-f', args.container]
-            print(f"{C.GRAY}  Running: {' '.join(cmd)}{C.NC}\n")
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
