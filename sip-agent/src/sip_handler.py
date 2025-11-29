@@ -911,3 +911,4 @@ class SIPHandler:
             
         # Enqueue for playback
         player.enqueue_file(wav_path)
+

@@ -5,6 +5,7 @@ Manages callable tools for the AI assistant.
 Includes timer, callback, and extensible tool framework.
 """
 
+import json
 import uuid
 import asyncio
 import logging
@@ -21,6 +22,16 @@ if TYPE_CHECKING:
 from config import Config
 
 logger = logging.getLogger(__name__)
+
+
+def log_event(logger, level, msg, event=None, **data):
+    """Helper to log structured events."""
+    extra = {}
+    if event:
+        extra['event'] = event
+    if data:
+        extra['data'] = data
+    logger.log(level, msg, extra=extra)
 
 
 class ToolStatus(Enum):
@@ -104,7 +115,8 @@ class TimerTool(BaseTool):
             target_uri=None  # Timer plays on current call
         )
         
-        logger.info(f"Timer set: {duration}s, message: {message}")
+        log_event(logger, logging.INFO, f"Timer set: {duration}s",
+                 event="timer_set", duration=duration, message=message, task_id=task_id)
         
         return ToolResult(
             status=ToolStatus.SUCCESS,
@@ -165,7 +177,8 @@ class CallbackTool(BaseTool):
             target_uri=target
         )
         
-        logger.info(f"Callback scheduled: {delay}s, uri: {target}")
+        log_event(logger, logging.INFO, f"Callback scheduled: {delay}s to {target}",
+                 event="callback_scheduled", delay=delay, uri=target, task_id=task_id)
         
         return ToolResult(
             status=ToolStatus.SUCCESS,
@@ -441,7 +454,8 @@ class ToolManager:
                 
     async def _execute_scheduled_task(self, task: ScheduledTask):
         """Execute a scheduled task."""
-        logger.info(f"Executing scheduled task: {task.id} ({task.task_type})")
+        log_event(logger, logging.INFO, f"Executing task: {task.id} ({task.task_type})",
+                 event="task_execute", task_id=task.id, task_type=task.task_type)
         
         try:
             if task.task_type == "timer":
@@ -456,6 +470,8 @@ class ToolManager:
             
     async def _execute_timer(self, task: ScheduledTask):
         """Execute a timer - speak the message on current call."""
+        log_event(logger, logging.INFO, f"Timer fired: {task.message}",
+                 event="timer_fired", task_id=task.id, message=task.message)
         if self.assistant.current_call and self.assistant.current_call.is_active:
             # Use streaming if available for consistent voice
             if hasattr(self.assistant, '_stream_response'):
@@ -471,6 +487,9 @@ class ToolManager:
             logger.error(f"Callback {task.id} has no target URI")
             return
             
+        log_event(logger, logging.INFO, f"Executing callback to {task.target_uri}",
+                 event="callback_execute", task_id=task.id, uri=task.target_uri)
+        
         # Make the call
         for attempt in range(self.config.callback_retry_attempts):
             try:
@@ -478,7 +497,8 @@ class ToolManager:
                     task.target_uri,
                     task.message
                 )
-                logger.info(f"Callback {task.id} completed")
+                log_event(logger, logging.INFO, f"Callback completed: {task.id}",
+                         event="callback_complete", task_id=task.id)
                 return
             except Exception as e:
                 logger.warning(f"Callback attempt {attempt + 1} failed: {e}")

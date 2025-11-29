@@ -9,6 +9,7 @@ All ML inference offloaded to dedicated services:
 This container is lightweight - just orchestration.
 """
 
+import json
 import time
 import random
 import signal
@@ -22,13 +23,51 @@ from config import Config, get_config
 from llm_engine import create_llm_engine
 from audio_pipeline import LowLatencyAudioPipeline
 
+class JSONFormatter(logging.Formatter):
+    """JSON log formatter for structured logging."""
+    
+    def format(self, record):
+        log_data = {
+            "ts": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        
+        # Add extra fields if present
+        if hasattr(record, 'event'):
+            log_data['event'] = record.event
+        if hasattr(record, 'data'):
+            log_data['data'] = record.data
+            
+        # Add exception info if present
+        if record.exc_info:
+            log_data['exc'] = self.formatException(record.exc_info)
+            
+        return json.dumps(log_data)
+
+
+def log_event(logger, level, msg, event=None, **data):
+    """Helper to log structured events."""
+    extra = {}
+    if event:
+        extra['event'] = event
+    if data:
+        extra['data'] = data
+    logger.log(level, msg, extra=extra)
+
+
+# Configure JSON logging
+handler = logging.StreamHandler()
+handler.setFormatter(JSONFormatter())
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-    ]
+    handlers=[handler]
 )
+
+# Reduce noise from libraries
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
@@ -222,7 +261,8 @@ class SIPAIAssistant:
                         pass
                 
                 remote_uri = getattr(call_info, 'remote_uri', 'unknown')
-                logger.info(f"Call received from: {remote_uri}")
+                log_event(logger, logging.INFO, f"Call received from: {remote_uri}",
+                         event="call_start", caller=remote_uri, direction="inbound")
                 
                 self.current_call = call_info
                 self.conversation_history = []
@@ -261,7 +301,8 @@ class SIPAIAssistant:
             try:
                 # Check call state
                 if not getattr(self.current_call, 'is_active', False):
-                    logger.info("Call ended, stopping audio loop")
+                    log_event(logger, logging.INFO, "Call ended, stopping audio loop",
+                             event="call_end")
                     break
                     
                 # Wait for media to be ready
@@ -279,14 +320,15 @@ class SIPAIAssistant:
                     if audio_chunk:
                         audio_received_count += 1
                         
-                        # Log periodically
+                        # Log periodically (debug level - not interesting for filtering)
                         if time.time() - last_log_time > 5:
-                            logger.info(f"Audio chunks received: {audio_received_count}")
+                            logger.debug(f"Audio chunks received: {audio_received_count}")
                             last_log_time = time.time()
                         
                         # Check for barge-in
                         if self._processing and self.audio_pipeline.has_speech(audio_chunk):
-                            logger.info("Barge-in detected")
+                            log_event(logger, logging.INFO, "Barge-in detected",
+                                     event="barge_in")
                             await self._handle_barge_in()
                             
                         # Process through VAD/STT
@@ -317,7 +359,8 @@ class SIPAIAssistant:
             logger.debug(f"Already processing, queuing: {text}")
             return
             
-        logger.info(f"User: {text}")
+        log_event(logger, logging.INFO, f"User: {text}",
+                 event="user_speech", text=text)
         
         # Add to history
         self.conversation_history.append({
@@ -331,13 +374,15 @@ class SIPAIAssistant:
         try:
             # Play acknowledgment so user knows we heard them
             ack = self.get_random_acknowledgment()
-            logger.info(f"Assistant: {ack}")
+            log_event(logger, logging.INFO, f"Assistant: {ack}",
+                     event="assistant_ack", text=ack)
             await self._speak(ack)
             
             response = await self._generate_response(text)
             
             if response:
-                logger.info(f"Assistant: {response}")
+                log_event(logger, logging.INFO, f"Assistant: {response}",
+                         event="assistant_response", text=response)
                 
                 # Add to history
                 self.conversation_history.append({
@@ -459,9 +504,13 @@ class SIPAIAssistant:
                     await asyncio.sleep(0.5)
                 else:
                     # Timed out waiting for answer
-                    logger.warning(f"Call to {uri} not answered within {ring_timeout}s")
+                    log_event(logger, logging.WARNING, f"Call to {uri} not answered",
+                             event="call_timeout", uri=uri, timeout=ring_timeout)
                     await self.sip_handler.hangup_call(call_info)
                     return
+                
+                log_event(logger, logging.INFO, f"Outbound call connected to {uri}",
+                         event="call_start", caller=uri, direction="outbound")
                 
                 # Small delay after answer for audio to stabilize
                 await asyncio.sleep(1)
@@ -492,7 +541,8 @@ class SIPAIAssistant:
                     
                     # Ask if they need anything else
                     followup = self.get_random_followup()
-                    logger.info(f"Assistant: {followup}")
+                    log_event(logger, logging.INFO, f"Assistant: {followup}",
+                             event="assistant_response", text=followup)
                     await self._speak(followup)
                     
                     # Start listening loop (runs until call ends)
