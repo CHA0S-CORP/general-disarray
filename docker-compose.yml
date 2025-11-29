@@ -76,7 +76,7 @@ services:
       - STT_MODEL_TTL=-1
       - TTS_MODEL_TTL=-1
       - VAD_MODEL_TTL=-1
-      - PORT=8001
+      - UVICORN_PORT=8001
       # TTS is configured via API request parameters (model/voice)
     ports:
       - "8001:8001"
