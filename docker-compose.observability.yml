@@ -1,0 +1,209 @@
+# Observability Stack for SIP AI Assistant
+# Include this file using: docker compose -f docker-compose.yml -f docker-compose.observability.yml up
+#
+# Components:
+# - OpenTelemetry Collector: Receives traces, metrics, logs from services
+# - Prometheus: Metrics storage and querying
+# - Tempo: Distributed tracing backend
+# - Loki: Log aggregation
+# - Grafana: Visualization and dashboards
+#
+# Access:
+# - Grafana: http://localhost:3000 (admin/admin)
+# - Prometheus: http://localhost:9090
+# - Tempo: http://localhost:3200
+
+services:
+  # ===================
+  # OpenTelemetry Collector
+  # ===================
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.115.0
+    container_name: otel-collector
+    command: ["--config=/etc/otel-collector/config.yaml"]
+    volumes:
+      - ./observability/otel-collector/config.yaml:/etc/otel-collector/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8888:8888"   # Prometheus metrics exposed by the collector
+    depends_on:
+      - tempo
+      - loki
+      - prometheus
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:13133/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ===================
+  # Prometheus - Metrics
+  # ===================
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yaml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-remote-write-receiver'
+      - '--enable-feature=exemplar-storage'
+      - '--enable-feature=native-histograms'
+    volumes:
+      - ./observability/prometheus/prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ===================
+  # Tempo - Traces
+  # ===================
+  tempo:
+    image: grafana/tempo:2.6.1
+    container_name: tempo
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./observability/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200"   # Tempo HTTP
+      - "9095:9095"   # Tempo gRPC
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3200/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ===================
+  # Loki - Logs
+  # ===================
+  loki:
+    image: grafana/loki:3.2.1
+    container_name: loki
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./observability/loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/var/loki
+    ports:
+      - "3100:3100"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3100/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ===================
+  # Grafana - Visualization
+  # ===================
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: grafana
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+      - GF_FEATURE_TOGGLES_ENABLE=traceqlEditor
+      - GF_SERVER_ROOT_URL=http://localhost:3000
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ===================
+  # Redis Exporter - Redis Metrics
+  # ===================
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.66.0
+    container_name: redis-exporter
+    environment:
+      - REDIS_ADDR=redis://redis:6379
+    ports:
+      - "9121:9121"
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  # ===================
+  # Override sip-agent with OTEL instrumentation
+  # ===================
+  sip-agent:
+    environment:
+      # OpenTelemetry configuration
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+      - OTEL_SERVICE_NAME=sip-agent
+      - OTEL_RESOURCE_ATTRIBUTES=service.namespace=sip-ai,deployment.environment=docker
+      - OTEL_TRACES_EXPORTER=otlp
+      - OTEL_METRICS_EXPORTER=otlp
+      - OTEL_LOGS_EXPORTER=otlp
+      - OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED=true
+      # Enable OTEL in our app
+      - OTEL_ENABLED=true
+    depends_on:
+      otel-collector:
+        condition: service_healthy
+
+  # ===================
+  # Override vLLM with OTEL tracing
+  # ===================
+  vllm:
+    environment:
+      # vLLM native OpenTelemetry support
+      - OTEL_SERVICE_NAME=vllm
+      - OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://otel-collector:4317
+      - OTEL_EXPORTER_OTLP_TRACES_INSECURE=true
+      - OTEL_RESOURCE_ATTRIBUTES=service.namespace=sip-ai,deployment.environment=docker
+    command:
+      - --model=${LLM_MODEL:-meta-llama/Llama-3.1-70B-Instruct}
+      - --host=0.0.0.0
+      - --port=8000
+      - --tensor-parallel-size=${TENSOR_PARALLEL_SIZE:-1}
+      - --gpu-memory-utilization=${GPU_MEMORY_UTILIZATION:-0.90}
+      - --max-model-len=${MAX_MODEL_LEN:-8192}
+      - --otlp-traces-endpoint=http://otel-collector:4317
+    depends_on:
+      otel-collector:
+        condition: service_healthy
+
+  # ===================
+  # Override Speaches with OTEL instrumentation
+  # ===================
+  speaches:
+    environment:
+      # OpenTelemetry for FastAPI auto-instrumentation
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+      - OTEL_SERVICE_NAME=speaches
+      - OTEL_RESOURCE_ATTRIBUTES=service.namespace=sip-ai,deployment.environment=docker
+      - OTEL_TRACES_EXPORTER=otlp
+      - OTEL_METRICS_EXPORTER=otlp
+      - OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED=true
+    depends_on:
+      otel-collector:
+        condition: service_healthy
+
+volumes:
+  prometheus-data:
+  tempo-data:
+  loki-data:
+  grafana-data:

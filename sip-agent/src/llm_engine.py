@@ -6,6 +6,7 @@ Supports multiple backends: vLLM, Ollama, LM Studio.
 """
 
 import re
+import time
 import logging
 from datetime import datetime
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ except ImportError:
     HTTPX_AVAILABLE = False
 
 from config import Config
+from telemetry import create_span, Metrics
 
 
 
@@ -158,38 +160,60 @@ class LLMEngine:
         if not self.client:
             # Mock response
             return self._mock_response(messages)
-            
-        try:
-            response = await self.client.chat.completions.create(
-                model=self.config.llm_model,
-                messages=messages,
-                max_tokens=self.config.llm_max_tokens,
-                temperature=self.config.llm_temperature,
-                top_p=self.config.llm_top_p
-            )
-            
-            # --- CRITICAL FIX ---
-            # gpt-oss-20b / vLLM can return None for content if it gets confused 
-            # or tries to use native tools. We must fallback to empty string.
-            content = response.choices[0].message.content
-            
-            # --- FIX: Handle Empty Content / Length Finish ---
-            if content is None or not content.strip():
+        
+        with create_span("llm.generate", {
+            "llm.model": self.config.llm_model,
+            "llm.messages_count": len(messages),
+            "llm.max_tokens": self.config.llm_max_tokens
+        }) as span:
+            start_time = time.time()
+            try:
+                response = await self.client.chat.completions.create(
+                    model=self.config.llm_model,
+                    messages=messages,
+                    max_tokens=self.config.llm_max_tokens,
+                    temperature=self.config.llm_temperature,
+                    top_p=self.config.llm_top_p
+                )
+                
+                latency_ms = (time.time() - start_time) * 1000
+                
+                # --- CRITICAL FIX ---
+                # gpt-oss-20b / vLLM can return None for content if it gets confused 
+                # or tries to use native tools. We must fallback to empty string.
+                content = response.choices[0].message.content
                 finish_reason = response.choices[0].finish_reason
-                logger.warning(f"LLM returned empty content. Reason: {finish_reason}")
                 
-                # If it ran out of tokens while thinking, we can't recover easily 
-                # without more tokens, so we give a polite error.
-                if finish_reason == 'length':
-                    return "I'm sorry, I was thinking too hard and ran out of time. Could you ask that again?"
+                span.set_attribute("llm.latency_ms", latency_ms)
+                span.set_attribute("llm.finish_reason", finish_reason or "unknown")
                 
-                return "I didn't catch that. Could you repeat it?"
+                # Record usage if available
+                if hasattr(response, 'usage') and response.usage:
+                    span.set_attribute("llm.prompt_tokens", response.usage.prompt_tokens)
+                    span.set_attribute("llm.completion_tokens", response.usage.completion_tokens)
+                    span.set_attribute("llm.total_tokens", response.usage.total_tokens)
+                
+                Metrics.record_llm_latency(latency_ms, self.config.llm_model)
+                
+                # --- FIX: Handle Empty Content / Length Finish ---
+                if content is None or not content.strip():
+                    logger.warning(f"LLM returned empty content. Reason: {finish_reason}")
+                    span.set_attribute("llm.empty_response", True)
+                    
+                    # If it ran out of tokens while thinking, we can't recover easily 
+                    # without more tokens, so we give a polite error.
+                    if finish_reason == 'length':
+                        return "I'm sorry, I was thinking too hard and ran out of time. Could you ask that again?"
+                    
+                    return "I didn't catch that. Could you repeat it?"
 
-            return content
-            
-        except Exception as e:
-            logger.error(f"LLM generation error: {e}")
-            return "I'm sorry, I'm having trouble processing that. Could you try again?"
+                span.set_attribute("llm.response_length", len(content))
+                return content
+                
+            except Exception as e:
+                logger.error(f"LLM generation error: {e}")
+                span.record_exception(e)
+                return "I'm sorry, I'm having trouble processing that. Could you try again?"
             
     def _mock_response(self, messages: List[Dict[str, str]]) -> str:
         """Generate mock response when LLM unavailable."""

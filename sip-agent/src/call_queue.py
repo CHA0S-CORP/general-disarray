@@ -144,7 +144,7 @@ class CallQueue:
             ex=86400  # Expire after 24 hours
         )
         
-        # Add to queue
+        # Add to queue - rpush returns new list length (our position)
         position = await self.redis.rpush(self.QUEUE_KEY, call_id)
         queued_call.position = position
         

@@ -40,3 +40,15 @@ structlog>=23.0.0
 # HTTP server for health checks (optional)
 fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
+
+# ===================
+# OpenTelemetry (optional - for observability)
+# ===================
+# These are optional and only used when OTEL_ENABLED=true
+opentelemetry-api>=1.28.0
+opentelemetry-sdk>=1.28.0
+opentelemetry-exporter-otlp-proto-grpc>=1.28.0
+opentelemetry-instrumentation-fastapi>=0.49b0
+opentelemetry-instrumentation-httpx>=0.49b0
+opentelemetry-instrumentation-redis>=0.49b0
+opentelemetry-instrumentation-logging>=0.49b0

@@ -1,0 +1,13 @@
+apiVersion: 1
+
+providers:
+  - name: 'SIP Agent Dashboards'
+    orgId: 1
+    folder: 'SIP Agent'
+    folderUid: 'sip-agent'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards

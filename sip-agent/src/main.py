@@ -23,6 +23,10 @@ from config import Config, get_config
 from llm_engine import create_llm_engine
 from audio_pipeline import LowLatencyAudioPipeline
 
+# Initialize OpenTelemetry early (before other modules)
+from telemetry import init_telemetry, is_enabled as otel_enabled, TraceContextFilter
+init_telemetry("sip-agent")
+
 class JSONFormatter(logging.Formatter):
     """JSON log formatter for structured logging."""
     
@@ -33,6 +37,12 @@ class JSONFormatter(logging.Formatter):
             "logger": record.name,
             "msg": record.getMessage(),
         }
+        
+        # Add trace context if available (from OpenTelemetry)
+        if hasattr(record, 'trace_id'):
+            log_data['trace_id'] = record.trace_id
+        if hasattr(record, 'span_id'):
+            log_data['span_id'] = record.span_id
         
         # Add extra fields if present (set by log_event)
         if hasattr(record, 'event_type'):
@@ -73,6 +83,7 @@ def log_event(log, level, msg, event=None, **data):
 # Configure JSON logging
 handler = logging.StreamHandler()
 handler.setFormatter(JSONFormatter())
+handler.addFilter(TraceContextFilter())  # Add trace context to logs
 logging.basicConfig(
     level=logging.INFO,
     handlers=[handler],
@@ -670,9 +681,13 @@ async def main():
         
         # Create and start API
         from api import create_api
+        from telemetry import instrument_fastapi
         import uvicorn
         
         app = create_api(assistant, call_queue)
+        
+        # Instrument FastAPI with OpenTelemetry
+        instrument_fastapi(app)
         
         # Start queue worker (uses handler from app.state)
         if call_queue:

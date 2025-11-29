@@ -33,6 +33,7 @@ except ImportError:
     SCIPY_AVAILABLE = False
 
 from config import Config
+from telemetry import create_span, Metrics
 
 
 logger = logging.getLogger(__name__)
@@ -238,42 +239,56 @@ class WhisperAPIClient:
         if not self.available or not self.client:
             logger.warning("Whisper API not available")
             return ""
-            
-        try:
-            wav_buffer = io.BytesIO()
-            with wave.open(wav_buffer, 'wb') as wav:
-                wav.setnchannels(1)
-                wav.setsampwidth(2)
-                wav.setframerate(self.config.sample_rate)
-                wav.writeframes(audio_data)
-            wav_buffer.seek(0)
-            
-            files = {
-                'file': ('audio.wav', wav_buffer, 'audio/wav')
-            }
-            data = {
-                'model': self.model,
-                'language': self.language,
-                'response_format': 'json'
-            }
-            
-            response = await self.client.post(
-                f"{self.base_url}/v1/audio/transcriptions",
-                files=files,
-                data=data
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                text = result.get('text', '').strip()
-                return text
-            else:
-                logger.error(f"Whisper API error: {response.status_code} - {response.text}")
-                return ""
+        
+        with create_span("stt.transcribe", {
+            "stt.model": self.model,
+            "stt.language": self.language,
+            "audio.bytes": len(audio_data)
+        }) as span:
+            start_time = time.time()
+            try:
+                wav_buffer = io.BytesIO()
+                with wave.open(wav_buffer, 'wb') as wav:
+                    wav.setnchannels(1)
+                    wav.setsampwidth(2)
+                    wav.setframerate(self.config.sample_rate)
+                    wav.writeframes(audio_data)
+                wav_buffer.seek(0)
                 
-        except Exception as e:
-            logger.error(f"Transcription error: {e}")
-            return ""
+                files = {
+                    'file': ('audio.wav', wav_buffer, 'audio/wav')
+                }
+                data = {
+                    'model': self.model,
+                    'language': self.language,
+                    'response_format': 'json'
+                }
+                
+                response = await self.client.post(
+                    f"{self.base_url}/v1/audio/transcriptions",
+                    files=files,
+                    data=data
+                )
+                
+                latency_ms = (time.time() - start_time) * 1000
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    text = result.get('text', '').strip()
+                    span.set_attribute("stt.text_length", len(text))
+                    span.set_attribute("stt.latency_ms", latency_ms)
+                    Metrics.record_stt_latency(latency_ms, self.model)
+                    return text
+                else:
+                    logger.error(f"Whisper API error: {response.status_code} - {response.text}")
+                    span.set_attribute("error", True)
+                    span.set_attribute("http.status_code", response.status_code)
+                    return ""
+                    
+            except Exception as e:
+                logger.error(f"Transcription error: {e}")
+                span.record_exception(e)
+                return ""
 
 
 # ============================================================================
@@ -459,41 +474,57 @@ class SpeachesTTSClient:
         """
         if not self.available or not self.client:
             return b''
-            
-        try:
-            # Build request payload (OpenAI-compatible format)
-            payload = {
-                "model": self.model,
-                "voice": self.voice,
-                "input": text,
-                "response_format": self.response_format,
-                "speed": self.speed
-            }
-            
-            response = await self.client.post(
-                f"{self.base_url}/v1/audio/speech",
-                json=payload,
-                timeout=30.0
-            )
-            
-            if response.status_code == 200:
-                audio_data = response.content
+        
+        with create_span("tts.synthesize", {
+            "tts.model": self.model,
+            "tts.voice": self.voice,
+            "tts.text_length": len(text)
+        }) as span:
+            start_time = time.time()
+            try:
+                # Build request payload (OpenAI-compatible format)
+                payload = {
+                    "model": self.model,
+                    "voice": self.voice,
+                    "input": text,
+                    "response_format": self.response_format,
+                    "speed": self.speed
+                }
                 
-                # If response is WAV, extract raw PCM data
-                if self.response_format == "wav" and audio_data[:4] == b'RIFF':
-                    audio_data = self._extract_wav_data(audio_data)
+                response = await self.client.post(
+                    f"{self.base_url}/v1/audio/speech",
+                    json=payload,
+                    timeout=30.0
+                )
+                
+                latency_ms = (time.time() - start_time) * 1000
+                
+                if response.status_code == 200:
+                    audio_data = response.content
                     
-                return audio_data
-            else:
-                logger.error(f"TTS API error: {response.status_code} - {response.text}")
+                    # If response is WAV, extract raw PCM data
+                    if self.response_format == "wav" and audio_data[:4] == b'RIFF':
+                        audio_data = self._extract_wav_data(audio_data)
+                    
+                    span.set_attribute("tts.audio_bytes", len(audio_data))
+                    span.set_attribute("tts.latency_ms", latency_ms)
+                    Metrics.record_tts_latency(latency_ms, self.model)
+                    return audio_data
+                else:
+                    logger.error(f"TTS API error: {response.status_code} - {response.text}")
+                    span.set_attribute("error", True)
+                    span.set_attribute("http.status_code", response.status_code)
+                    return b''
+                    
+            except asyncio.TimeoutError:
+                logger.warning("TTS response timeout")
+                span.set_attribute("error", True)
+                span.set_attribute("error.type", "timeout")
                 return b''
-                
-        except asyncio.TimeoutError:
-            logger.warning("TTS response timeout")
-            return b''
-        except Exception as e:
-            logger.error(f"TTS synthesis error: {e}")
-            return b''
+            except Exception as e:
+                logger.error(f"TTS synthesis error: {e}")
+                span.record_exception(e)
+                return b''
             
     def _extract_wav_data(self, wav_bytes: bytes) -> bytes:
         """Extract raw PCM data from WAV file, also detect sample rate."""

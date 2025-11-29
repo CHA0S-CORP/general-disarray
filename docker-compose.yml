@@ -5,10 +5,11 @@
 # Services:
 #   - vllm: LLM server (Llama 3.1 70B)
 #   - speaches: Unified STT (Whisper) + TTS (Piper/Kokoro) server
+#   - redis: Queue for outbound calls
 #   - sip-agent: Main SIP application
 
 services:
-    # ============================================================================
+  # ============================================================================
   # Redis - Queue for outbound calls
   # ============================================================================
   redis:
