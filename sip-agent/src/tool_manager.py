@@ -24,14 +24,14 @@ from config import Config
 logger = logging.getLogger(__name__)
 
 
-def log_event(logger, level, msg, event=None, **data):
+def log_event(log, level, msg, event=None, **data):
     """Helper to log structured events."""
     extra = {}
     if event:
-        extra['event'] = event
+        extra['event_type'] = event
     if data:
-        extra['data'] = data
-    logger.log(level, msg, extra=extra)
+        extra['event_data'] = data
+    log.log(level, msg, extra=extra)
 
 
 class ToolStatus(Enum):

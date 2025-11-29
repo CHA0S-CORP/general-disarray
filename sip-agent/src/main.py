@@ -34,11 +34,11 @@ class JSONFormatter(logging.Formatter):
             "msg": record.getMessage(),
         }
         
-        # Add extra fields if present
-        if hasattr(record, 'event'):
-            log_data['event'] = record.event
-        if hasattr(record, 'data'):
-            log_data['data'] = record.data
+        # Add extra fields if present (set by log_event)
+        if hasattr(record, 'event_type'):
+            log_data['event'] = record.event_type
+        if hasattr(record, 'event_data') and record.event_data:
+            log_data['data'] = record.event_data
             
         # Add exception info if present
         if record.exc_info:
@@ -47,14 +47,27 @@ class JSONFormatter(logging.Formatter):
         return json.dumps(log_data)
 
 
-def log_event(logger, level, msg, event=None, **data):
+class EventLogAdapter(logging.LoggerAdapter):
+    """Logger adapter that adds event fields."""
+    
+    def process(self, msg, kwargs):
+        extra = kwargs.get('extra', {})
+        if 'event' in extra:
+            extra['event_type'] = extra.pop('event')
+        if 'data' in extra:
+            extra['event_data'] = extra.pop('data')
+        kwargs['extra'] = extra
+        return msg, kwargs
+
+
+def log_event(log, level, msg, event=None, **data):
     """Helper to log structured events."""
     extra = {}
     if event:
-        extra['event'] = event
+        extra['event_type'] = event
     if data:
-        extra['data'] = data
-    logger.log(level, msg, extra=extra)
+        extra['event_data'] = data
+    log.log(level, msg, extra=extra)
 
 
 # Configure JSON logging
@@ -62,7 +75,8 @@ handler = logging.StreamHandler()
 handler.setFormatter(JSONFormatter())
 logging.basicConfig(
     level=logging.INFO,
-    handlers=[handler]
+    handlers=[handler],
+    force=True  # Override any existing config
 )
 
 # Reduce noise from libraries
@@ -155,27 +169,35 @@ class SIPAIAssistant:
         
     async def start(self):
         """Start all components."""
-        logger.info("Starting SIP AI Assistant...")
+        log_event(logger, logging.INFO, "Starting SIP AI Assistant...",
+                 event="warming_up", phase="init")
         self.running = True
         
         # Start components
-        logger.info("Starting LLM engine...")
+        log_event(logger, logging.INFO, "Starting LLM engine...",
+                 event="warming_up", phase="llm")
         await self.llm_engine.start()
         
-        logger.info("Starting audio pipeline...")
+        log_event(logger, logging.INFO, "Starting audio pipeline...",
+                 event="warming_up", phase="audio")
         await self.audio_pipeline.start()
         
         # Pre-cache common phrases
+        log_event(logger, logging.INFO, "Pre-caching TTS phrases...",
+                 event="warming_up", phase="tts_cache")
         await self._precache_phrases()
         
-        logger.info("Starting SIP handler...")
+        log_event(logger, logging.INFO, "Starting SIP handler...",
+                 event="warming_up", phase="sip")
         await self.sip_handler.start()
         
-        logger.info("Starting tool manager...")
+        log_event(logger, logging.INFO, "Starting tool manager...",
+                 event="warming_up", phase="tools")
         await self.tool_manager.start()
         
-        logger.info("SIP AI Assistant ready!")
-        logger.info(f"SIP URI: sip:{self.config.sip_user}@{self.config.sip_domain}")
+        sip_uri = f"sip:{self.config.sip_user}@{self.config.sip_domain}"
+        log_event(logger, logging.INFO, f"SIP AI Assistant ready! URI: {sip_uri}",
+                 event="ready", sip_uri=sip_uri)
         
         # Keep running
         while self.running:
@@ -580,7 +602,8 @@ class SIPAIAssistant:
             logger.warning("No destination for callback")
             return
             
-        logger.info(f"Scheduling callback in {delay}s to {destination}: {message}")
+        log_event(logger, logging.INFO, f"Callback scheduled: {delay}s to {destination}",
+                 event="callback_scheduled", delay=delay, destination=destination, message=message)
         
         # Use tool_manager's scheduler for proper task management
         await self.tool_manager.schedule_task(
