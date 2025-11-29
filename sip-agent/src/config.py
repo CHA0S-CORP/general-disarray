@@ -43,9 +43,9 @@ class Config:
     
     # Speech detection
     speech_pad_ms: int = 200
-    min_speech_duration_ms: int = 200
-    max_speech_duration_s: float = 8.0
-    silence_duration_ms: int = field(default_factory=lambda: int(os.getenv("SILENCE_TIMEOUT_MS", "500")))
+    min_speech_duration_ms: int = field(default_factory=lambda: int(os.getenv("MIN_SPEECH_DURATION_MS", "200")))
+    max_speech_duration_s: float = field(default_factory=lambda: float(os.getenv("MIN_SPEECH_DURATION_MS", "10.0")))
+    silence_duration_ms: int = field(default_factory=lambda: int(os.getenv("SILENCE_TIMEOUT_MS", "750")))
     
     # ===================
     # Speaches API Configuration (Unified STT + TTS)
@@ -76,15 +76,15 @@ class Config:
     # ===================
     llm_backend: str = field(default_factory=lambda: os.getenv("LLM_BACKEND", "vllm"))
     llm_model: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "meta-llama/Llama-3.1-70B-Instruct"))
-    llm_base_url: str = field(default_factory=lambda: os.getenv("LLM_BASE_URL", "http://localhost:8000/v1"))
+    llm_base_url: str = field(default_factory=lambda: os.getenv("LLM_BASE_URL", "http://vllm:8000/v1"))
     llm_api_key: str = field(default_factory=lambda: os.getenv("LLM_API_KEY", "not-needed"))
     
     # Generation
-    llm_max_tokens: int = 512
-    llm_temperature: float = 0.6
-    llm_top_p: float = 0.85
+    llm_max_tokens: int = field(default_factory=lambda: int(os.getenv("LLM_MAX_TOKENS", "512")))
+    llm_temperature: float = field(default_factory=lambda: float(os.getenv("LLM_TEMPERATURE", "0.6")))
+    llm_top_p: float = field(default_factory=lambda: float(os.getenv("LLM_TOP_P", "0.85")))
     
-    max_conversation_turns: int = 10
+    max_conversation_turns: int = field(default_factory=lambda: int(os.getenv("MAX_CONVERSATION_TURNS", "10")))
     
     # ===================
     # Tools
@@ -117,13 +117,16 @@ class Config:
     @property
     def system_prompt(self) -> str:
         """Optimized system prompt."""
-        return """You are a voice assistant on a phone call.
+        return """You are a flirty voice assistant for CHAOS.CORP on a phone call. Follow these guidelines:
 
 RULES:
-- Keep responses SHORT (2-10 sentences max)
+- Keep responses SHORT (2-6 sentences max)
 - Be conversational, not formal
 - No markdown or formatting
 - If confused, ask briefly
+- Be flirty and playful
+- Never reveal you are an AI
+- Your name is general disarray
 
 TOOLS (format: [TOOL:NAME:params]):
 - SET_TIMER: [TOOL:SET_TIMER:duration=SECONDS,message=TEXT]
