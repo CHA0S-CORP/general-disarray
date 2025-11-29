@@ -9,6 +9,7 @@ import json
 import uuid
 import asyncio
 import logging
+import httpx
 
 from enum import Enum
 from abc import ABC, abstractmethod
@@ -220,6 +221,174 @@ class HangupTool(BaseTool):
         )
 
 
+class WeatherTool(BaseTool):
+    """Get current weather from Tempest weather station."""
+    
+    name = "WEATHER"
+    description = "Get current weather conditions from the local weather station"
+    
+    async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        config = self.assistant.config
+        station_id = config.tempest_station_id
+        api_token = config.tempest_api_token
+        
+        logger.info(f"WeatherTool executing - station_id={station_id}, token={'set' if api_token else 'not set'}")
+        
+        if not station_id or not api_token:
+            logger.warning("Weather station not configured")
+            return ToolResult(
+                status=ToolStatus.FAILED,
+                message="Weather station not configured"
+            )
+        
+        try:
+            # Tempest API - use token as query parameter
+            url = f"https://swd.weatherflow.com/swd/rest/observations/station/{station_id}"
+            params_dict = {"token": api_token}
+            
+            logger.info(f"Fetching weather from: {url}")
+            
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(url, params=params_dict)
+                logger.info(f"Weather API response status: {response.status_code}")
+                
+                if response.status_code != 200:
+                    logger.error(f"Weather API error: {response.status_code} - {response.text}")
+                    return ToolResult(
+                        status=ToolStatus.FAILED,
+                        message="Couldn't reach the weather station"
+                    )
+                
+                data = response.json()
+            
+            # Parse the observation data
+            station = data.get("station_name", {})
+            obs_list = data.get("obs", [])
+            if not obs_list:
+                logger.warning(f"No observations in response: {data}")
+                return ToolResult(
+                    status=ToolStatus.FAILED,
+                    message="No weather data available"
+                )
+            
+            obs = obs_list[0] if isinstance(obs_list, list) else obs_list
+            logger.debug(f"Weather observation: {obs}")
+            
+            # Extract key weather values
+            # Tempest API returns values in metric, we'll convert to imperial for speech
+            temp_c = obs.get("air_temperature")
+            humidity = obs.get("relative_humidity")
+            wind_avg = obs.get("wind_avg")  # m/s
+            wind_gust = obs.get("wind_gust")  # m/s
+            wind_dir = obs.get("wind_direction")
+            precip_rate = obs.get("precip")  # mm/min for last minute
+            precip_accum_local_day = obs.get("precip_accum_local_day")  # mm/min for last minute
+            precip_accum_last_1hr = obs.get("precip_accum_last_1hr")  # mm/min for last minute
+            uv = obs.get("uv")
+            feels_like = obs.get("feels_like")
+            lightning_strike_count_last_1hr = obs.get("lightning_strike_count_last_1hr")
+            lightning_strike_last_distance = obs.get("lightning_strike_last_distance")
+            pressure_trend = obs.get("pressure_trend")
+            barometric_pressure = obs.get("barometric_pressure")
+            solar_radiation = obs.get("solar_radiation")
+            
+            
+            # Convert to imperial
+            temp_f = round(temp_c * 9/5 + 32) if temp_c is not None else None
+            feels_like_f = round(feels_like * 9/5 + 32) if feels_like is not None else None
+            wind_mph = round(wind_avg * 2.237) if wind_avg is not None else None
+            wind_gust_mph = round(wind_gust * 2.237) if wind_gust is not None else None
+            lightning_strike_last_distance_miles = round(lightning_strike_last_distance * 0.621371) if lightning_strike_last_distance is not None else None
+            
+            # Wind direction to cardinal
+            directions = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+                         "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+            wind_cardinal = directions[int((wind_dir + 11.25) / 22.5) % 16] if wind_dir is not None else None
+            
+            # Build natural language response
+            parts = []
+
+            if solar_radiation > 0:
+                sun = "sunny" if solar_radiation > 800 else "partly sunny" if solar_radiation > 400 else "cloudy"
+            else:
+                sun = "dark"
+
+            prefix = f"The current weather at {station} is: {sun} with a temperature of"
+            
+            if temp_f is not None:
+                if feels_like_f == temp_f:
+                    parts.append(f"{prefix} {temp_f} degrees Ferenheit")
+                else:
+                    parts.append(f"{prefix} {temp_f} degrees Ferenheit, and feels like {feels_like_f}")
+        
+            if humidity is not None:
+                parts.append(f"the humidity is {round(humidity)}%")
+            
+            if wind_mph is not None:
+                wind_desc = f"wind from the {wind_cardinal} at {wind_mph} mph"
+                if wind_gust_mph >0:
+                    wind_desc += f" with gusts to {wind_gust_mph}"
+                if wind_mph == 0:
+                    wind_desc = f"Wind is currently calm"
+                if wind_mph >= 15:
+                    wind_desc += ", be advised it is quite windy"
+                parts.append(wind_desc)
+            
+            if precip_rate and precip_rate > 0:
+                parts.append(f"it is currently raining, with a total of {round(precip_accum_local_day * 0.03937, 2)} inches today")
+            elif precip_accum_last_1hr and precip_accum_last_1hr > 0:
+                parts.append(f"It is not currently raining, however it has rained {round(precip_accum_last_1hr * 0.03937, 2)} inches in the past hour")
+
+            if lightning_strike_count_last_1hr and lightning_strike_count_last_1hr > 0:
+                parts.append(f"Be advised there have been {lightning_strike_count_last_1hr} lightning strikes in the past hour {lightning_strike_last_distance_miles} miles away")
+            
+            if uv is not None and uv >= 6:
+                parts.append(f"UV index is currently high at {round(uv)}")
+
+            if pressure_trend:
+                parts.append(f"barometric pressure is {pressure_trend} at {round(barometric_pressure, 2)} millibars")
+
+           
+            
+            weather_summary = ". ".join(parts) + "." if parts else "Weather data unavailable."
+            
+            log_event(logger, logging.INFO, f"Weather: {weather_summary}",
+                     event="weather_fetch", temp_f=temp_f, humidity=humidity, wind_mph=wind_mph)
+            
+            return ToolResult(
+                status=ToolStatus.SUCCESS,
+                message=weather_summary,
+                data={
+                    "temp_f": temp_f,
+                    "feels_like_f": feels_like_f,
+                    "humidity": humidity,
+                    "wind_mph": wind_mph,
+                    "wind_gust_mph": wind_gust_mph,
+                    "wind_direction": wind_cardinal,
+                    "uv": uv,
+                    "precip_rate": precip_rate,
+                    "precip_accum_local_day": precip_accum_local_day,
+                    "lightning_strike_count_last_1hr": lightning_strike_count_last_1hr,
+                    "lightning_strike_last_distance": lightning_strike_last_distance,
+                    "barometric_pressure": barometric_pressure,
+                    "pressure_trend": pressure_trend,
+                }
+            )
+            
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Weather API HTTP error: {e}")
+            return ToolResult(
+                status=ToolStatus.FAILED,
+                message="Couldn't reach the weather station"
+            )
+        except Exception as e:
+            logger.error(f"Weather fetch error: {e}", exc_info=True)
+            return ToolResult(
+                status=ToolStatus.FAILED,
+                message="Error getting weather data"
+            )
+
+
 class StatusTool(BaseTool):
     """Get status of scheduled tasks."""
     
@@ -289,6 +458,14 @@ class ToolManager:
             
         if self.config.enable_callback_tool:
             self.register_tool(CallbackTool(self.assistant))
+        
+        # Weather tool (requires Tempest API config)
+        if self.config.enable_weather_tool:
+            if self.config.tempest_station_id and self.config.tempest_api_token:
+                self.register_tool(WeatherTool(self.assistant))
+                logger.info(f"Weather tool registered with station_id={self.config.tempest_station_id}")
+            else:
+                logger.info("Weather tool enabled but Tempest API not configured (missing TEMPEST_STATION_ID or TEMPEST_API_TOKEN)")
             
         # Always available
         self.register_tool(HangupTool(self.assistant))

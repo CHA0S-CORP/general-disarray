@@ -1,276 +1,307 @@
 # SIP AI Assistant
 
-A fully local voice AI assistant that communicates via SIP phone calls. Designed for NVIDIA GB10/Grace Blackwell with 100GB+ VRAM.
-
-## Features
-
-- **Speech-to-Text**: OpenAI Whisper with CUDA acceleration (large-v3 by default)
-- **LLM**: vLLM serving Llama 3.1 70B (or other models)
-- **Text-to-Speech**: XTTS v2 with voice cloning and streaming support
-- **SIP Integration**: Full PJSIP implementation for phone calls
-- **Smart Barge-in**: Interrupt the AI mid-speech
-- **Tools**: Timers, callbacks, and extensible tool framework
+A voice-based AI assistant that answers phone calls via SIP, powered by local LLM inference. Supports natural conversations, timers, callbacks, and extensible tools.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Docker Compose                            │
-├─────────────────────────────────────────────────────────────┤
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
-│  │   vLLM      │  │   XTTS      │  │   SIP Assistant     │  │
-│  │  (LLM)      │  │  (TTS API)  │  │  (Main App)         │  │
-│  │  Port 8000  │  │  Port 8001  │  │  Port 5060          │  │
-│  └─────────────┘  └─────────────┘  └─────────────────────┘  │
-│        ↑               ↑                    │               │
-│        └───────────────┴────────────────────┘               │
-└─────────────────────────────────────────────────────────────┘
-                         │
-                         │ SIP/RTP
-                         ↓
-                  ┌─────────────┐
-                  │  Asterisk   │
-                  │  PBX        │
-                  └─────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Docker Compose                               │
+├─────────────────┬─────────────────────┬─────────────────────────────┤
+│                 │                     │                             │
+│    vLLM         │     Speaches        │      SIP Agent              │
+│    Server       │     (STT + TTS)     │      (Orchestrator)         │
+│                 │                     │                             │
+│  ┌───────────┐  │  ┌───────────────┐  │  ┌───────────────────────┐  │
+│  │ LLM Model │  │  │ Whisper (STT) │  │  │  PJSIP Call Handler   │  │
+│  │ (Qwen2.5) │  │  │ Kokoro (TTS)  │  │  │  Audio Pipeline       │  │
+│  └───────────┘  │  └───────────────┘  │  │  Tool Manager         │  │
+│                 │                     │  │  LLM Client            │  │
+│  Port: 8000     │  Port: 8001         │  └───────────────────────┘  │
+│                 │                     │                             │
+└─────────────────┴─────────────────────┴─────────────────────────────┘
+                                              │
+                                              ▼
+                                    ┌───────────────────┐
+                                    │   SIP Server      │
+                                    │   (Asterisk/      │
+                                    │    FreeSWITCH)    │
+                                    └───────────────────┘
 ```
+
+**Components:**
+
+| Service | Purpose | Model/Tech |
+|---------|---------|------------|
+| **vLLM** | LLM inference | Qwen2.5-7B-Instruct (configurable) |
+| **Speaches** | Speech-to-Text | Whisper (configurable size) |
+| **Speaches** | Text-to-Speech | Kokoro-82M with af_heart voice |
+| **SIP Agent** | Orchestration | PJSIP + Python asyncio |
+
+## Features
+
+- **Natural Conversations** - Context-aware multi-turn dialogue
+- **Voice Activity Detection** - Automatic speech endpoint detection
+- **Barge-in Support** - Interrupt the assistant mid-response
+- **Timers** - "Set a timer for 5 minutes"
+- **Callbacks** - "Call me back in 10 minutes"
+- **Extensible Tools** - Easy to add new capabilities
+- **JSON Structured Logging** - Filterable event stream
+- **Pre-cached Phrases** - Low-latency greetings and acknowledgments
+
+## Prerequisites
+
+- Docker & Docker Compose
+- NVIDIA GPU with CUDA support
+- SIP server (Asterisk, FreeSWITCH, etc.)
+- ~16GB+ VRAM recommended for default models
 
 ## Quick Start
 
-### 1. Prerequisites
+1. **Clone and configure:**
+   ```bash
+   cp .env.example .env
+   # Edit .env with your settings
+   ```
 
-- Docker with NVIDIA Container Toolkit
-- NVIDIA GPU with 32GB+ VRAM (GB10 recommended)
-- Asterisk PBX or SIP server
+2. **Start services:**
+   ```bash
+   docker compose up -d
+   ```
 
-### 2. Configuration
+3. **View logs:**
+   ```bash
+   ./view-logs.py
+   ```
 
-```bash
-# Copy example config
-cp .env.example .env
+4. **Call the SIP extension** configured in your `.env`
 
-# Edit with your settings
-nano .env
-```
-
-Key settings:
-- `HF_TOKEN`: HuggingFace token for model downloads
-- `SIP_USER`, `SIP_PASSWORD`, `SIP_DOMAIN`: SIP credentials
-- `WHISPER_MODEL`: STT model size (large-v3 recommended)
-- `LLM_MODEL`: LLM to use (default: Llama 3.1 70B)
-
-### 3. Launch
-
-```bash
-# Build and start all services
-docker-compose up -d
-
-# Watch logs
-docker-compose logs -f
-
-# Check status
-docker-compose ps
-```
-
-### 4. Create Voice Profile (Optional)
-
-```bash
-# Record 10-30 seconds of clear speech
-# Then create a voice profile:
-python voice_manager.py create my_voice reference.wav --default --test
-```
-
-## GPU Memory Usage
-
-With GB10 (100GB+ unified memory):
-
-| Component | Memory Usage |
-|-----------|-------------|
-| vLLM (70B) | ~50-60 GB |
-| XTTS v2 | ~6 GB |
-| Whisper large-v3 | ~3 GB |
-| **Total** | ~60-70 GB |
-
-For smaller GPUs, adjust `LLM_MODEL` to use smaller models.
-
-## Voice Cloning
-
-The XTTS server supports voice cloning from reference audio:
-
-```bash
-# Create a profile
-python voice_manager.py create assistant reference.wav
-
-# List profiles
-python voice_manager.py list
-
-# Test synthesis
-python voice_manager.py test assistant "Hello, this is a test!"
-
-# Delete profile
-python voice_manager.py delete assistant
-```
-
-### Reference Audio Tips
-
-- **Duration**: 5-30 seconds of clear speech
-- **Quality**: Clean recording, minimal background noise
-- **Content**: Natural conversational speech
-- **Format**: WAV, MP3, FLAC, or OGG
-
-## Configuration Reference
+## Configuration
 
 ### Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `HF_TOKEN` | - | HuggingFace token |
-| `LLM_MODEL` | `meta-llama/Llama-3.1-70B-Instruct` | LLM model |
-| `WHISPER_MODEL` | `large-v3` | Whisper model size |
-| `WHISPER_DEVICE` | `cuda` | STT device |
-| `SIP_USER` | `ai-assistant` | SIP username |
-| `SIP_PASSWORD` | - | SIP password |
-| `SIP_DOMAIN` | `localhost` | SIP domain |
-| `XTTS_DEFAULT_VOICE` | - | Default voice profile |
-| `BARGE_IN_MIN_DURATION` | `700` | Barge-in sensitivity (ms) |
-| `BARGE_IN_ENERGY_THRESHOLD` | `2500` | Barge-in volume threshold |
-
-### Asterisk Configuration
-
-Example `pjsip.conf`:
-
-```ini
-[ai-assistant]
-type=endpoint
-context=internal
-disallow=all
-allow=ulaw
-allow=alaw
-auth=ai-assistant-auth
-aors=ai-assistant-aor
-
-[ai-assistant-auth]
-type=auth
-auth_type=userpass
-username=ai-assistant
-password=your-password-here
-
-[ai-assistant-aor]
-type=aor
-max_contacts=1
-```
-
-Example `extensions.conf`:
-
-```ini
-[internal]
-exten => 100,1,Dial(PJSIP/ai-assistant)
-```
-
-## API Reference
-
-### XTTS Server Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check |
-| `/v1/tts` | POST | Synthesize speech |
-| `/v1/tts/stream` | POST | Stream synthesis (SSE) |
-| `/v1/tts/raw` | POST | Raw PCM output |
-| `/v1/voices` | GET | List voices |
-| `/v1/voices` | POST | Create voice |
-| `/v1/voices/{name}` | DELETE | Delete voice |
-
-### Example: Synthesize Speech
+Copy `.env.example` to `.env` and configure:
 
 ```bash
-curl -X POST http://localhost:8001/v1/tts \
-  -H "Content-Type: application/json" \
-  -d '{"text": "Hello world", "voice": "default"}' \
-  --output speech.wav
+# SIP Configuration
+SIP_USER=1000                    # SIP extension/username
+SIP_PASSWORD=secret              # SIP password
+SIP_DOMAIN=pbx.example.com       # SIP server domain
+SIP_REGISTRAR=pbx.example.com    # SIP registrar (optional)
+
+# LLM Configuration
+LLM_MODEL=Qwen/Qwen2.5-7B-Instruct  # HuggingFace model ID
+LLM_API_URL=http://vllm:8000/v1     # vLLM endpoint
+
+# Speech Configuration
+SPEACHES_URL=http://speaches:8001   # Speaches API endpoint
+WHISPER_MODEL=base                  # tiny, base, small, medium, large
+WHISPER_COMPUTE_TYPE=auto           # auto, int8, float16, float32
+TTS_MODEL=kokoro                    # TTS model
+TTS_VOICE=af_heart                  # Voice preset
+
+# Audio Settings
+SAMPLE_RATE=16000                   # Audio sample rate
+
+# Callback Settings
+CALLBACK_RING_TIMEOUT=30            # Seconds to wait for answer
+CALLBACK_RETRY_ATTEMPTS=2           # Retry failed callbacks
+CALLBACK_RETRY_DELAY=30             # Seconds between retries
+
+# Tempest Weather API (optional)
+TEMPEST_STATION_ID=12345            # Your Tempest station ID
+TEMPEST_API_TOKEN=your-token        # API token from tempestwx.com
+```
+
+### System Prompt
+
+Edit `config.py` to customize the assistant's personality and behavior:
+
+```python
+SYSTEM_PROMPT = """You are a helpful AI voice assistant...
+
+Available tools:
+- TIMER: [TOOL:TIMER:duration=SECONDS,message=TEXT]
+- CALLBACK: [TOOL:CALLBACK:delay=SECONDS,message=TEXT]
+- WEATHER: [TOOL:WEATHER]
+- HANGUP: [TOOL:HANGUP]
+"""
+```
+
+## Tools
+
+The assistant supports inline tool calls in responses:
+
+### Timer
+```
+User: "Set a timer for 5 minutes"
+Assistant: "I've set a timer for 5 minutes. [TOOL:TIMER:duration=300,message=Your 5 minute timer is done!]"
+```
+
+### Callback
+```
+User: "Call me back in 10 minutes to remind me about the meeting"
+Assistant: "I'll call you back in 10 minutes. [TOOL:CALLBACK:delay=600,message=This is your reminder about the meeting]"
+```
+
+### Weather
+```
+User: "What's the weather like?"
+Assistant: "Let me check. [TOOL:WEATHER] It's 72 degrees, 45% humidity, with wind from the northwest at 8 mph."
+```
+Requires `TEMPEST_STATION_ID` and `TEMPEST_API_TOKEN` to be configured. Get these from [tempestwx.com/settings/tokens](https://tempestwx.com/settings/tokens).
+
+### Hangup
+```
+User: "Goodbye"
+Assistant: "Goodbye! Have a great day. [TOOL:HANGUP]"
+```
+
+## Log Viewer
+
+The included `view-logs.py` script provides filtered, formatted log output:
+
+```bash
+# View interesting events only (default)
+./view-logs.py
+
+# View all logs
+./view-logs.py -a
+
+# Tail specific service
+./view-logs.py sip-agent
+```
+
+**Event Types:**
+
+| Icon | Event | Description |
+|------|-------|-------------|
+| 🔥 | `warming_up` | Service starting |
+| ✅ | `ready` | Service ready |
+| 📞 | `call_start` | Incoming/outgoing call |
+| 📴 | `call_end` | Call ended |
+| 🎤 | `user_speech` | User transcription |
+| 🤖 | `assistant_response` | LLM response |
+| 💬 | `assistant_ack` | Acknowledgment ("Okay", "Got it") |
+| 🔧 | `tool_call` | Tool invoked |
+| 📋 | `task_scheduled` | Timer/callback scheduled |
+| ⏰ | `timer_set` | Timer created |
+| 🔔 | `timer_fired` | Timer completed |
+| 📲 | `callback_scheduled` | Callback scheduled |
+| 🌤️ | `weather_fetch` | Weather data retrieved |
+| ⚡ | `task_execute` | Task executing |
+| ✋ | `barge_in` | User interrupted |
+
+**Sample Output:**
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ⟵ CALL #1: sip:420@10.42.252.54
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+00:15:23     🎤 User: Set a timer for 30 seconds
+00:15:24     💬 Assistant: Okay
+00:15:25       🔧 Tool called: TIMER (params=delay=30, message=...)
+00:15:25       📋 Task scheduled: timer in 30s
+00:15:26     🤖 Assistant: I've set a timer for 30 seconds
+00:15:55       🔔 Timer fired: Your timer is done
+
+──────────────────────────────────────────────────────────────────────
+  ✗ CALL ENDED
+──────────────────────────────────────────────────────────────────────
+```
+
+## Project Structure
+
+```
+sip-agent-speaches/
+├── docker-compose.yml    # Service definitions
+├── Dockerfile            # SIP agent container
+├── .env.example          # Configuration template
+├── requirements.txt      # Python dependencies
+├── main.py               # Main orchestrator
+├── sip_handler.py        # PJSIP call handling
+├── audio_pipeline.py     # STT/TTS via Speaches API
+├── llm_engine.py         # LLM client (vLLM/OpenAI API)
+├── tool_manager.py       # Timer, callback, tool framework
+├── config.py             # Configuration and system prompt
+├── view-logs.py          # Log viewer script
+└── README.md             # This file
 ```
 
 ## Troubleshooting
 
-### XTTS Not Loading
+### "Requested float16 compute type, but device does not support"
+Set `WHISPER_COMPUTE_TYPE=auto` in `.env` to auto-detect the best compute type.
 
-```bash
-# Check XTTS logs
-docker-compose logs xtts
+### Call connects but no audio
+- Check SIP server NAT settings
+- Verify RTP ports are open (10000-10100)
+- Check `SIP_DOMAIN` matches your server
 
-# Verify GPU access
-docker-compose exec xtts nvidia-smi
+### Slow response times
+- Use a smaller Whisper model (`tiny` or `base`)
+- Ensure GPU is being utilized (check `nvidia-smi`)
+- Pre-cache common phrases (enabled by default)
+
+### PJSIP assertion errors on shutdown
+These are cosmetic and don't affect operation. The cleanup sequence handles them gracefully.
+
+### Tool calls not working
+Ensure the LLM response contains the exact format:
+```
+[TOOL:TOOLNAME:param1=value1,param2=value2]
 ```
 
-### Whisper CUDA Issues
+## Hardware Requirements
 
-The app uses standard OpenAI Whisper instead of faster-whisper for better GB10 compatibility. If you see CUDA errors:
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| GPU VRAM | 8GB | 16GB+ |
+| System RAM | 16GB | 32GB |
+| CPU | 4 cores | 8+ cores |
 
-```bash
-# Check CUDA setup
-docker-compose exec sip-assistant python3 -c "import torch; print(torch.cuda.is_available())"
-```
+**Tested Configurations:**
+- NVIDIA RTX 4090 (24GB) - All models
+- NVIDIA DGX Spark GB10 - With ARM64 compatibility fixes
+- NVIDIA RTX 3080 (10GB) - Smaller models
 
-### SIP Registration Failed
+## Extending
 
-1. Check credentials in `.env`
-2. Verify Asterisk is reachable
-3. Check firewall (ports 5060/udp, 10000-10100/udp)
+### Adding New Tools
 
-```bash
-# Test SIP connectivity
-docker-compose exec sip-assistant python3 -c "
-from sip_handler import SIPHandler
-# ...test code...
-"
-```
+1. Create a tool class in `tool_manager.py`:
+   ```python
+   class WeatherTool(BaseTool):
+       name = "WEATHER"
+       description = "Get current weather"
+       
+       async def execute(self, params: Dict[str, Any]) -> ToolResult:
+           location = params.get('location', 'default')
+           # Implement weather lookup
+           return ToolResult(
+               status=ToolStatus.SUCCESS,
+               message=f"The weather in {location} is sunny"
+           )
+   ```
 
-### Audio Quality Issues
+2. Register in `ToolManager.start()`:
+   ```python
+   self.register_tool(WeatherTool(self.assistant))
+   ```
 
-- Increase `BARGE_IN_ENERGY_THRESHOLD` for noisy environments
-- Adjust `WHISPER_MODEL` for accuracy vs speed
-- Try different XTTS temperature settings
-
-## Development
-
-### Local Testing (without Docker)
-
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Run XTTS server
-python xtts_server.py &
-
-# Run main app
-python main.py
-```
-
-### Adding Custom Tools
-
-Edit `tool_manager.py`:
-
-```python
-class MyCustomTool(BaseTool):
-    name = "MY_TOOL"
-    description = "Description for LLM"
-    
-    async def execute(self, params: Dict[str, Any]) -> ToolResult:
-        # Your logic here
-        return ToolResult(
-            status=ToolStatus.SUCCESS,
-            message="Done!"
-        )
-```
+3. Update system prompt in `config.py`:
+   ```
+   - WEATHER: [TOOL:WEATHER:location=CITY]
+   ```
 
 ## License
 
 MIT License - See LICENSE file for details.
 
-## Contributing
+## Acknowledgments
 
-Pull requests welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch
-3. Add tests for new features
-4. Submit a PR with clear description
+- [PJSIP](https://www.pjsip.org/) - SIP stack
+- [Speaches](https://github.com/speaches-ai/speaches) - STT/TTS API
+- [vLLM](https://github.com/vllm-project/vllm) - LLM inference
+- [Whisper](https://github.com/openai/whisper) - Speech recognition
+- [Kokoro](https://huggingface.co/hexgrad/Kokoro-82M) - Text-to-speech

@@ -14,7 +14,6 @@ import sys
 import json
 import argparse
 import subprocess
-from datetime import datetime
 
 # ANSI colors
 class C:
@@ -51,6 +50,7 @@ EVENT_STYLE = {
     'tool_call': ('🔧', C.WHITE, 'tool'),
     'timer_set': ('⏰', C.YELLOW, 'tool'),
     'callback_scheduled': ('📲', C.BLUE, 'tool'),
+    'weather_fetch': ('🌤️', C.CYAN, 'tool'),
     
     # Task execution
     'task_scheduled': ('📋', C.BLUE, 'task'),
@@ -224,8 +224,6 @@ def print_header(show_all: bool):
 
 def process_stream(stream, show_all: bool):
     for line in stream:
-        if isinstance(line, bytes):
-            line = line.decode('utf-8', errors='replace')
         formatted = format_log(line, show_all)
         if formatted:
             print(formatted, flush=True)
@@ -254,9 +252,9 @@ def main():
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,         # Enable text mode
-                bufsize=1,         # Line buffering (now works)
-                errors='replace'   # Handle encoding errors
+                text=True,
+                bufsize=1,
+                errors='replace'
             )
             process_stream(process.stdout, args.all)
             

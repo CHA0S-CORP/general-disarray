@@ -114,11 +114,20 @@ class LLMEngine:
         # Parse and execute any tool calls
         response_text, tool_results = await self._process_tool_calls(response_text)
         
-        # If tools were called, we might want to incorporate results
-        if tool_results:
-            # For voice, we typically just confirm the action was taken
-            # The tool call is already parsed out of the response
-            pass
+        # Append results from informational tools (like WEATHER)
+        # These tools return data that should be spoken to the user
+        for result in tool_results:
+            tool_name = result.get("tool", "")
+            tool_result = result.get("result")
+            
+            # For informational tools, append the result message
+            if tool_name in ("WEATHER", "STATUS") and tool_result:
+                if hasattr(tool_result, 'message') and tool_result.message:
+                    # Add the result to the response
+                    if response_text:
+                        response_text = f"{response_text} {tool_result.message}"
+                    else:
+                        response_text = tool_result.message
             
         return response_text
         

@@ -632,17 +632,32 @@ class SIPHandler:
             # Cleanup in PJSIP thread (after loop exits)
             logger.info("PJSIP thread shutting down...")
             try:
-                # Hangup all calls first
-                for call in list(self.active_calls.values()):
+                # Hangup all calls first and clear all references
+                calls_to_cleanup = list(self.active_calls.values())
+                self.active_calls.clear()  # Clear dict first
+                
+                for call in calls_to_cleanup:
                     try:
-                        # Clear the call_info reference to break circular refs
+                        # Clear all references to break circular refs
                         if hasattr(call, 'call_info') and call.call_info:
                             call.call_info.pj_call = None
                             call.call_info = None
+                        # Clear media references
+                        call.aud_med = None
+                        call.recorder = None
+                        call.player = None
+                        call.handler = None
                         prm = pj.CallOpParam()
                         call.hangup(prm)
                     except:
                         pass
+                del calls_to_cleanup
+                
+                # Clear playlist players
+                with self._playlist_lock:
+                    for player in self._playlist_players.values():
+                        player._pj_player = None
+                    self._playlist_players.clear()
                 
                 # Process events to let hangups complete
                 for _ in range(10):
@@ -657,6 +672,7 @@ class SIPHandler:
                 # Delete account before destroying library
                 if self.account:
                     try:
+                        self.account.handler = None  # Break circular ref
                         self.account.shutdown()
                     except:
                         pass
@@ -668,6 +684,13 @@ class SIPHandler:
                         self.endpoint.libHandleEvents(50)
                     except:
                         break
+                
+                # Force garbage collection to clean up any remaining PJSIP objects
+                # BEFORE destroying the library. This prevents the assertion error
+                # when Python's GC tries to clean up Call objects after libDestroy.
+                import gc
+                gc.collect()
+                gc.collect()  # Run twice to catch weak refs and circular refs
                 
                 # Destroy endpoint
                 if self.endpoint:
@@ -753,6 +776,16 @@ class SIPHandler:
                 if call_id in self._playlist_players:
                     self._playlist_players[call_id].stop_all()
                     del self._playlist_players[call_id]
+            
+            # Clear circular references to allow garbage collection
+            call.call_info.pj_call = None
+            call.call_info = None
+        
+        # Clear other references
+        call.handler = None
+        call.aud_med = None
+        call.recorder = None
+        call.player = None
                 
     async def hangup_call(self, call_info: CallInfo):
         """Hangup a call."""

@@ -91,12 +91,17 @@ class Config:
     # ===================
     enable_timer_tool: bool = True
     enable_callback_tool: bool = True
+    enable_weather_tool: bool = True
     enable_search_tool: bool = False
     enable_calendar_tool: bool = False
     max_timer_duration_hours: int = 24
     callback_retry_attempts: int = 3
     callback_retry_delay_s: int = 60
     callback_ring_timeout_s: int = field(default_factory=lambda: int(os.getenv("CALLBACK_RING_TIMEOUT", "30")))
+    
+    # Tempest Weather API
+    tempest_station_id: str = field(default_factory=lambda: os.getenv("TEMPEST_STATION_ID", ""))
+    tempest_api_token: str = field(default_factory=lambda: os.getenv("TEMPEST_API_TOKEN", ""))
     
     # ===================
     # System
@@ -115,7 +120,7 @@ class Config:
         return """You are a voice assistant on a phone call.
 
 RULES:
-- Keep responses SHORT (2-6 sentences max)
+- Keep responses SHORT (2-10 sentences max)
 - Be conversational, not formal
 - No markdown or formatting
 - If confused, ask briefly
@@ -124,9 +129,8 @@ TOOLS (format: [TOOL:NAME:params]):
 - SET_TIMER: [TOOL:SET_TIMER:duration=SECONDS,message=TEXT]
 - CALLBACK: [TOOL:CALLBACK:delay=SECONDS,message=TEXT] (calls back the current caller)
   Optional: destination=NUMBER (only if calling a different number)
+- WEATHER: [TOOL:WEATHER] (get current weather conditions)
 - HANGUP: [TOOL:HANGUP]
-
-use tools when appropriate to help the user. Phrases like goodbye or thank you often indicate the end of the call.
 
 Be helpful and concise."""
 

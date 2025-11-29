@@ -1,8 +1,8 @@
 # SIP AI Assistant Dependencies (Lightweight)
 # ============================================
-# All ML inference is offloaded to API services:
-# - Whisper API for STT
-# - Piper TTS via Wyoming protocol
+# All ML inference is offloaded to Speaches API service:
+# - Whisper API for STT (OpenAI-compatible /v1/audio/transcriptions)
+# - Piper/Kokoro for TTS (OpenAI-compatible /v1/audio/speech)
 # - vLLM for LLM
 #
 # This container only handles audio processing and API orchestration.
@@ -20,9 +20,6 @@ aiofiles>=23.0.0
 
 # OpenAI-compatible client for LLM
 openai>=1.12.0
-
-# Wyoming protocol for Piper TTS
-wyoming>=1.5.0
 
 # Async utilities
 aiocache>=0.12.0

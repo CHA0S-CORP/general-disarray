@@ -63,7 +63,10 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       # STT Settings (Whisper)
       - WHISPER__MODEL=${WHISPER_MODEL:-Systran/faster-distil-whisper-small.en}
-      - WHISPER__COMPUTE_TYPE=default
+      # Use 'auto' for compute type - float16 may not be supported on all GPUs
+      # Options: auto, int8, int8_float16, int8_float32, int8_bfloat16, 
+      #          int16, float16, bfloat16, float32
+      - WHISPER__COMPUTE_TYPE=${WHISPER_COMPUTE_TYPE:-default}
       - WHISPER__DEVICE=cuda
       - WHISPER__INFERENCE_CONFIG__BEAM_SIZE=1
       - WHISPER__INFERENCE_CONFIG__LANGUAGE=${WHISPER_LANGUAGE:-en}
@@ -130,6 +133,9 @@ services:
       - SIP_REGISTRAR=${SIP_REGISTRAR:-}
       # General
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # Tools
+      - TEMPEST_STATION_ID=${TEMPEST_STATION_ID:-}
+      - TEMPEST_API_TOKEN=${TEMPEST_API_TOKEN:-}
     ports:
       - "5060:5060/udp"
       - "5060:5060/tcp"

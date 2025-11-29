@@ -126,10 +126,10 @@ class SIPAIAssistant:
         ]
         
         self.greeting_phrases = [
-            "Hello! How can I help you today?",
-            "Hi there! What can I do for you?",
-            "Hello! How may I assist you?",
-            "Hey! What can I help you with?"
+            "Hello Professor! What chaos can I help you with today?",
+            "Im sorry dave, im afraid i cant do that.",
+            "What do you want, human?",
+            # "Hey! What can I help you with?"
         ]
         
         self.goodbye_phrases = [
@@ -395,7 +395,7 @@ class SIPAIAssistant:
         
         try:
             # Play acknowledgment so user knows we heard them
-            ack = self.get_random_acknowledgment()
+            ack = self.get_random_thinking()
             log_event(logger, logging.INFO, f"Assistant: {ack}",
                      event="assistant_ack", text=ack)
             await self._speak(ack)
