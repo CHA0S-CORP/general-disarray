@@ -76,7 +76,7 @@ sequenceDiagram
 
 > 🤖 *"At Storm Lake, as of 9:30 pm, it's 44 degrees with foggy conditions. Wind is calm."*
 
-![Example conversation flow](https://github.com/MaxwellDPS/docs/blob/v1.0/docs/photos/Screenshot%202025-11-29%20214959.png?raw=true)
+![Example conversation flow](https://github.com/MaxwellDPS/docs/blob/v1.0/photos/Screenshot%202025-11-29%20214959.png?raw=true)
 <!-- TODO: Screenshot of log viewer showing a weather query conversation -->
 ---
 
@@ -244,7 +244,7 @@ curl -X POST http://localhost:8080/call \
   "message": "Call initiated"
 }
 ```
-![](https://github.com/MaxwellDPS/docs/blob/v1.0/docs/photos/Screenshot%202025-11-29%20214700.png?raw=true)
+![](https://github.com/MaxwellDPS/docs/blob/v1.0/photos/Screenshot%202025-11-29%20214700.png?raw=true)
 ### 🌅 Morning Weather Briefing
 
 Schedule a daily weather call at 7am:
@@ -553,11 +553,11 @@ Import the included dashboard:
 grafana/dashboards/sip-agent.json
 ```
 
-![Alt text](https://github.com/MaxwellDPS/docs/blob/v1.0/docs/photos/Screenshot%202025-11-29%20222658.png?raw=true "Dashboard")
-![Alt text](https://github.com/MaxwellDPS/docs/blob/v1.0/docs/photos/Screenshot%202025-11-29%20222729.png?raw=true "Dashboard")
-![Alt text](https://github.com/MaxwellDPS/docs/blob/v1.0/docs/photos/Screenshot%202025-11-29%20222739.png?raw=true "Dashboard")
-![Alt text](https://github.com/MaxwellDPS/docs/blob/v1.0/docs/photos/Screenshot%202025-11-29%20222748.png?raw=true "Dashboard")
-![Alt text](https://github.com/MaxwellDPS/docs/blob/v1.0/docs/photos/Screenshot%202025-11-29%20222808.png?raw=true "Dashboard")
+![Alt text](https://github.com/MaxwellDPS/docs/blob/v1.0/photos/Screenshot%202025-11-29%20222658.png?raw=true "Dashboard")
+![Alt text](https://github.com/MaxwellDPS/docs/blob/v1.0/photos/Screenshot%202025-11-29%20222729.png?raw=true "Dashboard")
+![Alt text](https://github.com/MaxwellDPS/docs/blob/v1.0/photos/Screenshot%202025-11-29%20222739.png?raw=true "Dashboard")
+![Alt text](https://github.com/MaxwellDPS/docs/blob/v1.0/photos/Screenshot%202025-11-29%20222748.png?raw=true "Dashboard")
+![Alt text](https://github.com/MaxwellDPS/docs/blob/v1.0/photos/Screenshot%202025-11-29%20222808.png?raw=true "Dashboard")
 
 
 ---
