@@ -417,7 +417,8 @@ class ToolManager:
         task_type: str,
         delay_seconds: int,
         message: str,
-        target_uri: Optional[str] = None
+        target_uri: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
     ) -> str:
         """Schedule a task for later execution."""
         task_id = str(uuid.uuid4())[:8]
@@ -427,7 +428,8 @@ class ToolManager:
             task_type=task_type,
             execute_at=datetime.now() + timedelta(seconds=delay_seconds),
             message=message,
-            target_uri=target_uri
+            target_uri=target_uri,
+            metadata=metadata or {}
         )
         
         self.scheduled_tasks[task_id] = task
@@ -495,6 +497,8 @@ class ToolManager:
                 await self._execute_timer(task)
             elif task.task_type == "callback":
                 await self._execute_callback(task)
+            elif task.task_type == "scheduled_call":
+                await self._execute_scheduled_call(task)
             else:
                 logger.warning(f"Unknown task type: {task.task_type}")
                 
@@ -539,6 +543,163 @@ class ToolManager:
                     await asyncio.sleep(self.config.callback_retry_delay_s)
                     
         logger.error(f"Callback {task.id} failed after {self.config.callback_retry_attempts} attempts")
+
+    async def _execute_scheduled_call(self, task: ScheduledTask):
+        """Execute a scheduled call - optionally run a tool, then make outbound call."""
+        metadata = task.metadata or {}
+        extension = metadata.get("extension") or task.target_uri
+        
+        if not extension:
+            logger.error(f"Scheduled call {task.id} has no extension")
+            return
+        
+        log_event(logger, logging.INFO, f"Executing scheduled call to {extension}",
+                 event="scheduled_call_execute", task_id=task.id, extension=extension)
+        
+        # Build the message
+        message_parts = []
+        
+        # Add prefix
+        if metadata.get("prefix"):
+            message_parts.append(metadata["prefix"])
+        
+        # Execute tool if specified
+        tool_name = metadata.get("tool")
+        if tool_name:
+            tool = self.get_tool(tool_name)
+            if tool:
+                try:
+                    tool_params = metadata.get("tool_params", {})
+                    result = await tool.execute(tool_params)
+                    
+                    if result.status.value == "success" if hasattr(result.status, 'value') else str(result.status).lower() == "success":
+                        message_parts.append(result.message)
+                        log_event(logger, logging.INFO, f"Tool {tool_name} executed for scheduled call",
+                                 event="scheduled_call_tool_success", tool=tool_name)
+                    else:
+                        logger.warning(f"Tool {tool_name} failed: {result.message}")
+                        message_parts.append(f"I was unable to get the {tool_name.lower()} information.")
+                except Exception as e:
+                    logger.error(f"Tool {tool_name} error: {e}")
+                    message_parts.append(f"I encountered an error getting the {tool_name.lower()} information.")
+            else:
+                logger.warning(f"Tool {tool_name} not found for scheduled call")
+                message_parts.append(metadata.get("message", "This is your scheduled call."))
+        elif metadata.get("message"):
+            message_parts.append(metadata["message"])
+        
+        # Add suffix
+        if metadata.get("suffix"):
+            message_parts.append(metadata["suffix"])
+        
+        # Combine message
+        full_message = " ".join(message_parts) if message_parts else "This is your scheduled call."
+        
+        # Make the call
+        for attempt in range(self.config.callback_retry_attempts):
+            try:
+                await self.assistant.make_outbound_call(extension, full_message)
+                
+                log_event(logger, logging.INFO, f"Scheduled call completed: {task.id}",
+                         event="scheduled_call_complete", task_id=task.id, extension=extension)
+                
+                # Handle recurring
+                if metadata.get("recurring"):
+                    await self._reschedule_recurring_call(task, metadata)
+                
+                # Send callback webhook if specified
+                if metadata.get("callback_url"):
+                    await self._send_scheduled_call_webhook(task, metadata, "completed")
+                
+                return
+                
+            except Exception as e:
+                logger.warning(f"Scheduled call attempt {attempt + 1} failed: {e}")
+                if attempt < self.config.callback_retry_attempts - 1:
+                    await asyncio.sleep(self.config.callback_retry_delay_s)
+        
+        logger.error(f"Scheduled call {task.id} failed after {self.config.callback_retry_attempts} attempts")
+        
+        if metadata.get("callback_url"):
+            await self._send_scheduled_call_webhook(task, metadata, "failed")
+    
+    async def _reschedule_recurring_call(self, task: ScheduledTask, metadata: dict):
+        """Reschedule a recurring call."""
+        import pytz
+        
+        recurring = metadata.get("recurring")
+        if not recurring:
+            return
+        
+        tz = pytz.timezone(metadata.get("timezone", "America/Los_Angeles"))
+        now = datetime.now(tz)
+        next_time = None
+        
+        if recurring == "daily":
+            # Same time tomorrow
+            next_time = now + timedelta(days=1)
+        elif recurring == "weekdays":
+            # Next weekday (Mon-Fri)
+            next_time = now + timedelta(days=1)
+            while next_time.weekday() >= 5:  # Saturday=5, Sunday=6
+                next_time += timedelta(days=1)
+        elif recurring == "weekends":
+            # Next weekend day
+            next_time = now + timedelta(days=1)
+            while next_time.weekday() < 5:
+                next_time += timedelta(days=1)
+        else:
+            # TODO: Support cron expressions
+            logger.warning(f"Unsupported recurring pattern: {recurring}")
+            return
+        
+        # If at_time was specified, use that time on the next day
+        at_time = metadata.get("at_time")
+        if at_time and ':' in at_time and 'T' not in at_time:
+            hour, minute = map(int, at_time.split(':'))
+            next_time = next_time.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        
+        delay_seconds = int((next_time - now).total_seconds())
+        
+        # Schedule next occurrence
+        new_task_id = await self.schedule_task(
+            task_type="scheduled_call",
+            delay_seconds=delay_seconds,
+            message=task.message,
+            target_uri=metadata.get("extension"),
+            metadata=metadata
+        )
+        
+        log_event(logger, logging.INFO, f"Rescheduled recurring call: {new_task_id}",
+                 event="scheduled_call_rescheduled", 
+                 task_id=new_task_id, 
+                 recurring=recurring,
+                 next_time=next_time.isoformat())
+    
+    async def _send_scheduled_call_webhook(self, task: ScheduledTask, metadata: dict, status: str):
+        """Send webhook for scheduled call completion."""
+        import httpx
+        
+        url = metadata.get("callback_url")
+        if not url:
+            return
+        
+        payload = {
+            "schedule_id": task.id,
+            "status": status,
+            "extension": metadata.get("extension"),
+            "tool": metadata.get("tool"),
+            "recurring": metadata.get("recurring"),
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(url, json=payload)
+                response.raise_for_status()
+                logger.info(f"Scheduled call webhook sent: {url}")
+        except Exception as e:
+            logger.error(f"Scheduled call webhook failed: {e}")
 
     async def schedule_callback(self, delay_seconds: int, message: str, target_uri: str) -> str:
         """

@@ -7,6 +7,7 @@ REST API for initiating outbound notification calls with optional response colle
 import asyncio
 import logging
 import httpx
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, TYPE_CHECKING
 from dataclasses import dataclass
 from enum import Enum
@@ -117,6 +118,60 @@ class ToolCallResponse(BaseModel):
     tool_success: bool
     tool_message: str
     message: str
+
+
+class ScheduledCallRequest(BaseModel):
+    """Request to schedule a call for a future time."""
+    extension: str = Field(..., description="SIP extension or phone number to call")
+    message: Optional[str] = Field(default=None, description="Message to speak (if no tool specified)")
+    tool: Optional[str] = Field(default=None, description="Tool to execute and speak result (e.g., WEATHER)")
+    tool_params: Dict[str, Any] = Field(default_factory=dict, description="Parameters for the tool")
+    delay_seconds: Optional[int] = Field(default=None, description="Seconds from now to make the call")
+    at_time: Optional[str] = Field(default=None, description="ISO datetime or HH:MM time to make the call")
+    timezone: Optional[str] = Field(default="America/Los_Angeles", description="Timezone for at_time (default: America/Los_Angeles)")
+    prefix: Optional[str] = Field(default=None, description="Message to speak before tool result")
+    suffix: Optional[str] = Field(default=None, description="Message to speak after tool result")
+    callback_url: Optional[str] = Field(default=None, description="Webhook URL to POST results to")
+    recurring: Optional[str] = Field(default=None, description="Recurrence pattern: 'daily', 'weekdays', 'weekends', or cron expression")
+    
+    @model_validator(mode='after')
+    def validate_time_or_delay(self):
+        """Validate that either delay_seconds or at_time is provided."""
+        if self.delay_seconds is None and self.at_time is None:
+            raise ValueError("Either delay_seconds or at_time must be provided")
+        if self.delay_seconds is not None and self.at_time is not None:
+            raise ValueError("Provide either delay_seconds or at_time, not both")
+        return self
+    
+    @model_validator(mode='after')
+    def validate_message_or_tool(self):
+        """Validate that either message or tool is provided."""
+        if not self.message and not self.tool:
+            raise ValueError("Either message or tool must be provided")
+        return self
+
+
+class ScheduledCallResponse(BaseModel):
+    """Response from scheduled call request."""
+    schedule_id: str
+    status: str
+    extension: str
+    scheduled_for: str
+    delay_seconds: int
+    message: str
+    recurring: Optional[str] = None
+
+
+class ScheduledCallInfo(BaseModel):
+    """Information about a scheduled call."""
+    schedule_id: str
+    extension: str
+    scheduled_for: str
+    remaining_seconds: int
+    message: Optional[str] = None
+    tool: Optional[str] = None
+    recurring: Optional[str] = None
+    status: str
 
 
 class ToolExecuteResponse(BaseModel):
@@ -837,6 +892,221 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
             return {"success": True, "message": "Message spoken to call"}
         else:
             raise HTTPException(status_code=404, detail="No active call to speak to")
+    
+    # ==========================================================================
+    # Scheduled Calls API
+    # ==========================================================================
+    
+    @app.post("/schedule", response_model=ScheduledCallResponse)
+    async def schedule_call(request: ScheduledCallRequest):
+        """
+        Schedule a call for a future time.
+        
+        You can schedule a call with either a static message or a tool that
+        will be executed at call time (e.g., WEATHER for fresh data).
+        
+        Time can be specified as:
+        - delay_seconds: Number of seconds from now
+        - at_time: ISO datetime (2025-01-15T07:00:00) or HH:MM time (07:00)
+        
+        Examples:
+        
+        Wake-up weather call in 8 hours:
+        ```json
+        {
+            "extension": "1001",
+            "tool": "WEATHER",
+            "delay_seconds": 28800,
+            "prefix": "Good morning! Here's your weather."
+        }
+        ```
+        
+        Daily 7am weather call:
+        ```json
+        {
+            "extension": "1001",
+            "tool": "WEATHER",
+            "at_time": "07:00",
+            "timezone": "America/Los_Angeles",
+            "prefix": "Good morning!",
+            "recurring": "daily"
+        }
+        ```
+        
+        Reminder call at specific time:
+        ```json
+        {
+            "extension": "5551234567",
+            "message": "This is your reminder to take your medication.",
+            "at_time": "2025-01-15T09:00:00",
+            "timezone": "America/New_York"
+        }
+        ```
+        
+        Weekday morning briefing:
+        ```json
+        {
+            "extension": "1001",
+            "tool": "WEATHER",
+            "at_time": "06:30",
+            "recurring": "weekdays",
+            "prefix": "Good morning! Time to wake up."
+        }
+        ```
+        """
+        import time
+        import pytz
+        from datetime import datetime, timedelta
+        
+        # Calculate delay
+        delay_seconds = request.delay_seconds
+        scheduled_time = None
+        
+        if request.at_time:
+            try:
+                tz = pytz.timezone(request.timezone or "America/Los_Angeles")
+                now = datetime.now(tz)
+                
+                # Parse time - either full ISO or just HH:MM
+                if 'T' in request.at_time or '-' in request.at_time:
+                    # Full ISO datetime
+                    if request.at_time.endswith('Z'):
+                        scheduled_time = datetime.fromisoformat(request.at_time.replace('Z', '+00:00'))
+                    else:
+                        scheduled_time = datetime.fromisoformat(request.at_time)
+                        if scheduled_time.tzinfo is None:
+                            scheduled_time = tz.localize(scheduled_time)
+                else:
+                    # Just HH:MM - schedule for today or tomorrow
+                    hour, minute = map(int, request.at_time.split(':'))
+                    scheduled_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                    
+                    # If time already passed today, schedule for tomorrow
+                    if scheduled_time <= now:
+                        scheduled_time += timedelta(days=1)
+                
+                delay_seconds = int((scheduled_time - now).total_seconds())
+                
+                if delay_seconds < 0:
+                    raise HTTPException(status_code=400, detail="Scheduled time is in the past")
+                    
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=f"Invalid time format: {e}")
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Error parsing time: {e}")
+        
+        # Generate schedule ID
+        schedule_id = f"sched-{int(time.time())}-{len(assistant.tool_manager.scheduled_tasks) + 1}"
+        
+        # Build the task data
+        task_data = {
+            "extension": request.extension,
+            "message": request.message,
+            "tool": request.tool,
+            "tool_params": request.tool_params,
+            "prefix": request.prefix,
+            "suffix": request.suffix,
+            "callback_url": request.callback_url,
+            "recurring": request.recurring,
+            "timezone": request.timezone,
+            "at_time": request.at_time,  # Store for recurring
+        }
+        
+        # Schedule the task
+        task_id = await assistant.tool_manager.schedule_task(
+            task_type="scheduled_call",
+            delay_seconds=delay_seconds,
+            message=request.message or f"Scheduled {request.tool} call",
+            target_uri=request.extension,
+            metadata=task_data
+        )
+        
+        # Calculate scheduled time for response
+        if scheduled_time:
+            scheduled_for = scheduled_time.isoformat()
+        else:
+            tz = pytz.timezone(request.timezone or "America/Los_Angeles")
+            scheduled_for = (datetime.now(tz) + timedelta(seconds=delay_seconds)).isoformat()
+        
+        log_event(logger, logging.INFO, f"Scheduled call: {schedule_id} -> {request.extension}",
+                 event="call_scheduled",
+                 schedule_id=schedule_id,
+                 extension=request.extension,
+                 delay=delay_seconds,
+                 tool=request.tool)
+        
+        return ScheduledCallResponse(
+            schedule_id=task_id,
+            status="scheduled",
+            extension=request.extension,
+            scheduled_for=scheduled_for,
+            delay_seconds=delay_seconds,
+            message=f"Call scheduled for {scheduled_for}",
+            recurring=request.recurring
+        )
+    
+    @app.get("/schedule", response_model=List[ScheduledCallInfo])
+    async def list_scheduled_calls():
+        """List all scheduled calls."""
+        scheduled = []
+        now = asyncio.get_event_loop().time()
+        
+        for task_id, task in assistant.tool_manager.scheduled_tasks.items():
+            if task.task_type == "scheduled_call":
+                remaining = max(0, int(task.execute_at - now))
+                metadata = task.metadata or {}
+                
+                scheduled.append(ScheduledCallInfo(
+                    schedule_id=task_id,
+                    extension=metadata.get("extension", task.target_uri or ""),
+                    scheduled_for=datetime.fromtimestamp(task.execute_at).isoformat(),
+                    remaining_seconds=remaining,
+                    message=metadata.get("message"),
+                    tool=metadata.get("tool"),
+                    recurring=metadata.get("recurring"),
+                    status="pending" if not task.completed else "completed"
+                ))
+        
+        return sorted(scheduled, key=lambda x: x.remaining_seconds)
+    
+    @app.get("/schedule/{schedule_id}", response_model=ScheduledCallInfo)
+    async def get_scheduled_call(schedule_id: str):
+        """Get details of a scheduled call."""
+        task = assistant.tool_manager.scheduled_tasks.get(schedule_id)
+        
+        if not task or task.task_type != "scheduled_call":
+            raise HTTPException(status_code=404, detail="Scheduled call not found")
+        
+        now = asyncio.get_event_loop().time()
+        remaining = max(0, int(task.execute_at - now))
+        metadata = task.metadata or {}
+        
+        return ScheduledCallInfo(
+            schedule_id=schedule_id,
+            extension=metadata.get("extension", task.target_uri or ""),
+            scheduled_for=datetime.fromtimestamp(task.execute_at).isoformat(),
+            remaining_seconds=remaining,
+            message=metadata.get("message"),
+            tool=metadata.get("tool"),
+            recurring=metadata.get("recurring"),
+            status="pending" if not task.completed else "completed"
+        )
+    
+    @app.delete("/schedule/{schedule_id}")
+    async def cancel_scheduled_call(schedule_id: str):
+        """Cancel a scheduled call."""
+        task = assistant.tool_manager.scheduled_tasks.get(schedule_id)
+        
+        if not task:
+            raise HTTPException(status_code=404, detail="Scheduled call not found")
+        
+        # Remove from scheduled tasks
+        del assistant.tool_manager.scheduled_tasks[schedule_id]
+        
+        log_event(logger, logging.INFO, f"Cancelled scheduled call: {schedule_id}",
+                 event="call_schedule_cancelled", schedule_id=schedule_id)
+        
+        return {"success": True, "message": f"Scheduled call {schedule_id} cancelled"}
     
     return app
 

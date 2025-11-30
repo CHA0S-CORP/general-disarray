@@ -100,6 +100,14 @@ EVENT_STYLE = {
     'api_tool_call_tool_failed': ('❌', C.RED, 'api'),
     'api_tool_no_call': ('⚠️', C.YELLOW, 'api'),
     'api_speak_success': ('🔊', C.GREEN, 'api'),
+    
+    # Scheduled calls
+    'call_scheduled': ('📅', C.BLUE, 'scheduled'),
+    'call_schedule_cancelled': ('❌', C.RED, 'scheduled'),
+    'scheduled_call_execute': ('📅', C.BLUE, 'scheduled'),
+    'scheduled_call_tool_success': ('✅', C.GREEN, 'scheduled'),
+    'scheduled_call_complete': ('✅', C.GREEN, 'scheduled'),
+    'scheduled_call_rescheduled': ('🔄', C.CYAN, 'scheduled'),
 }
 
 # Events that start a grouped section
@@ -109,6 +117,7 @@ GROUP_START_EVENTS = {
     'api_tool_call': ('api', '🌐', 'API TOOL CALL', C.CYAN),
     'api_tool_execute': ('api', '🌐', 'API TOOL EXECUTE', C.CYAN),
     'outbound_call_initiated': ('outbound', '📤', 'OUTBOUND CALL', C.BLUE),
+    'scheduled_call_execute': ('scheduled', '📅', 'SCHEDULED CALL', C.MAGENTA),
 }
 
 # Events that end a grouped section
@@ -117,6 +126,7 @@ GROUP_END_EVENTS = {
     'callback': ['callback_complete', 'callback_failed', 'call_end'],
     'api': ['api_tool_complete', 'api_tool_call_tool_failed', 'outbound_call_initiated'],
     'outbound': ['outbound_call_webhook_success', 'outbound_call_complete', 'outbound_call_failed', 'outbound_call_no_answer'],
+    'scheduled': ['scheduled_call_complete', 'scheduled_call_rescheduled'],
 }
 
 class CallTracker:
@@ -126,9 +136,9 @@ class CallTracker:
         self.in_call = False
         self.current_caller = None
         self.call_count = 0
-        # Track active groups (timer, callback, api, outbound)
+        # Track active groups (timer, callback, api, outbound, scheduled)
         self.active_group = None
-        self.group_count = {'timer': 0, 'callback': 0, 'api': 0, 'outbound': 0}
+        self.group_count = {'timer': 0, 'callback': 0, 'api': 0, 'outbound': 0, 'scheduled': 0}
         
     def print_call_header(self, caller: str, direction: str = "inbound"):
         """Print a call start header."""
@@ -245,6 +255,12 @@ def format_log(line: str, show_all: bool = False) -> str | None:
                 extra_info = ext
                 if call_id:
                     extra_info += f" ({call_id})"
+            elif event == 'scheduled_call_execute':
+                ext = extra.get('extension', '')
+                task_id = extra.get('task_id', '')
+                extra_info = ext
+                if task_id:
+                    extra_info += f" ({task_id})"
             
             tracker.start_group(group_type, icon, title, color, extra_info)
             # Continue to also print the event line below
@@ -265,7 +281,7 @@ def format_log(line: str, show_all: bool = False) -> str | None:
                 indent = "    "  # Indent within group
             elif category == 'speech':
                 indent = "    "  # Extra indent for conversation
-            elif category in ('tool', 'task', 'timer', 'callback', 'api', 'outbound'):
+            elif category in ('tool', 'task', 'timer', 'callback', 'api', 'outbound', 'scheduled'):
                 indent = "      "  # Extra indent for tools/tasks
             
             # Build output line
@@ -295,6 +311,10 @@ def format_log(line: str, show_all: bool = False) -> str | None:
                     show_keys = ['choice', 'raw_text']
                 elif event.startswith('outbound_call_'):
                     show_keys = ['call_id', 'status', 'duration']
+                elif event == 'call_scheduled':
+                    show_keys = ['schedule_id', 'extension', 'delay', 'tool']
+                elif event.startswith('scheduled_call_'):
+                    show_keys = ['task_id', 'extension', 'tool', 'recurring']
                 else:
                     show_keys = list(extra.keys())
                 
