@@ -116,9 +116,9 @@ services:
   # SIP AI Assistant - Main application (lightweight, no local models)
   # ============================================================================
   sip-agent:
-    build:
-      context: sip-agent/
-      dockerfile: Dockerfile
+    # build:
+    #   context: sip-agent/
+    #   dockerfile: Dockerfile
     container_name: sip-agent
     image: ghcr.io/maxwelldps/nvitop-exporter:latest
     depends_on:

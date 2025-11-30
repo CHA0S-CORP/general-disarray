@@ -46,7 +46,6 @@ RUN wget -q http://prdownloads.sourceforge.net/swig/swig-4.0.2.tar.gz && \
     ./Tools/pcre-build.sh && \
     ./configure --prefix=/usr && \
     make -j$(nproc) && \
-    make install && \
     cd .. && rm -rf swig-4.0.2*
 
 # Build PJSIP (STATIC with fPIC)
@@ -68,7 +67,6 @@ RUN cd /tmp/pjproject-2.14/pjsip-apps/src/swig && \
     python3 setup.py bdist_wheel && \
     mkdir -p /build_artifacts && \
     cp dist/*.whl /build_artifacts/
-
 
 # ============================================================================
 # STAGE 2: Final Runtime Image (Lightweight)

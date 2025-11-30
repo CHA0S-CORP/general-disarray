@@ -157,9 +157,9 @@ services:
   # ===================
   nvitop-exporter:
     image: ghcr.io/maxwelldps/nvitop-exporter:latest
-    build:
-      context: ./nvitop/
-      dockerfile: nvitop-exporter/Dockerfile
+    # build:
+    #   context: ./nvitop/
+    #   dockerfile: nvitop-exporter/Dockerfile
     container_name: nvitop-exporter
     command: ["--port", "5050", "--bind-address", "0.0.0.0"]
     ports:
