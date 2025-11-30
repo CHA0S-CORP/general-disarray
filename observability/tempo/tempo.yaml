@@ -51,6 +51,8 @@ metrics_generator:
       # CRITICAL: Set this to true to query data older than 30 minutes
       flush_to_storage: true
       filter_server_spans: false  # <--- Set this to false!
+    streamingEnabled:
+      search: true
 
 overrides:
   defaults:
