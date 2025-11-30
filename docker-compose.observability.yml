@@ -156,7 +156,7 @@ services:
   # nvitop Exporter - GPU Metrics
   # ===================
   nvitop-exporter:
-    # image:  ghcr.io/xuehaipan/nvitop-exporter:latest
+    image: ghcr.io/maxwelldps/nvitop-exporter:latest
     build:
       context: ./nvitop/
       dockerfile: nvitop-exporter/Dockerfile
