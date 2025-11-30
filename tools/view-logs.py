@@ -267,7 +267,7 @@ def main():
         if args.stdin:
             process_stream(sys.stdin, args.all)
         else:
-            cmd = ['docker', 'compose', 'logs', '--tail', '0', '-f', args.container]
+            cmd = ['docker',  'logs', '--tail', '0', '-f', args.container]
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,

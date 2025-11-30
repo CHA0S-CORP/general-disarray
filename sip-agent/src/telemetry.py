@@ -259,6 +259,10 @@ class Metrics:
     _counters = {}
     _histograms = {}
     _gauges = {}
+    _observable_gauges = {}
+    
+    # Track active calls for gauge
+    _active_calls = 0
     
     @classmethod
     def _get_or_create_counter(cls, name: str, description: str, unit: str = "1"):
@@ -296,7 +300,10 @@ class Metrics:
                 )
         return cls._gauges.get(name)
     
-    # Call metrics
+    # ===================
+    # Call Quality & Reliability
+    # ===================
+    
     @classmethod
     def record_call_started(cls, call_type: str = "inbound"):
         counter = cls._get_or_create_counter(
@@ -305,6 +312,8 @@ class Metrics:
         )
         if counter:
             counter.add(1, {"call.type": call_type})
+        cls._active_calls += 1
+        cls._update_active_calls()
     
     @classmethod
     def record_call_ended(cls, call_type: str = "inbound", status: str = "completed"):
@@ -314,6 +323,52 @@ class Metrics:
         )
         if counter:
             counter.add(1, {"call.type": call_type, "call.status": status})
+        cls._active_calls = max(0, cls._active_calls - 1)
+        cls._update_active_calls()
+    
+    @classmethod
+    def _update_active_calls(cls):
+        gauge = cls._get_or_create_gauge(
+            "sip.calls.active",
+            "Currently active calls"
+        )
+        # Note: Using up_down_counter, we track delta. For true gauge, we'd need observable gauge
+    
+    @classmethod
+    def record_call_failed(cls, call_type: str = "inbound", reason: str = "error"):
+        counter = cls._get_or_create_counter(
+            "sip.calls.failed",
+            "Calls that failed"
+        )
+        if counter:
+            counter.add(1, {"call.type": call_type, "failure.reason": reason})
+    
+    @classmethod
+    def record_call_abandoned(cls, call_type: str = "inbound"):
+        counter = cls._get_or_create_counter(
+            "sip.calls.abandoned",
+            "Calls where caller hung up before response"
+        )
+        if counter:
+            counter.add(1, {"call.type": call_type})
+    
+    @classmethod
+    def record_barge_in(cls):
+        counter = cls._get_or_create_counter(
+            "sip.calls.barge_in",
+            "User interruptions during playback"
+        )
+        if counter:
+            counter.add(1)
+    
+    @classmethod
+    def record_silence_timeout(cls):
+        counter = cls._get_or_create_counter(
+            "sip.calls.silence_timeout",
+            "Calls ended due to silence"
+        )
+        if counter:
+            counter.add(1)
     
     @classmethod
     def record_call_duration(cls, duration_ms: float, call_type: str = "inbound"):
@@ -324,15 +379,70 @@ class Metrics:
         if histogram:
             histogram.record(duration_ms, {"call.type": call_type})
     
-    # Audio pipeline metrics
+    # ===================
+    # Conversation Quality
+    # ===================
+    
     @classmethod
-    def record_tts_latency(cls, latency_ms: float, model: str = "unknown"):
+    def record_conversation_turns(cls, turns: int):
         histogram = cls._get_or_create_histogram(
-            "sip.tts.latency",
-            "TTS synthesis latency in milliseconds"
+            "sip.conversation.turns",
+            "Number of turns per conversation",
+            unit="1"
         )
         if histogram:
-            histogram.record(latency_ms, {"tts.model": model})
+            histogram.record(turns)
+    
+    @classmethod
+    def record_user_utterance(cls, word_count: int):
+        histogram = cls._get_or_create_histogram(
+            "sip.conversation.user_words",
+            "Words per user utterance",
+            unit="1"
+        )
+        if histogram:
+            histogram.record(word_count)
+    
+    @classmethod
+    def record_assistant_response(cls, word_count: int):
+        histogram = cls._get_or_create_histogram(
+            "sip.conversation.assistant_words",
+            "Words per assistant response",
+            unit="1"
+        )
+        if histogram:
+            histogram.record(word_count)
+    
+    @classmethod
+    def record_tool_call(cls, tool_name: str):
+        counter = cls._get_or_create_counter(
+            "sip.tools.calls",
+            "Tool/function invocations"
+        )
+        if counter:
+            counter.add(1, {"tool.name": tool_name})
+    
+    @classmethod
+    def record_tool_error(cls, tool_name: str, error_type: str = "unknown"):
+        counter = cls._get_or_create_counter(
+            "sip.tools.errors",
+            "Tool execution failures"
+        )
+        if counter:
+            counter.add(1, {"tool.name": tool_name, "error.type": error_type})
+    
+    @classmethod
+    def record_tool_latency(cls, latency_ms: float, tool_name: str):
+        histogram = cls._get_or_create_histogram(
+            "sip.tools.latency",
+            "Tool execution time in milliseconds"
+        )
+        if histogram:
+            histogram.record(latency_ms, {"tool.name": tool_name})
+    
+    # ===================
+    # Audio Pipeline - STT
+    # ===================
     
     @classmethod
     def record_stt_latency(cls, latency_ms: float, model: str = "unknown"):
@@ -344,6 +454,104 @@ class Metrics:
             histogram.record(latency_ms, {"stt.model": model})
     
     @classmethod
+    def record_stt_confidence(cls, confidence: float, model: str = "unknown"):
+        histogram = cls._get_or_create_histogram(
+            "sip.stt.confidence",
+            "STT confidence scores",
+            unit="1"
+        )
+        if histogram:
+            histogram.record(confidence, {"stt.model": model})
+    
+    @classmethod
+    def record_stt_audio_duration(cls, duration_s: float):
+        histogram = cls._get_or_create_histogram(
+            "sip.stt.audio_duration",
+            "Input audio duration in seconds",
+            unit="s"
+        )
+        if histogram:
+            histogram.record(duration_s)
+    
+    @classmethod
+    def record_stt_error(cls, model: str = "unknown", error_type: str = "unknown"):
+        counter = cls._get_or_create_counter(
+            "sip.stt.errors",
+            "STT transcription failures"
+        )
+        if counter:
+            counter.add(1, {"stt.model": model, "error.type": error_type})
+    
+    # ===================
+    # Audio Pipeline - TTS
+    # ===================
+    
+    @classmethod
+    def record_tts_latency(cls, latency_ms: float, model: str = "unknown"):
+        histogram = cls._get_or_create_histogram(
+            "sip.tts.latency",
+            "TTS synthesis latency in milliseconds"
+        )
+        if histogram:
+            histogram.record(latency_ms, {"tts.model": model})
+    
+    @classmethod
+    def record_tts_characters(cls, char_count: int, model: str = "unknown"):
+        histogram = cls._get_or_create_histogram(
+            "sip.tts.characters",
+            "Characters synthesized",
+            unit="1"
+        )
+        if histogram:
+            histogram.record(char_count, {"tts.model": model})
+    
+    @classmethod
+    def record_tts_audio_duration(cls, duration_s: float, model: str = "unknown"):
+        histogram = cls._get_or_create_histogram(
+            "sip.tts.audio_duration",
+            "Output audio duration in seconds",
+            unit="s"
+        )
+        if histogram:
+            histogram.record(duration_s, {"tts.model": model})
+    
+    @classmethod
+    def record_tts_error(cls, model: str = "unknown", error_type: str = "unknown"):
+        counter = cls._get_or_create_counter(
+            "sip.tts.errors",
+            "TTS synthesis failures"
+        )
+        if counter:
+            counter.add(1, {"tts.model": model, "error.type": error_type})
+    
+    # ===================
+    # Audio Pipeline - VAD
+    # ===================
+    
+    @classmethod
+    def record_vad_speech_segment(cls):
+        counter = cls._get_or_create_counter(
+            "sip.vad.speech_segments",
+            "VAD speech segment detections"
+        )
+        if counter:
+            counter.add(1)
+    
+    @classmethod
+    def record_audio_buffer_size(cls, size_bytes: int):
+        gauge = cls._get_or_create_gauge(
+            "sip.audio.buffer_size",
+            "Audio buffer size in bytes",
+            unit="By"
+        )
+        if gauge:
+            gauge.add(size_bytes)
+    
+    # ===================
+    # LLM Performance
+    # ===================
+    
+    @classmethod
     def record_llm_latency(cls, latency_ms: float, model: str = "unknown"):
         histogram = cls._get_or_create_histogram(
             "sip.llm.latency",
@@ -352,7 +560,66 @@ class Metrics:
         if histogram:
             histogram.record(latency_ms, {"llm.model": model})
     
-    # Queue metrics
+    @classmethod
+    def record_llm_tokens_input(cls, tokens: int, model: str = "unknown"):
+        counter = cls._get_or_create_counter(
+            "sip.llm.tokens_input",
+            "Input tokens consumed"
+        )
+        if counter:
+            counter.add(tokens, {"llm.model": model})
+    
+    @classmethod
+    def record_llm_tokens_output(cls, tokens: int, model: str = "unknown"):
+        counter = cls._get_or_create_counter(
+            "sip.llm.tokens_output",
+            "Output tokens generated"
+        )
+        if counter:
+            counter.add(tokens, {"llm.model": model})
+    
+    @classmethod
+    def record_llm_ttft(cls, ttft_ms: float, model: str = "unknown"):
+        histogram = cls._get_or_create_histogram(
+            "sip.llm.ttft",
+            "Time to first token in milliseconds"
+        )
+        if histogram:
+            histogram.record(ttft_ms, {"llm.model": model})
+    
+    @classmethod
+    def record_llm_tokens_per_second(cls, tps: float, model: str = "unknown"):
+        histogram = cls._get_or_create_histogram(
+            "sip.llm.tokens_per_second",
+            "Token generation throughput",
+            unit="1"
+        )
+        if histogram:
+            histogram.record(tps, {"llm.model": model})
+    
+    @classmethod
+    def record_llm_context_tokens(cls, tokens: int, model: str = "unknown"):
+        histogram = cls._get_or_create_histogram(
+            "sip.llm.context_tokens",
+            "Context window token usage",
+            unit="1"
+        )
+        if histogram:
+            histogram.record(tokens, {"llm.model": model})
+    
+    @classmethod
+    def record_llm_error(cls, model: str = "unknown", error_type: str = "unknown"):
+        counter = cls._get_or_create_counter(
+            "sip.llm.errors",
+            "LLM API failures"
+        )
+        if counter:
+            counter.add(1, {"llm.model": model, "error.type": error_type})
+    
+    # ===================
+    # Queue & Capacity
+    # ===================
+    
     @classmethod
     def record_queue_depth(cls, depth: int):
         gauge = cls._get_or_create_gauge(
@@ -360,8 +627,34 @@ class Metrics:
             "Number of calls in queue"
         )
         if gauge:
-            # Reset and set new value (up_down_counter pattern)
             gauge.add(depth)
+    
+    @classmethod
+    def record_queue_enqueued(cls):
+        counter = cls._get_or_create_counter(
+            "sip.queue.enqueued",
+            "Calls added to queue"
+        )
+        if counter:
+            counter.add(1)
+    
+    @classmethod
+    def record_queue_rejected(cls, reason: str = "queue_full"):
+        counter = cls._get_or_create_counter(
+            "sip.queue.rejected",
+            "Calls rejected"
+        )
+        if counter:
+            counter.add(1, {"rejection.reason": reason})
+    
+    @classmethod
+    def record_queue_timeout(cls):
+        counter = cls._get_or_create_counter(
+            "sip.queue.timeout",
+            "Calls that timed out in queue"
+        )
+        if counter:
+            counter.add(1)
     
     @classmethod
     def record_queue_wait_time(cls, wait_time_ms: float):
@@ -371,6 +664,37 @@ class Metrics:
         )
         if histogram:
             histogram.record(wait_time_ms)
+    
+    # ===================
+    # Callbacks
+    # ===================
+    
+    @classmethod
+    def record_callback_success(cls):
+        counter = cls._get_or_create_counter(
+            "sip.callback.success",
+            "Successful callbacks"
+        )
+        if counter:
+            counter.add(1)
+    
+    @classmethod
+    def record_callback_failed(cls, reason: str = "unknown"):
+        counter = cls._get_or_create_counter(
+            "sip.callback.failed",
+            "Failed callbacks"
+        )
+        if counter:
+            counter.add(1, {"failure.reason": reason})
+    
+    @classmethod
+    def record_callback_retry(cls):
+        counter = cls._get_or_create_counter(
+            "sip.callback.retries",
+            "Callback retry attempts"
+        )
+        if counter:
+            counter.add(1)
 
 
 # ===================
@@ -404,3 +728,39 @@ class TraceContextFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         add_trace_context_to_log(record)
         return True
+
+
+def get_otel_log_handler():
+    """
+    Attach the OTEL LoggingHandler to the root logger.
+    
+    Call this AFTER logging.basicConfig() to ensure the handler isn't removed.
+    """
+    if not OTEL_ENABLED or not _initialized:
+        return False
+    
+    try:
+        from opentelemetry._logs import get_logger_provider
+        from opentelemetry.sdk._logs import LoggingHandler
+        
+        logger_provider = get_logger_provider()
+        if logger_provider is None:
+            logger.warning("No OTEL logger provider available")
+            return False
+        
+        # # Check if handler already attached
+        # root_logger = logging.getLogger()
+        # for handler in root_logger.handlers:
+        #     if isinstance(handler, LoggingHandler):
+        #         return True  # Already attached
+        
+        # Attach handler
+        otel_handler = LoggingHandler(
+            level=logging.DEBUG,
+            logger_provider=logger_provider
+        )
+        return otel_handler
+        
+    except Exception as e:
+        logger.warning(f"Failed to attach OTEL log handler: {e}")
+        return False

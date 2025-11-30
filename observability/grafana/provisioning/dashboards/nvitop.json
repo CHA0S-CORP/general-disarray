@@ -64,8 +64,8 @@
       }
     ]
   },
-  "description": "Grafana Dashboard built by `nvitop-exporter`.",
-  "editable": false,
+  "description": "Grafana Dashboard built by nvitop-exporter - Modified for DGX Spark unified memory support",
+  "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
   "id": null,
@@ -147,7 +147,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "exemplar": false,
           "expr": "host_cpu_percent_Percentage{hostname=~\"$hostname\"}",
           "fullMetaSearch": false,
@@ -224,7 +224,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "exemplar": false,
           "expr": "gpu_utilization_Percentage{hostname=~\"$hostname\"}",
           "fullMetaSearch": false,
@@ -244,7 +244,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "",
+      "description": "For DGX Spark (GB10) unified memory: falls back to host memory when GPU memory is unavailable",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -301,19 +301,19 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "exemplar": false,
-          "expr": "gpu_memory_percent_Percentage{hostname=~\"$hostname\"}",
+          "expr": "gpu_memory_percent_Percentage{hostname=~\"$hostname\"} or on(hostname) host_virtual_memory_percent_Percentage{hostname=~\"$hostname\"}",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": false,
-          "legendFormat": "{{hostname}} GPU {{index}}",
+          "legendFormat": "{{hostname}} GPU {{index}} (Unified Memory)",
           "range": true,
           "refId": "A",
           "useBackend": false
         }
       ],
-      "title": "GPU Memory",
+      "title": "GPU/Unified Memory",
       "type": "gauge"
     },
     {
@@ -378,7 +378,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "exemplar": false,
           "expr": "host_virtual_memory_percent_Percentage{hostname=~\"$hostname\"}",
           "fullMetaSearch": false,
@@ -500,7 +500,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "exemplar": false,
           "expr": "count(group by(uuid) (process_gpu_memory_MiB{hostname=~\"$hostname\", username=~\"$username\"}))",
           "format": "table",
@@ -519,9 +519,9 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "exemplar": false,
-          "expr": "count(gpu_memory_total_MiB{hostname=~\"$hostname\"})",
+          "expr": "count(gpu_utilization_Percentage{hostname=~\"$hostname\"})",
           "format": "table",
           "fullMetaSearch": false,
           "hide": false,
@@ -605,7 +605,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "exemplar": false,
           "expr": "count by(hostname, index) (process_gpu_memory_MiB{hostname=~\"$hostname\", username=~\"$username\"})",
           "fullMetaSearch": false,
@@ -688,7 +688,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "exemplar": false,
           "expr": "count by(hostname) (count by(hostname, pid) (process_info_info{hostname=~\"$hostname\", username=~\"$username\"}))",
           "fullMetaSearch": false,
@@ -877,7 +877,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "exemplar": false,
           "expr": "process_cpu_percent_Percentage{hostname=~\"$hostname\", username=~\"$username\"}",
           "format": "table",
@@ -897,7 +897,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "exemplar": false,
           "expr": "process_rss_memory_MiB{hostname=~\"$hostname\", username=~\"$username\"}",
           "format": "table",
@@ -916,7 +916,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "exemplar": false,
           "expr": "process_gpu_memory_MiB{hostname=~\"$hostname\", username=~\"$username\"}",
           "format": "table",
@@ -935,7 +935,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "exemplar": false,
           "expr": "process_gpu_sm_utilization_Percentage{hostname=~\"$hostname\", username=~\"$username\"}",
           "format": "table",
@@ -954,7 +954,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "exemplar": false,
           "expr": "process_gpu_memory_utilization_Percentage{hostname=~\"$hostname\", username=~\"$username\"}",
           "format": "table",
@@ -973,7 +973,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "exemplar": false,
           "expr": "process_gpu_encoder_utilization_Percentage{hostname=~\"$hostname\", username=~\"$username\"}",
           "format": "table",
@@ -992,7 +992,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "exemplar": false,
           "expr": "process_gpu_decoder_utilization_Percentage{hostname=~\"$hostname\", username=~\"$username\"}",
           "format": "table",
@@ -1011,7 +1011,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "exemplar": false,
           "expr": "process_running_time_Second{hostname=~\"$hostname\", username=~\"$username\"}",
           "format": "table",
@@ -1031,7 +1031,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "exemplar": false,
           "expr": "process_info_info{hostname=~\"$hostname\", username=~\"$username\"}",
           "format": "table",
@@ -1050,7 +1050,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "exemplar": false,
           "expr": "host_virtual_memory_total_MiB{hostname=~\"$hostname\"}",
           "format": "table",
@@ -1069,7 +1069,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "exemplar": false,
           "expr": "gpu_memory_total_MiB{hostname!~\"$hostname\"}",
           "format": "table",
@@ -1354,7 +1354,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "expr": "host_cpu_percent_Percentage{hostname=~\"$hostname\"}",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
@@ -1446,7 +1446,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "expr": "host_load_average_1m_Percentage{hostname=~\"$hostname\"}",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
@@ -1462,7 +1462,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "expr": "host_load_average_5m_Percentage{hostname=~\"$hostname\"}",
           "fullMetaSearch": false,
           "hide": false,
@@ -1479,7 +1479,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "expr": "host_load_average_15m_Percentage{hostname=~\"$hostname\"}",
           "fullMetaSearch": false,
           "hide": false,
@@ -1510,7 +1510,7 @@
             "axisColorMode": "text",
             "axisLabel": "",
             "axisPlacement": "auto",
-            "axisSoftMax": 1024,
+            "axisSoftMax": 131072,
             "barAlignment": 0,
             "barWidthFactor": 0.6,
             "drawStyle": "line",
@@ -1574,7 +1574,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "expr": "host_virtual_memory_used_MiB{hostname=~\"$hostname\"}",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
@@ -1585,7 +1585,7 @@
           "useBackend": false
         }
       ],
-      "title": "Host Virtual Memory",
+      "title": "Host Virtual Memory (Unified Memory Pool)",
       "type": "timeseries"
     },
     {
@@ -1669,7 +1669,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "expr": "host_swap_memory_used_MiB{hostname=~\"$hostname\"}",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
@@ -1791,7 +1791,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "expr": "sum by(hostname) (rate(host_net_io_rx_data_MiB{hostname=~\"$hostname\"}[$__rate_interval]))",
           "fullMetaSearch": false,
           "hide": false,
@@ -1808,7 +1808,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "expr": "sum by(hostname) (rate(host_net_io_tx_data_MiB{hostname=~\"$hostname\"}[$__rate_interval]))",
           "fullMetaSearch": false,
           "hide": false,
@@ -1918,7 +1918,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "expr": "sum by(hostname) (rate(host_disk_io_read_data_MiB{hostname=~\"$hostname\"}[$__rate_interval]))",
           "fullMetaSearch": false,
           "hide": false,
@@ -1935,7 +1935,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "expr": "sum by(hostname) (rate(host_disk_io_write_data_MiB{hostname=~\"$hostname\"}[$__rate_interval]))",
           "fullMetaSearch": false,
           "hide": false,
@@ -2044,7 +2044,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "expr": "gpu_utilization_Percentage{hostname=~\"$hostname\"}",
           "fullMetaSearch": false,
           "hide": false,
@@ -2064,6 +2064,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
+      "description": "For DGX Spark: Uses host memory as proxy for unified memory pool. Red dashed line shows total system memory limit.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2075,12 +2076,11 @@
             "axisColorMode": "text",
             "axisLabel": "",
             "axisPlacement": "auto",
-            "axisSoftMax": 1024,
             "barAlignment": 0,
             "barWidthFactor": 0.6,
             "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "hideFrom": {
               "legend": false,
               "tooltip": false,
@@ -2093,7 +2093,7 @@
             "scaleDistribution": {
               "type": "linear"
             },
-            "showPoints": "auto",
+            "showPoints": "never",
             "spanNulls": false,
             "stacking": {
               "group": "A",
@@ -2105,7 +2105,42 @@
           },
           "min": 0,
           "unit": "mbytes"
-        }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/.* Total$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [
+                    10,
+                    10
+                  ],
+                  "fill": "dash"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 14,
@@ -2140,19 +2175,36 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
-          "expr": "gpu_memory_used_MiB{hostname=~\"$hostname\"}",
+          "editorMode": "code",
+          "expr": "gpu_memory_used_MiB{hostname=~\"$hostname\"} or on(hostname) host_virtual_memory_used_MiB{hostname=~\"$hostname\"}",
           "fullMetaSearch": false,
           "hide": false,
           "includeNullMetadata": true,
           "instant": false,
-          "legendFormat": "{{hostname}} GPU {{index}}",
+          "legendFormat": "{{hostname}} Used",
           "range": true,
           "refId": "A",
           "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "gpu_memory_total_MiB{hostname=~\"$hostname\"} or on(hostname) host_virtual_memory_total_MiB{hostname=~\"$hostname\"}",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "legendFormat": "{{hostname}} Total",
+          "range": true,
+          "refId": "B",
+          "useBackend": false
         }
       ],
-      "title": "GPU Memory",
+      "title": "GPU/Unified Memory",
       "type": "timeseries"
     },
     {
@@ -2236,7 +2288,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "expr": "gpu_pcie_rx_throughput_MiBps{hostname=~\"$hostname\"}",
           "fullMetaSearch": false,
           "hide": false,
@@ -2332,7 +2384,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "expr": "gpu_pcie_tx_throughput_MiBps{hostname=~\"$hostname\"}",
           "fullMetaSearch": false,
           "hide": false,
@@ -2428,7 +2480,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "expr": "gpu_nvlink_total_rx_throughput_MiBps{hostname=~\"$hostname\"}",
           "fullMetaSearch": false,
           "hide": false,
@@ -2524,7 +2576,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "expr": "gpu_nvlink_total_tx_throughput_MiBps{hostname=~\"$hostname\"}",
           "fullMetaSearch": false,
           "hide": false,
@@ -2618,7 +2670,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "expr": "gpu_power_usage_W{hostname=~\"$hostname\"}",
           "fullMetaSearch": false,
           "hide": false,
@@ -2712,7 +2764,7 @@
             "uid": "prometheus"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
+          "editorMode": "code",
           "expr": "gpu_temperature_C{hostname=~\"$hostname\"}",
           "fullMetaSearch": false,
           "hide": false,
@@ -2737,7 +2789,9 @@
     "nvidia",
     "gpu",
     "gpu process",
-    "gpu monitoring"
+    "gpu monitoring",
+    "dgx-spark",
+    "unified-memory"
   ],
   "templating": {
     "list": [
@@ -2776,13 +2830,13 @@
     ]
   },
   "time": {
-    "from": "now-1h",
+    "from": "now-24h",
     "to": "now"
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "NVITOP",
-  "uid": "bdl3vqwxprhtsa",
+  "title": "nvitop-dashboard (DGX Spark)",
+  "uid": "bdl3vqwxprhtsa-dgx",
   "version": 1,
   "weekStart": ""
 }

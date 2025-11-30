@@ -23,11 +23,11 @@ services:
     command: ["--config=/etc/otel-collector/config.yaml"]
     volumes:
       - ./observability/otel-collector/config.yaml:/etc/otel-collector/config.yaml:ro
-    ports:
-      - "4317:4317"   # OTLP gRPC
-      - "4318:4318"   # OTLP HTTP
-      - "8888:8888"   # Prometheus metrics exposed by the collector
-      - "13133:13133" # Health check endpoint
+    # ports:
+    #   - "4317:4317"   # OTLP gRPC
+    #   - "4318:4318"   # OTLP HTTP
+    #   - "8888:8888"   # Prometheus metrics exposed by the collector
+    #   - "13133:13133" # Health check endpoint
     depends_on:
       - tempo
       - loki
@@ -156,7 +156,10 @@ services:
   # nvitop Exporter - GPU Metrics
   # ===================
   nvitop-exporter:
-    image:  ghcr.io/xuehaipan/nvitop-exporter:latest
+    # image:  ghcr.io/xuehaipan/nvitop-exporter:latest
+    build:
+      context: ../nvitop/
+      dockerfile: nvitop-exporter/Dockerfile
     container_name: nvitop-exporter
     command: ["--port", "5050", "--bind-address", "0.0.0.0"]
     ports:
@@ -225,14 +228,9 @@ services:
     environment:
       # OpenTelemetry for FastAPI auto-instrumentation
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
-      - OTEL_SERVICE_NAME=speaches
-      - OTEL_RESOURCE_ATTRIBUTES=service.namespace=sip-ai,deployment.environment=docker
-      - OTEL_TRACES_EXPORTER=otlp
-      - OTEL_METRICS_EXPORTER=otlp
-      - OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED=true
-    # depends_on:
-    #   otel-collector:
-    #     condition: service_healthy
+    depends_on:
+      otel-collector:
+        condition: service_started
 
 volumes:
   prometheus-data:

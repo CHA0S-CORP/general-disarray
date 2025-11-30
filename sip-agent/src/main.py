@@ -24,7 +24,7 @@ from llm_engine import create_llm_engine
 from audio_pipeline import LowLatencyAudioPipeline
 
 # Initialize OpenTelemetry early (before other modules)
-from telemetry import init_telemetry, is_enabled as otel_enabled, TraceContextFilter
+from telemetry import init_telemetry, is_enabled as otel_enabled, TraceContextFilter, Metrics, get_otel_log_handler
 init_telemetry("sip-agent")
 
 class JSONFormatter(logging.Formatter):
@@ -83,10 +83,11 @@ def log_event(log, level, msg, event=None, **data):
 # Configure JSON logging
 handler = logging.StreamHandler()
 handler.setFormatter(JSONFormatter())
-handler.addFilter(TraceContextFilter())  # Add trace context to logs
+# handler.addFilter(TraceContextFilter())  # Add trace context to logs
+otel_handler = get_otel_log_handler()
 logging.basicConfig(
     level=logging.INFO,
-    handlers=[handler],
+    handlers=[handler, otel_handler],
     force=True  # Override any existing config
 )
 
@@ -309,6 +310,10 @@ class SIPAIAssistant:
                 log_event(logger, logging.INFO, f"Call received from: {remote_uri}",
                          event="call_start", caller=remote_uri, direction="inbound")
                 
+                # Record call started metric
+                Metrics.record_call_started("inbound")
+                self._call_start_time = time.time()
+                
                 self.current_call = call_info
                 self.conversation_history = []
                 self._processing = False
@@ -348,6 +353,12 @@ class SIPAIAssistant:
                 if not getattr(self.current_call, 'is_active', False):
                     log_event(logger, logging.INFO, "Call ended, stopping audio loop",
                              event="call_end")
+                    # Record call metrics
+                    if hasattr(self, '_call_start_time') and self._call_start_time:
+                        duration_ms = (time.time() - self._call_start_time) * 1000
+                        Metrics.record_call_duration(duration_ms, "inbound")
+                        Metrics.record_call_ended("inbound", "completed")
+                        self._call_start_time = None
                     break
                     
                 # Wait for media to be ready
@@ -374,6 +385,7 @@ class SIPAIAssistant:
                         if self._processing and self.audio_pipeline.has_speech(audio_chunk):
                             log_event(logger, logging.INFO, "Barge-in detected",
                                      event="barge_in")
+                            Metrics.record_barge_in()
                             await self._handle_barge_in()
                             
                         # Process through VAD/STT
@@ -395,6 +407,11 @@ class SIPAIAssistant:
             except Exception as e:
                 logger.error(f"Audio processing error: {e}")
                 await asyncio.sleep(0.1)
+        
+        # Record conversation turns (count user messages as turns)
+        turns = len([m for m in self.conversation_history if m.get("role") == "user"])
+        if turns > 0:
+            Metrics.record_conversation_turns(turns)
                 
         logger.info("Audio processing loop ended")
                 
@@ -408,6 +425,10 @@ class SIPAIAssistant:
         if self._processing:
             logger.debug(f"Already processing, queuing: {text}")
             return
+        
+        # Record user utterance word count
+        word_count = len(text.split())
+        Metrics.record_user_utterance(word_count)
             
         log_event(logger, logging.INFO, f"User: {text}",
                  event="user_speech", text=text)
@@ -425,6 +446,10 @@ class SIPAIAssistant:
             response = await self._generate_response(text)
             
             if response:
+                # Record assistant response word count
+                response_word_count = len(response.split())
+                Metrics.record_assistant_response(response_word_count)
+                
                 log_event(logger, logging.INFO, f"Assistant: {response}",
                          event="assistant_response", text=response)
                 
@@ -550,11 +575,16 @@ class SIPAIAssistant:
                     # Timed out waiting for answer
                     log_event(logger, logging.WARNING, f"Call to {uri} not answered",
                              event="call_timeout", uri=uri, timeout=ring_timeout)
+                    Metrics.record_call_failed("outbound", "timeout")
                     await self.sip_handler.hangup_call(call_info)
                     return
                 
                 log_event(logger, logging.INFO, f"Outbound call connected to {uri}",
                          event="call_start", caller=uri, direction="outbound")
+                
+                # Record call started metric
+                Metrics.record_call_started("outbound")
+                outbound_call_start_time = time.time()
                 
                 # Small delay after answer for audio to stabilize
                 await asyncio.sleep(1)
@@ -607,6 +637,12 @@ class SIPAIAssistant:
                     self.current_call = None
                     
                 logger.info(f"Outbound call to {uri} completed")
+                
+                # Record call end metrics
+                if 'outbound_call_start_time' in locals():
+                    duration_ms = (time.time() - outbound_call_start_time) * 1000
+                    Metrics.record_call_duration(duration_ms, "outbound")
+                    Metrics.record_call_ended("outbound", "completed")
             else:
                 logger.error(f"Failed to connect outbound call to {uri}")
         except Exception as e:

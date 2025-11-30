@@ -19,6 +19,8 @@ import redis.asyncio as redis
 if TYPE_CHECKING:
     from api import OutboundCallRequest, OutboundCallHandler
 
+from telemetry import Metrics
+
 logger = logging.getLogger(__name__)
 
 
@@ -148,6 +150,10 @@ class CallQueue:
         position = await self.redis.rpush(self.QUEUE_KEY, call_id)
         queued_call.position = position
         
+        # Record queue metrics
+        Metrics.record_queue_enqueued()
+        Metrics.record_queue_depth(position)
+        
         log_event(logger, logging.INFO, f"Call {call_id} queued at position {position}",
                  event="call_queued", call_id=call_id, position=position)
         
@@ -223,6 +229,11 @@ class CallQueue:
         
         async with self._semaphore:
             wait_time = time.monotonic() - start
+            wait_time_ms = wait_time * 1000
+            
+            # Record queue wait time metric
+            Metrics.record_queue_wait_time(wait_time_ms)
+            
             if wait_time > 0.1:  # Log if waited more than 100ms
                 log_event(logger, logging.INFO, f"Call {call_id} waited {wait_time:.1f}s for slot",
                          event="call_waited", call_id=call_id, wait_seconds=round(wait_time, 1))

@@ -14,6 +14,8 @@ from enum import Enum
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field, model_validator
 
+from telemetry import Metrics
+
 if TYPE_CHECKING:
     from main import SIPAIAssistant
     from call_queue import CallQueue
@@ -364,9 +366,14 @@ class OutboundCallHandler:
                 
             log_event(logger, logging.INFO, f"Webhook sent successfully",
                      event="outbound_call_webhook_success", url=url)
+            
+            # Record success metric
+            Metrics.record_callback_success()
                 
         except Exception as e:
             logger.error(f"Failed to send webhook to {url}: {e}")
+            # Record failure metric
+            Metrics.record_callback_failed(type(e).__name__)
 
 
 # ============================================================================

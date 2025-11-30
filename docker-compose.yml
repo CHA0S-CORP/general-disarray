@@ -35,8 +35,6 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
-    env_file:
-      - .env
     ipc: host
     ulimits:
       memlock: -1
@@ -72,7 +70,7 @@ services:
   # OpenAI-compatible API for both transcription and speech synthesis
   # ============================================================================
   speaches:
-    image: ghcr.io/speaches-ai/speaches:latest-cuda
+    image: ghcr.io/speaches-ai/speaches:0.9.0-rc.2-cuda-12.6.3
     container_name: sip-ai-speaches
     runtime: nvidia
     ipc: host
@@ -143,6 +141,7 @@ services:
       - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.6}
       - LLM_TOP_P=${LLM_TOP_P:-0.85}
       - LLM_API_KEY=${LLM_API_KEY:-}
+      - MAX_CONVERSATION_TURNS=${MAX_CONVERSATION_TURNS:-10}
       # Speaches API settings (unified STT + TTS)
       - SPEACHES_API_URL=http://speaches:8001
       # STT settings
