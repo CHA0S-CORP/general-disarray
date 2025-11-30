@@ -13,6 +13,9 @@ on:
       - main
     paths:
       - 'sip-agent/**'
+  release:
+    types:
+      - published
 env:
   # Docker Hub
   DOCKERHUB_REPO: chaoscorp/sip-agent
