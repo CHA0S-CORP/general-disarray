@@ -1,6 +1,7 @@
 name: sip-agent
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -80,19 +81,6 @@ jobs:
             # Tag with short SHA
             type=sha,prefix=sha-
 
-      - name: Build and push (PR - build only, no push)
-        if: github.event_name == 'pull_request'
-        uses: docker/build-push-action@v5
-        with:
-          context: ./sip-agent/
-          file: ./sip-agent/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: false
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
       - name: Build and push (main/tags - push to registries)
         if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v5
@@ -103,8 +91,13 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
+          cache-from: |
+            type=gha
+            type=registry,ref=${{ env.GHCR_REPO }}:buildcache
           cache-to: type=gha,mode=max
+            # Build args for cache optimization
+          build-args: |
+              BUILDKIT_INLINE_CACHE=1
 
       - name: Generate build summary
         run: |
