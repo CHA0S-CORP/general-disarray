@@ -76,24 +76,17 @@ flowchart LR
 
 ## 🔗 Services & Integrations
 
-| Service | Purpose | Link |
-|---------|---------|------|
-| 🎤 **Speaches** | Unified STT/TTS server (Whisper + Kokoro) | [github.com/speaches-ai/speaches](https://github.com/speaches-ai/speaches) |
-| 🧠 **vLLM** | High-performance LLM inference | [vllm.ai](https://vllm.ai) |
-| 🦙 **Ollama** | Local LLM runner | [ollama.ai](https://ollama.ai) |
-| 🤖 **OpenAI** | Cloud LLM API | [openai.com](https://openai.com) |
-| 📞 **FreePBX** | SIP PBX system | [freepbx.org](https://www.freepbx.org) |
-| ⭐ **Asterisk** | Open source PBX | [asterisk.org](https://www.asterisk.org) |
-| 🌤️ **Tempest** | Weather station API | [tempestwx.com](https://tempestwx.com) |
-| 🔴 **Redis** | Call queue & caching | [redis.io](https://redis.io) |
-| 📊 **Prometheus** | Metrics collection | [prometheus.io](https://prometheus.io) |
-| 📈 **Grafana** | Dashboards & visualization | [grafana.com](https://grafana.com) |
-| 📝 **Loki** | Log aggregation | [grafana.com/loki](https://grafana.com/oss/loki/) |
-| 🔍 **Tempo** | Distributed tracing | [grafana.com/tempo](https://grafana.com/oss/tempo/) |
-| 📡 **OpenTelemetry** | Observability framework | [opentelemetry.io](https://opentelemetry.io) |
-| 🏠 **Home Assistant** | Smart home integration | [home-assistant.io](https://www.home-assistant.io) |
-| 🔄 **n8n** | Workflow automation | [n8n.io](https://n8n.io) |
-
+| Service | Purpose | URL |
+|---------|---------|-----|
+| 🤖 **SIP Agent** | AI Voice Assistant API | [localhost:8080](http://localhost:8080) |
+| 🎤 **Speaches** | STT/TTS (Whisper + Kokoro) | [localhost:8001](http://localhost:8001) |
+| 🧠 **vLLM** | LLM Inference | [localhost:8000](http://localhost:8000) |
+| 🔴 **Redis** | Call Queue & Cache | `redis://localhost:6379` |
+| 📊 **Prometheus** | Metrics Collection | [localhost:9090](http://localhost:9090) |
+| 📈 **Grafana** | Dashboards | [localhost:3000](http://localhost:3000) |
+| 📝 **Loki** | Log Aggregation | [localhost:3100](http://localhost:3100) |
+| 🔍 **Tempo** | Distributed Tracing | [localhost:3200](http://localhost:3200) |
+| 🔄 **n8n** | Workflow Automation | [localhost:5678](http://localhost:5678) |
 ---
 
 ## 🚀 Quick Start
@@ -104,8 +97,6 @@ flowchart LR
 |-------------|-------------|
 | 🐳 **Docker** | Docker and Docker Compose |
 | 📞 **SIP Server** | FreePBX, Asterisk, 3CX, or any SIP PBX |
-| 🧠 **LLM Server** | OpenAI API, vLLM, Ollama, or LM Studio |
-| 🎤 **Speaches** | [Speaches](https://github.com/speaches-ai/speaches) for STT/TTS |
 
 ### Installation
 
@@ -147,13 +138,13 @@ curl http://localhost:8080/health | jq
 ┌────────────────────────────────────────────────────────────┐
 │ 📞 INCOMING CALL                                           │
 ├────────────────────────────────────────────────────────────┤
-│ 🤖 "Hello! Welcome to the AI assistant. How can I help?"  │
+│ 🤖 "Hello! Welcome to the AI assistant. How can I help?"   │
 │ 👤 "What's the weather like?"                              │
-│ 🤖 "At Storm Lake, it's 44 degrees with foggy conditions."│
+│ 🤖 "At Storm Lake, it's 44 degrees with foggy conditions." │
 │ 👤 "Set a timer for 5 minutes"                             │
-│ 🤖 "Timer set for 5 minutes!"                             │
+│ 🤖 "Timer set for 5 minutes!"                              │
 │ 👤 "Goodbye"                                               │
-│ 🤖 "Goodbye! Have a great day!"                           │
+│ 🤖 "Goodbye! Have a great day!"                            │
 └────────────────────────────────────────────────────────────┘
 ```
 
