@@ -11,8 +11,8 @@ A voice-powered AI assistant that answers phone calls, understands natural langu
 [![Runs on DGX Spark](https://img.shields.io/badge/Runs%20on-DGX%20Spark-76B900?logo=nvidia&logoColor=white)](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)
 [![Docs](https://img.shields.io/badge/Docs-readme.io-blue)](https://sip-agent.readme.io)
 
-[![Build Status](https://github.com/MaxwellDPS/general-disarray/actions/workflows/docker-build.yml/badge.svg)](https://github.com/MaxwellDPS/general-disarray/actions/workflows/docker-build.yml)
-[![Build Status](https://github.com/MaxwellDPS/general-disarray/actions/workflows/docker-build-nvitop_exporter.yml/badge.svg)](https://github.com/MaxwellDPS/general-disarray/actions/workflows/docker-build-nvitop_exporter.yml)
+[![Build Status](https://github.com/CHA0S-CORP/general-disarray/actions/workflows/docker-build.yml/badge.svg)](https://github.com/CHA0S-CORP/general-disarray/actions/workflows/docker-build.yml)
+[![Build Status](https://github.com/CHA0S-CORP/general-disarray/actions/workflows/docker-build-nvitop_exporter.yml/badge.svg)](https://github.com/CHA0S-CORP/general-disarray/actions/workflows/docker-build-nvitop_exporter.yml)
 
 📖 **[Read the Documentation](https://sip-agent.readme.io)**
 
@@ -72,6 +72,27 @@ flowchart LR
     N8N -->|HTTP| API
     Webhook -->|HTTP| API
 ```
+---
+
+## 🔗 Services & Integrations
+
+| Service | Purpose | Link |
+|---------|---------|------|
+| 🎤 **Speaches** | Unified STT/TTS server (Whisper + Kokoro) | [github.com/speaches-ai/speaches](https://github.com/speaches-ai/speaches) |
+| 🧠 **vLLM** | High-performance LLM inference | [vllm.ai](https://vllm.ai) |
+| 🦙 **Ollama** | Local LLM runner | [ollama.ai](https://ollama.ai) |
+| 🤖 **OpenAI** | Cloud LLM API | [openai.com](https://openai.com) |
+| 📞 **FreePBX** | SIP PBX system | [freepbx.org](https://www.freepbx.org) |
+| ⭐ **Asterisk** | Open source PBX | [asterisk.org](https://www.asterisk.org) |
+| 🌤️ **Tempest** | Weather station API | [tempestwx.com](https://tempestwx.com) |
+| 🔴 **Redis** | Call queue & caching | [redis.io](https://redis.io) |
+| 📊 **Prometheus** | Metrics collection | [prometheus.io](https://prometheus.io) |
+| 📈 **Grafana** | Dashboards & visualization | [grafana.com](https://grafana.com) |
+| 📝 **Loki** | Log aggregation | [grafana.com/loki](https://grafana.com/oss/loki/) |
+| 🔍 **Tempo** | Distributed tracing | [grafana.com/tempo](https://grafana.com/oss/tempo/) |
+| 📡 **OpenTelemetry** | Observability framework | [opentelemetry.io](https://opentelemetry.io) |
+| 🏠 **Home Assistant** | Smart home integration | [home-assistant.io](https://www.home-assistant.io) |
+| 🔄 **n8n** | Workflow automation | [n8n.io](https://n8n.io) |
 
 ---
 
@@ -99,6 +120,9 @@ nano sip-agent/.env
 
 # Start services
 docker compose up -d
+
+# (Optional) Start services with Observability
+docker compose -f ./docker-compose.yml -f docker-compose.observability.yml up -d
 ```
 
 ### Verify Installation
