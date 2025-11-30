@@ -120,7 +120,7 @@ services:
     #   context: sip-agent/
     #   dockerfile: Dockerfile
     container_name: sip-agent
-    image: ghcr.io/maxwelldps/nvitop-exporter:latest
+    image:  ghcr.io/cha0s-corp/sip-agent:latest
     depends_on:
       redis:
         condition: service_healthy
