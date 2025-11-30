@@ -32,6 +32,52 @@ A voice-powered AI assistant that answers phone calls, understands natural langu
 | 🗣️ **Custom Phrases** | Customize greetings, goodbyes, and responses via JSON or env vars |
 | 📊 **Observability** | Prometheus metrics, OpenTelemetry tracing, structured JSON logs |
 
+## 💡 Use Cases
+
+| Use Case | Example |
+|----------|---------|
+| ⏲️ **Timers & Reminders** | *"Set a timer for 10 minutes"* |
+| 📞 **Callbacks** | *"Call me back in an hour"* |
+| 🌤️ **Weather Briefings** | Scheduled morning weather calls |
+| 📅 **Appointment Reminders** | Outbound calls with confirmation |
+| 🚨 **Alerts & Notifications** | Webhook-triggered phone calls |
+| 🏠 **Smart Home** | Voice control via phone |
+
+---
+## 🚀 Quick Example
+
+Call the assistant and say:
+
+> 🗣️ *"What's the weather like?"*
+
+```mermaid
+sequenceDiagram
+    participant User as 👤 User
+    participant Agent as 🤖 SIP Agent
+    participant STT as 🎤 Speaches
+    participant LLM as 🧠 LLM
+    participant Tool as 🌤️ Weather Tool
+    
+    User->>Agent: "What's the weather like?"
+    Agent->>STT: Audio stream
+    STT-->>Agent: Transcribed text
+    Agent->>LLM: User query + context
+    LLM-->>Agent: [TOOL:WEATHER]
+    Agent->>Tool: Execute
+    Tool-->>Agent: Weather data
+    Agent->>LLM: Tool result
+    LLM-->>Agent: Natural response
+    Agent->>STT: Text to speech
+    STT-->>Agent: Audio
+    Agent->>User: "At Storm Lake, it's 44°..."
+```
+
+**Assistant responds:**
+
+> 🤖 *"At Storm Lake, as of 9:30 pm, it's 44 degrees with foggy conditions. Wind is calm."*
+
+![Example conversation flow](screenshots/conversation-flow.png)
+<!-- TODO: Screenshot of log viewer showing a weather query conversation -->
 ---
 
 ## 🏗️ Architecture
@@ -185,7 +231,9 @@ curl -X POST http://localhost:8080/call \
   -H "Content-Type: application/json" \
   -d '{
     "extension": "5551234567",
-    "message": "Hello! This is a reminder about your appointment tomorrow."
+    "message": "Hello! This is a reminder about your appointment tomorrow.",
+    "at_time": "07:00",
+    "timezone": "America/Los_Angeles",
   }'
 ```
 
@@ -199,30 +247,24 @@ curl -X POST http://localhost:8080/call \
 }
 ```
 
-### 🌤️ Weather Call
+### 🌅 Morning Weather Briefing
+
+Schedule a daily weather call at 7am:
 
 ```bash
-curl -X POST http://localhost:8080/tools/WEATHER/call \
-  -H "Content-Type: application/json" \
-  -d '{
-    "extension": "5551234567",
-    "prefix": "Good morning! Here is your weather update."
-  }'
-```
-
-### ⏰ Schedule Daily Weather Briefing
-
-```bash
-curl -X POST http://localhost:8080/schedule \
+curl -X POST http://sip-agent:8080/schedule \
   -H "Content-Type: application/json" \
   -d '{
     "extension": "5551234567",
     "tool": "WEATHER",
     "at_time": "07:00",
+    "timezone": "America/Los_Angeles",
     "recurring": "daily",
-    "prefix": "Good morning!"
-  }'
+    "prefix": "Good morning! Here is your weather update for today.",
+    "suffix": "Have a great day!"
+  }' | jq
 ```
+
 
 **Response:**
 
@@ -351,15 +393,12 @@ Import the included dashboard:
 grafana/dashboards/sip-agent.json
 ```
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│ 📊 SIP Agent Dashboard                                      │
-├─────────────────────────────────────────────────────────────┤
-│ 📞 Active Calls: 1        │ 📈 Total Today: 47             │
-│ ⏱️ Avg Duration: 2m 34s   │ 🔧 Tool Calls: 23              │
-│ 🎤 STT p95: 245ms         │ 🧠 LLM p95: 890ms              │
-└─────────────────────────────────────────────────────────────┘
-```
+![Alt text](https://github.com/MaxwellDPS/docs/blob/v1.0/docs/photos/Screenshot%202025-11-29%20222658.png?raw=true "Dashboard")
+![Alt text](https://github.com/MaxwellDPS/docs/blob/v1.0/docs/photos/Screenshot%202025-11-29%20222729.png?raw=true "Dashboard")
+![Alt text](https://github.com/MaxwellDPS/docs/blob/v1.0/docs/photos/Screenshot%202025-11-29%20222739.png?raw=true "Dashboard")
+![Alt text](https://github.com/MaxwellDPS/docs/blob/v1.0/docs/photos/Screenshot%202025-11-29%20222748.png?raw=true "Dashboard")
+![Alt text](https://github.com/MaxwellDPS/docs/blob/v1.0/docs/photos/Screenshot%202025-11-29%20222808.png?raw=true "Dashboard")
+
 
 ---
 
@@ -544,16 +583,6 @@ git commit -m "✨ feat: add amazing feature"
 git push origin feature/amazing-feature
 ```
 
-**Commit prefixes:**
-
-| Prefix | Use |
-|--------|-----|
-| `✨ feat:` | New feature |
-| `🐛 fix:` | Bug fix |
-| `📚 docs:` | Documentation |
-| `🔧 chore:` | Maintenance |
-| `🎨 style:` | Formatting |
-| `♻️ refactor:` | Refactoring |
 
 ---
 
