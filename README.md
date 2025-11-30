@@ -16,6 +16,7 @@ A voice-powered AI assistant that answers phone calls, understands natural langu
 
 📖 **[Read the Documentation](https://sip-agent.readme.io)**
 
+<!-- ![](https://github.com/MaxwellDPS/docs/blob/v1.0/docs/photos/Screenshot%202025-11-29%20214430.png?raw=true) -->
 ---
 
 ## ✨ Features
@@ -76,7 +77,7 @@ sequenceDiagram
 
 > 🤖 *"At Storm Lake, as of 9:30 pm, it's 44 degrees with foggy conditions. Wind is calm."*
 
-![Example conversation flow](screenshots/conversation-flow.png)
+![Example conversation flow](https://github.com/MaxwellDPS/docs/blob/v1.0/docs/photos/Screenshot%202025-11-29%20214959.png?raw=true)
 <!-- TODO: Screenshot of log viewer showing a weather query conversation -->
 ---
 
