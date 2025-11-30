@@ -44,16 +44,18 @@ EVENT_STYLE = {
     'call_timeout': ('📴', C.RED, 'call'),
     
     # Outbound calls
-    'outbound_call_initiated': ('📤', C.BLUE, 'call'),
-    'outbound_call_dialing': ('📞', C.YELLOW, 'call'),
-    'outbound_call_answered': ('📞', C.GREEN, 'call'),
-    'outbound_call_no_answer': ('📴', C.RED, 'call'),
-    'outbound_call_message_played': ('🔊', C.GREEN, 'call'),
-    'outbound_call_ack_played': ('✅', C.GREEN, 'call'),
-    'outbound_call_choice_collected': ('✅', C.GREEN, 'call'),
-    'outbound_call_choice_no_match': ('❓', C.YELLOW, 'call'),
-    'outbound_call_webhook': ('🔗', C.BLUE, 'call'),
-    'outbound_call_webhook_success': ('✅', C.GREEN, 'call'),
+    'outbound_call_initiated': ('📤', C.BLUE, 'outbound'),
+    'outbound_call_dialing': ('📞', C.YELLOW, 'outbound'),
+    'outbound_call_answered': ('📞', C.GREEN, 'outbound'),
+    'outbound_call_no_answer': ('📴', C.RED, 'outbound'),
+    'outbound_call_message_played': ('🔊', C.GREEN, 'outbound'),
+    'outbound_call_ack_played': ('✅', C.GREEN, 'outbound'),
+    'outbound_call_choice_collected': ('✅', C.GREEN, 'outbound'),
+    'outbound_call_choice_no_match': ('❓', C.YELLOW, 'outbound'),
+    'outbound_call_webhook': ('🔗', C.BLUE, 'outbound'),
+    'outbound_call_webhook_success': ('✅', C.GREEN, 'outbound'),
+    'outbound_call_complete': ('✅', C.GREEN, 'outbound'),
+    'outbound_call_failed': ('❌', C.RED, 'outbound'),
     
     # Call queue
     'call_queued': ('📥', C.BLUE, 'call'),
@@ -106,6 +108,7 @@ GROUP_START_EVENTS = {
     'callback_execute': ('callback', '📲', 'CALLBACK', C.BLUE),
     'api_tool_call': ('api', '🌐', 'API TOOL CALL', C.CYAN),
     'api_tool_execute': ('api', '🌐', 'API TOOL EXECUTE', C.CYAN),
+    'outbound_call_initiated': ('outbound', '📤', 'OUTBOUND CALL', C.BLUE),
 }
 
 # Events that end a grouped section
@@ -113,6 +116,7 @@ GROUP_END_EVENTS = {
     'timer': ['timer_complete', 'timer_cancelled', 'call_end'],
     'callback': ['callback_complete', 'callback_failed', 'call_end'],
     'api': ['api_tool_complete', 'api_tool_call_tool_failed', 'outbound_call_initiated'],
+    'outbound': ['outbound_call_webhook_success', 'outbound_call_complete', 'outbound_call_failed', 'outbound_call_no_answer'],
 }
 
 class CallTracker:
@@ -122,9 +126,9 @@ class CallTracker:
         self.in_call = False
         self.current_caller = None
         self.call_count = 0
-        # Track active groups (timer, callback, api)
+        # Track active groups (timer, callback, api, outbound)
         self.active_group = None
-        self.group_count = {'timer': 0, 'callback': 0, 'api': 0}
+        self.group_count = {'timer': 0, 'callback': 0, 'api': 0, 'outbound': 0}
         
     def print_call_header(self, caller: str, direction: str = "inbound"):
         """Print a call start header."""
@@ -222,7 +226,7 @@ def format_log(line: str, show_all: bool = False) -> str | None:
             tracker.print_call_footer()
             return None  # Footer already printed
         
-        # Handle group start events (timer_fired, callback_execute, api_tool_call)
+        # Handle group start events (timer_fired, callback_execute, api_tool_call, outbound_call_initiated)
         if event in GROUP_START_EVENTS:
             group_type, icon, title, color = GROUP_START_EVENTS[event]
             # Build extra info from event data
@@ -235,6 +239,12 @@ def format_log(line: str, show_all: bool = False) -> str | None:
                 tool = extra.get('tool', '')
                 ext = extra.get('extension', '')
                 extra_info = f"{tool}" + (f" → {ext}" if ext else "")
+            elif event == 'outbound_call_initiated':
+                ext = extra.get('extension', extra.get('uri', ''))
+                call_id = extra.get('call_id', '')
+                extra_info = ext
+                if call_id:
+                    extra_info += f" ({call_id})"
             
             tracker.start_group(group_type, icon, title, color, extra_info)
             # Continue to also print the event line below
@@ -255,7 +265,7 @@ def format_log(line: str, show_all: bool = False) -> str | None:
                 indent = "    "  # Indent within group
             elif category == 'speech':
                 indent = "    "  # Extra indent for conversation
-            elif category in ('tool', 'task', 'timer', 'callback', 'api'):
+            elif category in ('tool', 'task', 'timer', 'callback', 'api', 'outbound'):
                 indent = "      "  # Extra indent for tools/tasks
             
             # Build output line
@@ -279,6 +289,12 @@ def format_log(line: str, show_all: bool = False) -> str | None:
                     show_keys = ['tool', 'extension', 'params']
                 elif event == 'weather_fetch':
                     pass  # Message has the summary
+                elif event == 'outbound_call_initiated':
+                    show_keys = ['extension', 'call_id']
+                elif event == 'outbound_call_choice_collected':
+                    show_keys = ['choice', 'raw_text']
+                elif event.startswith('outbound_call_'):
+                    show_keys = ['call_id', 'status', 'duration']
                 else:
                     show_keys = list(extra.keys())
                 
