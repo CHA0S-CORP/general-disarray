@@ -105,7 +105,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt --break-system-packages
 
 # Copy application code
-COPY src/*.py ./
+COPY src/ ./
 
 # Create directories
 RUN mkdir -p /app/data/recordings /app/data/logs /app/data/voices

@@ -29,7 +29,7 @@ class C:
     NC = '\033[0m'
 
 # Event styling: event_name -> (icon, color, category)
-# Categories: 'system', 'call', 'speech', 'tool', 'task'
+# Categories: 'system', 'call', 'speech', 'tool', 'task', 'api'
 EVENT_STYLE = {
     # System events
     'warming_up': ('🔥', C.YELLOW, 'system'),
@@ -66,18 +66,53 @@ EVENT_STYLE = {
     'assistant_ack': ('💬', C.MAGENTA, 'speech'),
     'barge_in': ('✋', C.YELLOW, 'speech'),
     
-    # Tool invocations
+    # Tool invocations (from conversation)
     'tool_call': ('🔧', C.WHITE, 'tool'),
     'timer_set': ('⏰', C.YELLOW, 'tool'),
     'callback_scheduled': ('📲', C.BLUE, 'tool'),
     'weather_fetch': ('🌤️', C.CYAN, 'tool'),
     
-    # Task execution
+    # Timer events
+    'timer_fired': ('🔔', C.YELLOW, 'timer'),
+    'timer_complete': ('✅', C.GREEN, 'timer'),
+    'timer_cancelled': ('❌', C.RED, 'timer'),
+    
+    # Callback events
+    'callback_execute': ('📲', C.BLUE, 'callback'),
+    'callback_dialing': ('📞', C.YELLOW, 'callback'),
+    'callback_answered': ('📞', C.GREEN, 'callback'),
+    'callback_complete': ('✅', C.GREEN, 'callback'),
+    'callback_failed': ('❌', C.RED, 'callback'),
+    
+    # Task execution (generic)
     'task_scheduled': ('📋', C.BLUE, 'task'),
     'task_execute': ('⚡', C.WHITE, 'task'),
-    'timer_fired': ('🔔', C.YELLOW, 'task'),
-    'callback_execute': ('📲', C.BLUE, 'task'),
-    'callback_complete': ('✅', C.GREEN, 'task'),
+    'task_complete': ('✅', C.GREEN, 'task'),
+    'task_cancelled': ('❌', C.RED, 'task'),
+    
+    # API/Webhook tool calls
+    'api_tool_execute': ('🌐', C.BLUE, 'api'),
+    'api_tool_complete': ('✅', C.GREEN, 'api'),
+    'api_tool_call': ('📤', C.BLUE, 'api'),
+    'api_tool_call_initiated': ('📞', C.GREEN, 'api'),
+    'api_tool_call_tool_failed': ('❌', C.RED, 'api'),
+    'api_tool_no_call': ('⚠️', C.YELLOW, 'api'),
+    'api_speak_success': ('🔊', C.GREEN, 'api'),
+}
+
+# Events that start a grouped section
+GROUP_START_EVENTS = {
+    'timer_fired': ('timer', '⏰', 'TIMER FIRED', C.YELLOW),
+    'callback_execute': ('callback', '📲', 'CALLBACK', C.BLUE),
+    'api_tool_call': ('api', '🌐', 'API TOOL CALL', C.CYAN),
+    'api_tool_execute': ('api', '🌐', 'API TOOL EXECUTE', C.CYAN),
+}
+
+# Events that end a grouped section
+GROUP_END_EVENTS = {
+    'timer': ['timer_complete', 'timer_cancelled', 'call_end'],
+    'callback': ['callback_complete', 'callback_failed', 'call_end'],
+    'api': ['api_tool_complete', 'api_tool_call_tool_failed', 'outbound_call_initiated'],
 }
 
 class CallTracker:
@@ -87,6 +122,9 @@ class CallTracker:
         self.in_call = False
         self.current_caller = None
         self.call_count = 0
+        # Track active groups (timer, callback, api)
+        self.active_group = None
+        self.group_count = {'timer': 0, 'callback': 0, 'api': 0}
         
     def print_call_header(self, caller: str, direction: str = "inbound"):
         """Print a call start header."""
@@ -107,6 +145,26 @@ class CallTracker:
             print(f"{C.RED}{'─' * 70}{C.NC}\n")
         self.in_call = False
         self.current_caller = None
+        self.end_group()  # End any active group when call ends
+    
+    def start_group(self, group_type: str, icon: str, title: str, color: str, extra_info: str = ""):
+        """Start a grouped section (timer, callback, api)."""
+        # End any existing group first
+        self.end_group()
+        
+        self.active_group = group_type
+        self.group_count[group_type] = self.group_count.get(group_type, 0) + 1
+        count = self.group_count[group_type]
+        
+        info_str = f" - {extra_info}" if extra_info else ""
+        print(f"\n{color}{'┌' + '─' * 50}{C.NC}")
+        print(f"{color}│ {icon} {title} #{count}{info_str}{C.NC}")
+        print(f"{color}{'└' + '─' * 50}{C.NC}")
+    
+    def end_group(self):
+        """End the current grouped section."""
+        if self.active_group:
+            self.active_group = None
 
 tracker = CallTracker()
 
@@ -164,15 +222,40 @@ def format_log(line: str, show_all: bool = False) -> str | None:
             tracker.print_call_footer()
             return None  # Footer already printed
         
+        # Handle group start events (timer_fired, callback_execute, api_tool_call)
+        if event in GROUP_START_EVENTS:
+            group_type, icon, title, color = GROUP_START_EVENTS[event]
+            # Build extra info from event data
+            extra_info = ""
+            if event == 'timer_fired':
+                extra_info = extra.get('message', msg) if extra else msg
+            elif event == 'callback_execute':
+                extra_info = extra.get('destination', extra.get('target', ''))
+            elif event in ('api_tool_call', 'api_tool_execute'):
+                tool = extra.get('tool', '')
+                ext = extra.get('extension', '')
+                extra_info = f"{tool}" + (f" → {ext}" if ext else "")
+            
+            tracker.start_group(group_type, icon, title, color, extra_info)
+            # Continue to also print the event line below
+        
+        # Handle group end events
+        if tracker.active_group:
+            end_events = GROUP_END_EVENTS.get(tracker.active_group, [])
+            if event in end_events:
+                tracker.end_group()
+        
         # Format based on event
         if event and event in EVENT_STYLE:
             icon, color, category = EVENT_STYLE[event]
             
-            # Indent based on category
+            # Indent based on category and active group
             indent = "  "
-            if category == 'speech':
+            if tracker.active_group:
+                indent = "    "  # Indent within group
+            elif category == 'speech':
                 indent = "    "  # Extra indent for conversation
-            elif category in ('tool', 'task'):
+            elif category in ('tool', 'task', 'timer', 'callback', 'api'):
                 indent = "      "  # Extra indent for tools/tasks
             
             # Build output line
@@ -192,6 +275,10 @@ def format_log(line: str, show_all: bool = False) -> str | None:
                     show_keys = ['duration', 'message']
                 elif event == 'callback_scheduled':
                     show_keys = ['delay', 'destination']
+                elif event in ('api_tool_call', 'api_tool_execute', 'api_tool_call_initiated'):
+                    show_keys = ['tool', 'extension', 'params']
+                elif event == 'weather_fetch':
+                    pass  # Message has the summary
                 else:
                     show_keys = list(extra.keys())
                 

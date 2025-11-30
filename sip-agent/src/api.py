@@ -90,6 +90,53 @@ class WebhookPayload(BaseModel):
     error: Optional[str] = None
 
 
+class ToolExecuteRequest(BaseModel):
+    """Request to execute a tool."""
+    tool: str = Field(..., description="Name of the tool to execute (e.g., WEATHER, DATETIME)")
+    params: Dict[str, Any] = Field(default_factory=dict, description="Parameters to pass to the tool")
+    speak_result: bool = Field(default=False, description="Speak the result to the active call")
+    call_id: Optional[str] = Field(default=None, description="Specific call to speak to (if multiple calls active)")
+
+
+class ToolCallRequest(BaseModel):
+    """Request to execute a tool and call someone with the result."""
+    tool: str = Field(..., description="Name of the tool to execute (e.g., WEATHER, DATETIME)")
+    params: Dict[str, Any] = Field(default_factory=dict, description="Parameters to pass to the tool")
+    extension: str = Field(..., description="SIP extension or phone number to call")
+    prefix: Optional[str] = Field(default=None, description="Message to speak before the tool result")
+    suffix: Optional[str] = Field(default=None, description="Message to speak after the tool result")
+    ring_timeout: int = Field(default=30, description="Seconds to wait for call to be answered")
+    callback_url: Optional[str] = Field(default=None, description="Webhook URL to POST call results to")
+
+
+class ToolCallResponse(BaseModel):
+    """Response from tool call request."""
+    call_id: str
+    status: str
+    tool: str
+    tool_success: bool
+    tool_message: str
+    message: str
+
+
+class ToolExecuteResponse(BaseModel):
+    """Response from tool execution."""
+    success: bool
+    tool: str
+    message: str
+    data: Optional[Dict[str, Any]] = None
+    spoken: bool = False
+    error: Optional[str] = None
+
+
+class ToolInfo(BaseModel):
+    """Information about an available tool."""
+    name: str
+    description: str
+    parameters: Dict[str, Any]
+    enabled: bool
+
+
 # ============================================================================
 # Outbound Call Handler
 # ============================================================================
@@ -524,4 +571,311 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
     # Store handler reference for queue worker
     app.state.handler = handler
     
+    # ==========================================================================
+    # Tool Execution API
+    # ==========================================================================
+    
+    @app.get("/tools", response_model=List[ToolInfo])
+    async def list_tools():
+        """
+        List all available tools.
+        
+        Returns information about each tool including name, description, 
+        parameters, and whether it's enabled.
+        """
+        tools = []
+        for name, tool in assistant.tool_manager.tools.items():
+            tools.append(ToolInfo(
+                name=name,
+                description=getattr(tool, 'description', ''),
+                parameters=getattr(tool, 'parameters', {}),
+                enabled=getattr(tool, 'enabled', True)
+            ))
+        return sorted(tools, key=lambda t: t.name)
+    
+    @app.get("/tools/{tool_name}", response_model=ToolInfo)
+    async def get_tool(tool_name: str):
+        """Get information about a specific tool."""
+        tool = assistant.tool_manager.get_tool(tool_name)
+        if not tool:
+            raise HTTPException(status_code=404, detail=f"Tool '{tool_name}' not found")
+        
+        return ToolInfo(
+            name=getattr(tool, 'name', tool_name),
+            description=getattr(tool, 'description', ''),
+            parameters=getattr(tool, 'parameters', {}),
+            enabled=getattr(tool, 'enabled', True)
+        )
+    
+    @app.post("/tools/{tool_name}/call", response_model=ToolCallResponse)
+    async def tool_call(tool_name: str, request: ToolCallRequest):
+        """
+        Execute a tool and call someone with the result.
+        
+        This endpoint is perfect for webhooks - it executes a tool (like WEATHER),
+        then places an outbound call to speak the result to the recipient.
+        
+        Examples:
+        
+        Weather alert call:
+        ```json
+        POST /tools/WEATHER/call
+        {
+            "tool": "WEATHER",
+            "extension": "1001",
+            "prefix": "Good morning! Here's your weather update.",
+            "suffix": "Have a great day!"
+        }
+        ```
+        
+        Scheduled weather call (from cron/Home Assistant):
+        ```bash
+        curl -X POST http://sip-agent:8080/tools/WEATHER/call \\
+          -H "Content-Type: application/json" \\
+          -d '{"tool": "WEATHER", "extension": "5551234567"}'
+        ```
+        
+        DateTime announcement:
+        ```json
+        POST /tools/DATETIME/call
+        {
+            "tool": "DATETIME",
+            "params": {"format": "full"},
+            "extension": "1001",
+            "prefix": "Attention please."
+        }
+        ```
+        
+        With callback for confirmation:
+        ```json
+        {
+            "tool": "WEATHER",
+            "extension": "1001",
+            "callback_url": "https://example.com/webhook/weather-call-complete"
+        }
+        ```
+        """
+        actual_tool_name = tool_name.upper()
+        
+        # Get the tool
+        tool = assistant.tool_manager.get_tool(actual_tool_name)
+        if not tool:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"Tool '{actual_tool_name}' not found. Use GET /tools to list available tools."
+            )
+        
+        log_event(logger, logging.INFO, f"Tool call request: {actual_tool_name} -> {request.extension}",
+                 event="api_tool_call", tool=actual_tool_name, extension=request.extension)
+        
+        try:
+            # Execute the tool first
+            result = await tool.execute(request.params)
+            
+            tool_success = result.status.value == "success" if hasattr(result.status, 'value') else str(result.status).lower() == "success"
+            tool_message = result.message
+            
+            if not tool_success:
+                log_event(logger, logging.WARNING, f"Tool failed: {tool_message}",
+                         event="api_tool_call_tool_failed", tool=actual_tool_name)
+                return ToolCallResponse(
+                    call_id="",
+                    status="tool_failed",
+                    tool=actual_tool_name,
+                    tool_success=False,
+                    tool_message=tool_message,
+                    message=f"Tool execution failed: {tool_message}"
+                )
+            
+            # Build the full message
+            message_parts = []
+            if request.prefix:
+                message_parts.append(request.prefix)
+            message_parts.append(tool_message)
+            if request.suffix:
+                message_parts.append(request.suffix)
+            
+            full_message = " ".join(message_parts)
+            
+            # Create outbound call request
+            call_request = OutboundCallRequest(
+                message=full_message,
+                extension=request.extension,
+                callback_url=request.callback_url,
+                ring_timeout=request.ring_timeout
+            )
+            
+            # Initiate the call
+            call_id, position = await handler.initiate_call(call_request)
+            
+            log_event(logger, logging.INFO, f"Tool call initiated: {call_id}",
+                     event="api_tool_call_initiated", 
+                     tool=actual_tool_name, 
+                     call_id=call_id,
+                     extension=request.extension)
+            
+            return ToolCallResponse(
+                call_id=call_id,
+                status="queued" if position > 0 else "initiated",
+                tool=actual_tool_name,
+                tool_success=True,
+                tool_message=tool_message,
+                message=f"Calling {request.extension} with {actual_tool_name} result"
+            )
+            
+        except Exception as e:
+            logger.error(f"Tool call failed: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.post("/tools/{tool_name}/execute", response_model=ToolExecuteResponse)
+    async def execute_tool(tool_name: str, request: ToolExecuteRequest = None):
+        """
+        Execute a tool and optionally speak the result.
+        
+        This endpoint allows external systems (webhooks, home automation, etc.)
+        to trigger tool execution. The result can optionally be spoken to 
+        an active call.
+        
+        Examples:
+        
+        Get weather (just data):
+        ```json
+        POST /tools/WEATHER/execute
+        {"tool": "WEATHER"}
+        ```
+        
+        Get weather and speak to call:
+        ```json
+        POST /tools/WEATHER/execute
+        {"tool": "WEATHER", "speak_result": true}
+        ```
+        
+        Execute calculation:
+        ```json
+        POST /tools/CALC/execute
+        {"tool": "CALC", "params": {"expression": "25 * 4"}}
+        ```
+        
+        Set a timer and announce it:
+        ```json
+        POST /tools/SET_TIMER/execute
+        {
+            "tool": "SET_TIMER",
+            "params": {"duration": 300, "message": "Pizza is ready!"},
+            "speak_result": true
+        }
+        ```
+        """
+        # Use request body or default
+        if request is None:
+            request = ToolExecuteRequest(tool=tool_name)
+        
+        # Override tool name from path
+        actual_tool_name = tool_name.upper()
+        
+        # Get the tool
+        tool = assistant.tool_manager.get_tool(actual_tool_name)
+        if not tool:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"Tool '{actual_tool_name}' not found. Use GET /tools to list available tools."
+            )
+        
+        log_event(logger, logging.INFO, f"API executing tool: {actual_tool_name}",
+                 event="api_tool_execute", tool=actual_tool_name, params=request.params)
+        
+        try:
+            # Execute the tool
+            result = await tool.execute(request.params)
+            
+            success = result.status.value == "success" if hasattr(result.status, 'value') else result.status == "success"
+            
+            response = ToolExecuteResponse(
+                success=success,
+                tool=actual_tool_name,
+                message=result.message,
+                data=getattr(result, 'data', None),
+                spoken=False,
+                error=None if success else result.message
+            )
+            
+            # Speak result to active call if requested
+            if request.speak_result and success and result.message:
+                spoken = await _speak_to_call(assistant, result.message, request.call_id)
+                response.spoken = spoken
+                if not spoken:
+                    log_event(logger, logging.WARNING, "No active call to speak to",
+                             event="api_tool_no_call")
+            
+            log_event(logger, logging.INFO, f"Tool executed: {actual_tool_name}",
+                     event="api_tool_complete", tool=actual_tool_name, success=success)
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Tool execution failed: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.post("/speak")
+    async def speak_message(message: str, call_id: Optional[str] = None):
+        """
+        Speak a message to the active call.
+        
+        This is useful for external systems to inject announcements
+        into an ongoing call.
+        
+        Query params:
+        - message: The text to speak
+        - call_id: Optional specific call ID (if multiple calls active)
+        """
+        if not message:
+            raise HTTPException(status_code=400, detail="Message is required")
+        
+        spoken = await _speak_to_call(assistant, message, call_id)
+        
+        if spoken:
+            return {"success": True, "message": "Message spoken to call"}
+        else:
+            raise HTTPException(status_code=404, detail="No active call to speak to")
+    
     return app
+
+
+async def _speak_to_call(assistant: 'SIPAIAssistant', message: str, call_id: Optional[str] = None) -> bool:
+    """
+    Speak a message to an active call.
+    
+    Returns True if message was spoken, False if no active call.
+    """
+    try:
+        # Check if there's an active call
+        current_call = getattr(assistant, 'current_call', None)
+        
+        if not current_call:
+            logger.debug("No current_call attribute on assistant")
+            return False
+        
+        # If call_id specified, verify it matches
+        if call_id:
+            current_call_id = getattr(current_call, 'call_id', None) or getattr(current_call, 'id', None)
+            if current_call_id != call_id:
+                logger.debug(f"Call ID mismatch: {current_call_id} != {call_id}")
+                return False
+        
+        # Generate TTS
+        audio_data = await assistant.audio_pipeline.synthesize(message)
+        if not audio_data:
+            logger.error("Failed to synthesize speech")
+            return False
+        
+        # Send audio to call
+        await assistant.sip_handler.send_audio(audio_data)
+        
+        log_event(logger, logging.INFO, f"Spoke message to call: {message[:50]}...",
+                 event="api_speak_success")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to speak to call: {e}", exc_info=True)
+        return False

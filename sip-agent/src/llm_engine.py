@@ -134,7 +134,7 @@ class LLMEngine:
         return response_text
         
     def _build_system_prompt(self, call_context: Optional[Dict[str, Any]] = None) -> str:
-        """Build system prompt with context."""
+        """Build system prompt with dynamic context and tools."""
         prompt = self.config.system_prompt
         
         # Add time context
@@ -147,11 +147,10 @@ class LLMEngine:
             prompt += f"\n- Caller: {call_context.get('remote_uri', 'unknown')}"
             prompt += f"\n- Duration: {call_context.get('duration', 0):.0f} seconds"
             
-        # Add available tools
-        prompt += "\n\nAvailable tools and their status:"
-        for tool_name, tool in self.tool_manager.tools.items():
-            status = "enabled" if tool.enabled else "disabled"
-            prompt += f"\n- {tool_name}: {status}"
+        # Add dynamic tools section from ToolManager
+        tools_prompt = self.tool_manager.get_tools_prompt()
+        if tools_prompt:
+            prompt += f"\n\n{tools_prompt}"
             
         return prompt
         
