@@ -16,7 +16,6 @@ A voice-powered AI assistant that answers phone calls, understands natural langu
 
 📖 **[Read the Documentation](https://sip-agent.readme.io)**
 
-<!-- ![](https://github.com/MaxwellDPS/docs/blob/v1.0/docs/photos/Screenshot%202025-11-29%20214430.png?raw=true) -->
 ---
 
 ## ✨ Features
@@ -499,13 +498,14 @@ This project is optimized to run on the [NVIDIA DGX Spark](https://www.nvidia.co
 │ ✅ Multiple concurrent calls                                │
 └─────────────────────────────────────────────────────────────┘
 ```
+![](https://github.com/MaxwellDPS/docs/blob/v1.0/docs/photos/Screenshot%202025-11-29%20214430.png?raw=true)
 
 **Recommended DGX Spark setup:**
 
 ```env
 # Run everything locally on DGX Spark
 LLM_BASE_URL=http://localhost:8000/v1
-LLM_MODEL=openai-community/gpt2-xl
+LLM_MODEL=openai/gpt-oss-20b
 SPEACHES_API_URL=http://localhost:8001
 ```
 
