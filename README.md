@@ -247,7 +247,7 @@ curl -X POST http://localhost:8080/call \
   "message": "Call initiated"
 }
 ```
-
+![](https://github.com/MaxwellDPS/docs/blob/v1.0/docs/photos/Screenshot%202025-11-29%20214700.png?raw=true)
 ### 🌅 Morning Weather Briefing
 
 Schedule a daily weather call at 7am:
