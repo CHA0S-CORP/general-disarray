@@ -1,665 +1,520 @@
-# SIP AI Assistant
+# 📞 SIP AI Assistant
 
-A voice-based AI assistant that answers phone calls via SIP, powered by local LLM inference. Supports natural conversations, timers, callbacks, and extensible tools.
+> 🤖 **ROBO CODED** — This project was made with AI and may not be 100% sane. But the code does work! 🎉
 
-## Architecture
+A voice-powered AI assistant that answers phone calls, understands natural language, and performs actions like checking weather, setting timers, scheduling callbacks, and more.
 
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![Docker](https://img.shields.io/badge/Docker-Ready-blue.svg)](https://www.docker.com/)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11+-green.svg)](https://www.python.org/)
+[![Runs on DGX Spark](https://img.shields.io/badge/Runs%20on-DGX%20Spark-76B900?logo=nvidia&logoColor=white)](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)
+[![Docs](https://img.shields.io/badge/Docs-readme.io-blue)](https://sip-agent.readme.io)
+
+📖 **[Read the Documentation](https://sip-agent.readme.io)**
+
+---
+
+## ✨ Features
+
+| Feature | Description |
+|---------|-------------|
+| 🎙️ **Voice Conversations** | Natural speech-to-text and text-to-speech powered by Whisper & Kokoro |
+| 🤖 **LLM Integration** | Connects to OpenAI, vLLM, Ollama, LM Studio, and more |
+| 🔧 **Built-in Tools** | Weather, timers, callbacks, date/time, calculator, jokes |
+| 🔌 **Plugin System** | Easily add custom tools with Python |
+| 🌐 **REST API** | Initiate outbound calls, execute tools, manage schedules |
+| ⏰ **Scheduled Calls** | One-time or recurring calls (daily briefings, reminders) |
+| 🔗 **Webhooks** | Trigger calls from Home Assistant, n8n, Grafana, and more |
+| 📊 **Observability** | Prometheus metrics, OpenTelemetry tracing, structured JSON logs |
+
+---
+
+## 🏗️ Architecture
+
+```mermaid
+flowchart LR
+    subgraph Caller
+        Phone[📱 SIP Phone]
+    end
+    
+    subgraph Agent["🤖 SIP AI Agent"]
+        SIP[SIP Client]
+        Audio[Audio Pipeline]
+        Tools[Tool Manager]
+        API[REST API]
+    end
+    
+    subgraph Services
+        LLM[🧠 LLM Server<br/>OpenAI / vLLM / Ollama]
+        Speaches[🎤 Speaches<br/>STT + TTS]
+    end
+    
+    subgraph Integrations
+        HA[🏠 Home Assistant]
+        N8N[🔄 n8n]
+        Webhook[🔗 Webhooks]
+    end
+    
+    Phone <-->|SIP/RTP| SIP
+    SIP <--> Audio
+    Audio <-->|Whisper| Speaches
+    Audio <-->|Kokoro| Speaches
+    Audio <--> Tools
+    Tools <-->|OpenAI API| LLM
+    
+    API <--> Tools
+    HA -->|HTTP| API
+    N8N -->|HTTP| API
+    Webhook -->|HTTP| API
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         Docker Compose                               │
-├─────────────────┬─────────────────────┬─────────────────────────────┤
-│                 │                     │                             │
-│    vLLM         │     Speaches        │      SIP Agent              │
-│    Server       │     (STT + TTS)     │      (Orchestrator)         │
-│                 │                     │                             │
-│  ┌───────────┐  │  ┌───────────────┐  │  ┌───────────────────────┐  │
-│  │ LLM Model │  │  │ Whisper (STT) │  │  │  PJSIP Call Handler   │  │
-│  │ (Qwen2.5) │  │  │ Kokoro (TTS)  │  │  │  Audio Pipeline       │  │
-│  └───────────┘  │  └───────────────┘  │  │  Tool Manager         │  │
-│                 │                     │  │  LLM Client            │  │
-│  Port: 8000     │  Port: 8001         │  └───────────────────────┘  │
-│                 │                     │                             │
-└─────────────────┴─────────────────────┴─────────────────────────────┘
-                                              │
-                                              ▼
-                                    ┌───────────────────┐
-                                    │   SIP Server      │
-                                    │   (Asterisk/      │
-                                    │    FreeSWITCH)    │
-                                    └───────────────────┘
-```
 
-**Components:**
+---
 
-| Service | Purpose | Model/Tech |
-|---------|---------|------------|
-| **vLLM** | LLM inference | Qwen2.5-7B-Instruct (configurable) |
-| **Speaches** | Speech-to-Text | Whisper (configurable size) |
-| **Speaches** | Text-to-Speech | Kokoro-82M with af_heart voice |
-| **Redis** | Call queue | Persistence for outbound calls |
-| **SIP Agent** | Orchestration | PJSIP + Python asyncio |
+## 🚀 Quick Start
 
-## Features
+### Prerequisites
 
-- **Natural Conversations** - Context-aware multi-turn dialogue
-- **Voice Activity Detection** - Automatic speech endpoint detection
-- **Barge-in Support** - Interrupt the assistant mid-response
-- **Timers** - "Set a timer for 5 minutes"
-- **Callbacks** - "Call me back in 10 minutes"
-- **Outbound Call API** - REST API for notification calls with response collection
-- **Call Queue** - Redis-backed queue for rate-limiting outbound calls
-- **Extensible Tools** - Easy to add new capabilities
-- **JSON Structured Logging** - Filterable event stream
-- **Pre-cached Phrases** - Low-latency greetings and acknowledgments
-- **OpenTelemetry Observability** - Distributed tracing, metrics, and logs
+| Requirement | Description |
+|-------------|-------------|
+| 🐳 **Docker** | Docker and Docker Compose |
+| 📞 **SIP Server** | FreePBX, Asterisk, 3CX, or any SIP PBX |
+| 🧠 **LLM Server** | OpenAI API, vLLM, Ollama, or LM Studio |
+| 🎤 **Speaches** | [Speaches](https://github.com/speaches-ai/speaches) for STT/TTS |
 
-## Observability Stack (Optional)
-
-The project includes an optional observability stack with OpenTelemetry, Grafana, Prometheus, Tempo, and Loki.
-
-### Quick Start with Observability
+### Installation
 
 ```bash
-# Start with observability enabled
-docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d
+# Clone the repository
+git clone https://github.com/MaxwellDPS/general-disarray.git
+cd sip-agent
+
+# Configure environment
+cp sip-agent/.env.example sip-agent/.env
+nano sip-agent/.env
+
+# Start services
+docker compose up -d
 ```
 
-### Access Points
+### Verify Installation
 
-| Service | URL | Purpose |
-|---------|-----|---------|
-| Grafana | http://localhost:3000 | Dashboards & visualization |
-| Prometheus | http://localhost:9090 | Metrics queries |
-| Tempo | http://localhost:3200 | Trace queries |
-| Loki | http://localhost:3100 | Log queries |
-| nvitop-exporter | http://localhost:5050/metrics | GPU metrics |
-
-### Components
-
-```
-┌────────────────────────────────────────────────────────────────────────────┐
-│                          Observability Stack                                │
-├────────────────┬──────────────┬──────────────┬──────────────┬──────────────┤
-│                │              │              │              │              │
-│   SIP Agent    │    vLLM      │  Speaches    │    Redis     │  (Apps)      │
-│   (traces,     │   (traces,   │   (traces)   │   (metrics)  │              │
-│    metrics,    │    metrics)  │              │              │              │
-│    logs)       │              │              │              │              │
-│                │              │              │              │              │
-└───────┬────────┴──────┬───────┴──────┬───────┴──────┬───────┴──────────────┘
-        │               │              │              │
-        └───────────────┴──────────────┴──────────────┘
-                               │
-                               ▼
-                    ┌──────────────────────┐
-                    │  OpenTelemetry       │
-                    │  Collector           │
-                    │  (4317/4318)         │
-                    └──────────────────────┘
-                               │
-            ┌──────────────────┼──────────────────┐
-            ▼                  ▼                  ▼
-    ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
-    │  Prometheus  │   │    Tempo     │   │    Loki      │
-    │  (metrics)   │   │   (traces)   │   │   (logs)     │
-    └──────────────┘   └──────────────┘   └──────────────┘
-            │                  │                  │
-            └──────────────────┼──────────────────┘
-                               │
-                               ▼
-                    ┌──────────────────────┐
-                    │      Grafana         │
-                    │   (visualization)    │
-                    │     :3000            │
-                    └──────────────────────┘
+```bash
+curl http://localhost:8080/health | jq
 ```
 
-### Pre-built Dashboards
+**Expected output:**
 
-| Dashboard | Description |
-|-----------|-------------|
-| **SIP Agent Overview** | Call metrics, STT/TTS/LLM latency, queue depth, service map |
-| **Speaches Overview** | HTTP endpoint metrics, STT/TTS request rates, latency distribution, logs |
-| **GPU Overview (nvitop)** | GPU utilization, memory, temperature, power, fan speed, processes |
-
-> **Tip:** For the full nvitop dashboard with additional graphs, import Grafana dashboard ID `22589`
-
-### Instrumented Metrics
-
-**SIP Agent:**
-- `sip.calls.started` - Calls initiated (counter)
-- `sip.calls.ended` - Calls completed (counter)
-- `sip.calls.duration` - Call duration in ms (histogram)
-- `sip.tts.latency` - TTS synthesis time (histogram)
-- `sip.stt.latency` - STT transcription time (histogram)
-- `sip.llm.latency` - LLM inference time (histogram)
-- `sip.queue.depth` - Outbound call queue size (gauge)
-- `sip.queue.wait_time` - Time waiting in queue (histogram)
-
-**Speaches (via OpenTelemetry auto-instrumentation):**
-- `http_server_request_duration_seconds` - HTTP request latency (histogram)
-- `http_server_active_requests` - Currently active requests (gauge)
-- Per-endpoint metrics for `/v1/audio/transcriptions`, `/v1/audio/speech`, etc.
-
-**vLLM (native):**
-- Request latency, throughput
-- Token generation metrics
-- GPU memory utilization (via Prometheus scrape)
-
-**GPU (via nvitop-exporter):**
-- `nvitop_device_utilization_gpu_percent` - GPU compute utilization
-- `nvitop_device_utilization_memory_percent` - GPU memory utilization  
-- `nvitop_device_memory_used_bytes` / `_total_bytes` - Memory usage
-- `nvitop_device_temperature_gpu_celsius` - GPU temperature
-- `nvitop_device_power_usage_watts` - Power consumption
-- `nvitop_device_fan_speed_percent` - Fan speed
-- `nvitop_process_gpu_memory_bytes` - Per-process GPU memory usage
-
-### Trace Correlation
-
-Traces are automatically correlated across services:
-- HTTP requests between SIP Agent → vLLM/Speaches
-- Redis operations for queue management
-- Call lifecycle from start to hangup
-
-### Log Correlation
-
-JSON logs include trace context for correlation:
 ```json
 {
-  "ts": "2024-01-15T10:30:00",
-  "level": "INFO",
-  "trace_id": "abc123...",
-  "span_id": "def456...",
-  "msg": "Processing speech",
-  "event": "stt_started"
+  "status": "healthy",
+  "sip_registered": true,
+  "active_calls": 0
 }
 ```
 
-### Environment Variables
+### Make a Test Call
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `OTEL_ENABLED` | Enable OpenTelemetry | `false` |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector endpoint | `http://otel-collector:4317` |
-| `OTEL_SERVICE_NAME` | Service name for traces | `sip-agent` |
-| `OTEL_RESOURCE_ATTRIBUTES` | Additional attributes | `` |
-
-## Prerequisites
-
-- Docker & Docker Compose
-- NVIDIA GPU with CUDA support
-- SIP server (Asterisk, FreeSWITCH, etc.)
-- ~16GB+ VRAM recommended for default models
-
-## Quick Start
-
-1. **Clone and configure:**
-   ```bash
-   cp .env.example .env
-   # Edit .env with your settings
-   ```
-
-2. **Start services:**
-   ```bash
-   docker compose up -d
-   ```
-
-3. **View logs:**
-   ```bash
-   ./view-logs.py
-   ```
-
-4. **Call the SIP extension** configured in your `.env`
-
-## Docker Images
-
-Pre-built multi-architecture images are available:
-
-| Registry | Image |
-|----------|-------|
-| Docker Hub | `chaoscorp/sip-agent` |
-| GHCR | `ghcr.io/<owner>/sip-agent` |
-
-**Supported Platforms:**
-- `linux/amd64` (x86_64)
-- `linux/arm64` (ARM64, DGX Spark compatible)
-
-**Tags:**
-- `latest` - Latest stable release
-- `v1.0.0` - Specific version
-- `sha-abc1234` - Specific commit
-
-Pull example:
-```bash
-# Docker Hub
-docker pull chaoscorp/sip-agent:latest
-
-# GitHub Container Registry
-docker pull ghcr.io/<owner>/sip-agent:latest
+```
+┌────────────────────────────────────────────────────────────┐
+│ 📞 INCOMING CALL                                           │
+├────────────────────────────────────────────────────────────┤
+│ 🤖 "Hello! Welcome to the AI assistant. How can I help?"  │
+│ 👤 "What's the weather like?"                              │
+│ 🤖 "At Storm Lake, it's 44 degrees with foggy conditions."│
+│ 👤 "Set a timer for 5 minutes"                             │
+│ 🤖 "Timer set for 5 minutes!"                             │
+│ 👤 "Goodbye"                                               │
+│ 🤖 "Goodbye! Have a great day!"                           │
+└────────────────────────────────────────────────────────────┘
 ```
 
-## Configuration
+---
 
-### Environment Variables
+## ⚙️ Configuration
 
-Copy `.env.example` to `.env` and configure:
+Create a `.env` file with your settings:
 
-```bash
-# SIP Configuration
-SIP_USER=1000                    # SIP extension/username
-SIP_PASSWORD=secret              # SIP password
-SIP_DOMAIN=pbx.example.com       # SIP server domain
-SIP_REGISTRAR=pbx.example.com    # SIP registrar (optional)
-SIP_MAX_CALLS=8                  # Max simultaneous calls (inbound+outbound)
+```env
+# 📞 SIP Connection
+SIP_USER=ai-assistant
+SIP_PASSWORD=your-secure-password
+SIP_DOMAIN=pbx.example.com
 
-# LLM Configuration
-LLM_MODEL=Qwen/Qwen2.5-7B-Instruct  # HuggingFace model ID
-LLM_API_URL=http://vllm:8000/v1     # vLLM endpoint
+# 🎤 Speaches (STT + TTS)
+SPEACHES_API_URL=http://speaches:8001
 
-# Speech Configuration
-SPEACHES_URL=http://speaches:8001   # Speaches API endpoint
-WHISPER_MODEL=base                  # tiny, base, small, medium, large
-WHISPER_COMPUTE_TYPE=auto           # auto, int8, float16, float32
-TTS_MODEL=kokoro                    # TTS model
-TTS_VOICE=af_heart                  # Voice preset
+# 🧠 LLM Settings
+LLM_BASE_URL=http://vllm:8000/v1
+LLM_MODEL=openai-community/gpt2-xl
 
-# Audio Settings
-SAMPLE_RATE=16000                   # Audio sample rate
-
-# Call Queue (Redis)
-REDIS_URL=redis://redis:6379/0      # Redis connection
-CALL_QUEUE_MAX_CONCURRENT=1         # Concurrent outbound calls
-
-# Callback Settings
-CALLBACK_RING_TIMEOUT=30            # Seconds to wait for answer
-CALLBACK_RETRY_ATTEMPTS=2           # Retry failed callbacks
-CALLBACK_RETRY_DELAY=30             # Seconds between retries
-
-# Tempest Weather API (optional)
-TEMPEST_STATION_ID=12345            # Your Tempest station ID
-TEMPEST_API_TOKEN=your-token        # API token from tempestwx.com
+# 🌤️ Weather (Optional)
+TEMPEST_STATION_ID=12345
+TEMPEST_API_TOKEN=your-api-token
 ```
 
-### Call Concurrency
+📖 See [Configuration Reference](https://sip-agent.readme.io/docs/configuration) for all options.
 
-Two settings control call concurrency:
+---
 
-| Setting | Purpose | Default |
-|---------|---------|---------|
-| `SIP_MAX_CALLS` | PJSIP limit for total simultaneous calls | 8 |
-| `CALL_QUEUE_MAX_CONCURRENT` | Outbound call queue concurrency | 1 |
+## 🌐 API Examples
 
-With defaults, the system can:
-- Answer up to 8 incoming calls simultaneously
-- Make 1 outbound call at a time (queued)
-- Handle inbound calls while an outbound call is in progress
-
-To allow parallel outbound calls, increase `CALL_QUEUE_MAX_CONCURRENT`.
-
-### System Prompt
-
-Edit `config.py` to customize the assistant's personality and behavior:
-
-```python
-SYSTEM_PROMPT = """You are a helpful AI voice assistant...
-
-Available tools:
-- TIMER: [TOOL:TIMER:duration=SECONDS,message=TEXT]
-- CALLBACK: [TOOL:CALLBACK:delay=SECONDS,message=TEXT]
-- WEATHER: [TOOL:WEATHER]
-- HANGUP: [TOOL:HANGUP]
-"""
-```
-
-## Tools
-
-The assistant supports inline tool calls in responses:
-
-### Timer
-```
-User: "Set a timer for 5 minutes"
-Assistant: "I've set a timer for 5 minutes. [TOOL:TIMER:duration=300,message=Your 5 minute timer is done!]"
-```
-
-### Callback
-```
-User: "Call me back in 10 minutes to remind me about the meeting"
-Assistant: "I'll call you back in 10 minutes. [TOOL:CALLBACK:delay=600,message=This is your reminder about the meeting]"
-```
-
-### Weather
-```
-User: "What's the weather like?"
-Assistant: "Let me check. [TOOL:WEATHER] It's 72 degrees, 45% humidity, with wind from the northwest at 8 mph."
-```
-Requires `TEMPEST_STATION_ID` and `TEMPEST_API_TOKEN` to be configured. Get these from [tempestwx.com/settings/tokens](https://tempestwx.com/settings/tokens).
-
-### Hangup
-```
-User: "Goodbye"
-Assistant: "Goodbye! Have a great day. [TOOL:HANGUP]"
-```
-
-## Outbound Call API
-
-The assistant includes a REST API for initiating outbound notification calls with optional response collection.
-
-Full OpenAPI specification available in `openapi.yaml`.
-
-### Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/health` | Health check (includes queue status) |
-| GET | `/queue` | Queue status |
-| POST | `/call` | Initiate outbound call |
-| GET | `/call/{call_id}` | Check call status |
-
-### Call Queue
-
-Outbound calls are queued in Redis and processed sequentially to prevent overwhelming the SIP system. Configure concurrency with `CALL_QUEUE_MAX_CONCURRENT` (default: 1).
-
-```bash
-# Check queue status
-curl http://localhost:8080/queue
-```
-
-Response:
-```json
-{
-  "enabled": true,
-  "queued": 3,
-  "processing": 1,
-  "max_concurrent": 1
-}
-```
-
-### Basic Notification Call
-
-Send a message to an extension (no webhook needed for simple notifications):
+### 📞 Make an Outbound Call
 
 ```bash
 curl -X POST http://localhost:8080/call \
   -H "Content-Type: application/json" \
   -d '{
-    "message": "Hello, this is a reminder about your appointment tomorrow at 2pm.",
-    "extension": "1001",
-    "ring_timeout": 30
+    "extension": "5551234567",
+    "message": "Hello! This is a reminder about your appointment tomorrow."
   }'
 ```
 
 **Response:**
+
 ```json
 {
-  "call_id": "out-1234567890-1",
+  "call_id": "out-1732945860-1",
   "status": "queued",
-  "message": "Call queued at position 3",
-  "queue_position": 3
+  "message": "Call initiated"
 }
 ```
 
-### Call with Choice Collection
-
-Prompt the user for a response (webhook required to receive the choice):
+### 🌤️ Weather Call
 
 ```bash
-curl -X POST http://localhost:8080/call \
+curl -X POST http://localhost:8080/tools/WEATHER/call \
   -H "Content-Type: application/json" \
   -d '{
-    "message": "Hello, this is a reminder about your appointment tomorrow at 2pm.",
-    "extension": "1001",
-    "callback_url": "https://example.com/webhook",
-    "ring_timeout": 30,
-    "choice": {
-      "prompt": "Would you like to confirm or cancel? Say yes to confirm or no to cancel.",
-      "options": [
-        {"value": "confirmed", "synonyms": ["yes", "yeah", "yep", "confirm", "okay", "sure"]},
-        {"value": "cancelled", "synonyms": ["no", "nope", "cancel", "nevermind"]}
-      ],
-      "timeout_seconds": 15,
-      "repeat_count": 2
-    }
+    "extension": "5551234567",
+    "prefix": "Good morning! Here is your weather update."
   }'
 ```
 
-### Webhook Payload
+### ⏰ Schedule Daily Weather Briefing
 
-After the call completes, a POST request is sent to your `callback_url`:
+```bash
+curl -X POST http://localhost:8080/schedule \
+  -H "Content-Type: application/json" \
+  -d '{
+    "extension": "5551234567",
+    "tool": "WEATHER",
+    "at_time": "07:00",
+    "recurring": "daily",
+    "prefix": "Good morning!"
+  }'
+```
+
+**Response:**
 
 ```json
 {
-  "call_id": "out-1234567890-1",
-  "status": "completed",
-  "extension": "1001",
-  "duration_seconds": 45.2,
-  "message_played": true,
-  "choice_response": "confirmed",
-  "choice_raw_text": "yes I confirm",
-  "error": null
+  "schedule_id": "a1b2c3d4",
+  "status": "scheduled",
+  "scheduled_for": "2025-12-01T07:00:00-08:00",
+  "recurring": "daily"
 }
 ```
 
-**Status Values:**
-- `completed` - Call answered, message played
-- `no_answer` - Call not answered within ring timeout
-- `failed` - Call failed to connect
-- `busy` - Extension was busy
-
-### Request Parameters
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `message` | string | Yes | Message to speak to recipient |
-| `extension` | string | Yes | SIP extension or full URI |
-| `callback_url` | string | If choice | Webhook URL for results (required when using choice) |
-| `ring_timeout` | int | No | Seconds to wait for answer (default: 30) |
-| `call_id` | string | No | Custom call ID for tracking |
-| `choice` | object | No | Choice prompt configuration |
-
-### Choice Configuration
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `prompt` | string | Yes | Question to ask the user |
-| `options` | array | Yes | List of valid choices |
-| `timeout_seconds` | int | No | Wait time for response (default: 30) |
-| `repeat_count` | int | No | Times to repeat if no response (default: 2) |
-
-### Choice Option
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `value` | string | Yes | Value returned in webhook |
-| `synonyms` | array | No | Alternative phrases that map to this choice |
-
-## Log Viewer
-
-The included `view-logs.py` script provides filtered, formatted log output:
+### 🔧 List Available Tools
 
 ```bash
-# View interesting events only (default)
-./view-logs.py
-
-# View all logs
-./view-logs.py -a
-
-# Tail specific service
-./view-logs.py sip-agent
+curl http://localhost:8080/tools | jq '.[].name'
 ```
 
-**Event Types:**
-
-| Icon | Event | Description |
-|------|-------|-------------|
-| 🔥 | `warming_up` | Service starting |
-| ✅ | `ready` | Service ready |
-| 🌐 | `api_started` | API server started |
-| 📞 | `call_start` | Incoming/outgoing call |
-| 📴 | `call_end` | Call ended |
-| 📤 | `outbound_call_initiated` | Outbound call queued |
-| 📞 | `outbound_call_answered` | Outbound call answered |
-| 🔊 | `outbound_call_message_played` | Message played |
-| ✅ | `outbound_call_choice_collected` | User choice collected |
-| 🔗 | `outbound_call_webhook` | Webhook sent |
-| 🎤 | `user_speech` | User transcription |
-| 🤖 | `assistant_response` | LLM response |
-| 💬 | `assistant_ack` | Acknowledgment ("Okay", "Got it") |
-| 🔧 | `tool_call` | Tool invoked |
-| 📋 | `task_scheduled` | Timer/callback scheduled |
-| ⏰ | `timer_set` | Timer created |
-| 🔔 | `timer_fired` | Timer completed |
-| 📲 | `callback_scheduled` | Callback scheduled |
-| 🌤️ | `weather_fetch` | Weather data retrieved |
-| ⚡ | `task_execute` | Task executing |
-| ✋ | `barge_in` | User interrupted |
-
-**Sample Output:**
-```
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  ⟵ CALL #1: sip:420@10.42.252.54
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-00:15:23     🎤 User: Set a timer for 30 seconds
-00:15:24     💬 Assistant: Okay
-00:15:25       🔧 Tool called: TIMER (params=delay=30, message=...)
-00:15:25       📋 Task scheduled: timer in 30s
-00:15:26     🤖 Assistant: I've set a timer for 30 seconds
-00:15:55       🔔 Timer fired: Your timer is done
-
-──────────────────────────────────────────────────────────────────────
-  ✗ CALL ENDED
-──────────────────────────────────────────────────────────────────────
-```
-
-## Project Structure
+**Output:**
 
 ```
-sip-agent-speaches/
-├── .github/
-│   └── workflows/
-│       └── docker-build.yml  # CI/CD for multi-arch builds
-├── docker-compose.yml    # Service definitions
-├── Dockerfile            # SIP agent container
-├── .env.example          # Configuration template
-├── requirements.txt      # Python dependencies
-├── main.py               # Main orchestrator
-├── api.py                # REST API for outbound calls
-├── call_queue.py         # Redis-backed call queue
-├── openapi.yaml          # OpenAPI 3.0 specification
-├── sip_handler.py        # PJSIP call handling
-├── audio_pipeline.py     # STT/TTS via Speaches API
-├── llm_engine.py         # LLM client (vLLM/OpenAI API)
-├── tool_manager.py       # Timer, callback, tool framework
-├── config.py             # Configuration and system prompt
-├── view-logs.py          # Log viewer script
-└── README.md             # This file
+"WEATHER"
+"SET_TIMER"
+"CALLBACK"
+"HANGUP"
+"STATUS"
+"CANCEL"
+"DATETIME"
+"CALC"
+"JOKE"
 ```
 
-## Troubleshooting
+---
 
-### "Requested float16 compute type, but device does not support"
-Set `WHISPER_COMPUTE_TYPE=auto` in `.env` to auto-detect the best compute type.
+## 🔧 Built-in Tools
 
-### Call connects but no audio
-- Check SIP server NAT settings
-- Verify RTP ports are open (10000-10100)
-- Check `SIP_DOMAIN` matches your server
+| Tool | Description | Example Phrase |
+|------|-------------|----------------|
+| 🌤️ `WEATHER` | Current weather conditions | *"What's the weather?"* |
+| ⏲️ `SET_TIMER` | Set a countdown timer | *"Set a timer for 5 minutes"* |
+| 📞 `CALLBACK` | Schedule a callback | *"Call me back in an hour"* |
+| 📴 `HANGUP` | End the call | *"Goodbye"* |
+| 📋 `STATUS` | Check pending timers | *"What timers do I have?"* |
+| ❌ `CANCEL` | Cancel timers/callbacks | *"Cancel my timer"* |
+| 🕐 `DATETIME` | Current date and time | *"What time is it?"* |
+| 🧮 `CALC` | Math calculations | *"What's 25 times 4?"* |
+| 😄 `JOKE` | Tell a joke | *"Tell me a joke"* |
 
-### Slow response times
-- Use a smaller Whisper model (`tiny` or `base`)
-- Ensure GPU is being utilized (check `nvidia-smi`)
-- Pre-cache common phrases (enabled by default)
+---
 
-### PJSIP assertion errors on shutdown
-These are cosmetic and don't affect operation. The cleanup sequence handles them gracefully.
+## 🔌 Creating Plugins
 
-### Tool calls not working
-Ensure the LLM response contains the exact format:
+Add custom tools by creating Python plugins:
+
+```python
+# src/plugins/hello_tool.py
+from tool_plugins import BaseTool, ToolResult, ToolStatus
+
+class HelloTool(BaseTool):
+    name = "HELLO"
+    description = "Say hello to someone"
+    
+    parameters = {
+        "name": {
+            "type": "string",
+            "description": "Name to greet",
+            "required": True
+        }
+    }
+    
+    async def execute(self, params):
+        name = params.get("name", "friend")
+        return ToolResult(
+            status=ToolStatus.SUCCESS,
+            message=f"Hello, {name}! Nice to meet you."
+        )
 ```
-[TOOL:TOOLNAME:param1=value1,param2=value2]
+
+Register in `tool_manager.py`:
+
+```python
+from plugins.hello_tool import HelloTool
+
+tool_classes = [
+    # ... existing tools ...
+    HelloTool,
+]
 ```
 
-## Hardware Requirements
+📖 See [Creating Plugins](https://sip-agent.readme.io/docs/plugins) for the full guide.
 
-| Component | Minimum | Recommended |
-|-----------|---------|-------------|
-| GPU VRAM | 8GB | 16GB+ |
-| System RAM | 16GB | 32GB |
-| CPU | 4 cores | 8+ cores |
+---
 
-**Tested Configurations:**
-- NVIDIA RTX 4090 (24GB) - All models
-- NVIDIA DGX Spark GB10 - With ARM64 compatibility fixes
-- NVIDIA RTX 3080 (10GB) - Smaller models
+## 📊 Monitoring
 
-## Extending
-
-### Adding New Tools
-
-1. Create a tool class in `tool_manager.py`:
-   ```python
-   class WeatherTool(BaseTool):
-       name = "WEATHER"
-       description = "Get current weather"
-       
-       async def execute(self, params: Dict[str, Any]) -> ToolResult:
-           location = params.get('location', 'default')
-           # Implement weather lookup
-           return ToolResult(
-               status=ToolStatus.SUCCESS,
-               message=f"The weather in {location} is sunny"
-           )
-   ```
-
-2. Register in `ToolManager.start()`:
-   ```python
-   self.register_tool(WeatherTool(self.assistant))
-   ```
-
-3. Update system prompt in `config.py`:
-   ```
-   - WEATHER: [TOOL:WEATHER:location=CITY]
-   ```
-
-## CI/CD
-
-GitHub Actions automatically builds and pushes multi-architecture Docker images on:
-- Push to `main`/`master` branch
-- Version tags (`v*`)
-- Pull requests (build only, no push)
-
-### Required Secrets
-
-To enable Docker Hub pushes, add these secrets to your GitHub repository:
-
-| Secret | Description |
-|--------|-------------|
-| `DOCKERHUB_USERNAME` | Docker Hub username |
-| `DOCKERHUB_TOKEN` | Docker Hub access token |
-
-GHCR authentication uses the built-in `GITHUB_TOKEN`.
-
-### Manual Build
-
-Build locally for a specific platform:
+### View Logs
 
 ```bash
-# x86_64
-docker build -t sip-agent:local .
+# Docker logs
+docker logs -f sip-agent
 
-# ARM64 (requires buildx)
-docker buildx build --platform linux/arm64 -t sip-agent:local-arm64 .
+# Formatted log viewer
+python tools/view-logs.py -f
 ```
 
-## License
+**Example output:**
 
-MIT License - See LICENSE file for details.
+```
+┌──────────────────────────────────────────────────────────────
+│ 📞 CALL #1 - From: 1001
+└──────────────────────────────────────────────────────────────
+15:30:05  📞 Call started
+15:30:06  👤 "What's the weather?"
+15:30:07  🔧 [TOOL:WEATHER]
+15:30:08  🤖 "At Storm Lake, it's 44 degrees..."
+15:30:12  👤 "Thanks, goodbye"
+15:30:13  📴 Call ended (duration: 0:08)
+```
 
-## Acknowledgments
+### Grafana Dashboard
 
-- [PJSIP](https://www.pjsip.org/) - SIP stack
-- [Speaches](https://github.com/speaches-ai/speaches) - STT/TTS API
-- [vLLM](https://github.com/vllm-project/vllm) - LLM inference
-- [Whisper](https://github.com/openai/whisper) - Speech recognition
-- [Kokoro](https://huggingface.co/hexgrad/Kokoro-82M) - Text-to-speech
+Import the included dashboard:
+
+```bash
+grafana/dashboards/sip-agent.json
+```
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 📊 SIP Agent Dashboard                                      │
+├─────────────────────────────────────────────────────────────┤
+│ 📞 Active Calls: 1        │ 📈 Total Today: 47             │
+│ ⏱️ Avg Duration: 2m 34s   │ 🔧 Tool Calls: 23              │
+│ 🎤 STT p95: 245ms         │ 🧠 LLM p95: 890ms              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 🗂️ Project Structure
+
+```
+sip-agent/
+├── 📂 sip-agent/
+│   ├── 📂 src/
+│   │   ├── 📄 main.py              # Application entry
+│   │   ├── 📄 config.py            # Configuration
+│   │   ├── 📄 api.py               # REST API
+│   │   ├── 📄 sip_client.py        # SIP handling
+│   │   ├── 📄 audio_pipeline.py    # STT/TTS
+│   │   ├── 📄 llm_engine.py        # LLM integration
+│   │   ├── 📄 tool_manager.py      # Tool execution
+│   │   └── 📂 plugins/             # Tool plugins
+│   ├── 📄 Dockerfile
+│   ├── 📄 .env.example
+│   └── 📄 requirements.txt
+├── 📂 tools/
+│   └── 📄 view-logs.py             # Log viewer
+├── 📂 grafana/
+│   └── 📂 dashboards/              # Grafana dashboards
+├── 📂 docs/                        # Documentation
+├── 📄 docker-compose.yml
+└── 📄 README.md                    # 👈 You are here
+```
+
+---
+
+## 🖥️ Runs on NVIDIA DGX Spark
+
+This project is optimized to run on the [NVIDIA DGX Spark](https://www.nvidia.com/en-us/products/workstations/dgx-spark/) with Grace Blackwell architecture.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 🟢 NVIDIA DGX Spark                                         │
+├─────────────────────────────────────────────────────────────┤
+│ 🧠 Grace Blackwell GB10 Superchip                          │
+│ 💾 128GB Unified Memory                                     │
+│ ⚡ 1 PFLOP AI Performance                                   │
+├─────────────────────────────────────────────────────────────┤
+│ ✅ Local LLM inference (vLLM, Ollama)                      │
+│ ✅ Local STT/TTS (Speaches + Whisper + Kokoro)             │
+│ ✅ Real-time voice processing                               │
+│ ✅ Multiple concurrent calls                                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Recommended DGX Spark setup:**
+
+```env
+# Run everything locally on DGX Spark
+LLM_BASE_URL=http://localhost:8000/v1
+LLM_MODEL=openai-community/gpt2-xl
+SPEACHES_API_URL=http://localhost:8001
+```
+
+---
+
+## 🐳 Docker Compose
+
+```yaml
+services:
+  sip-agent:
+    build: ./sip-agent
+    network_mode: host  # Required for SIP/RTP
+    environment:
+      - SIP_USER=${SIP_USER}
+      - SIP_PASSWORD=${SIP_PASSWORD}
+      - SIP_DOMAIN=${SIP_DOMAIN}
+      - SPEACHES_API_URL=${SPEACHES_API_URL}
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - LLM_MODEL=${LLM_MODEL}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    depends_on:
+      - speaches
+
+  speaches:
+    image: ghcr.io/speaches-ai/speaches:latest
+    ports:
+      - "8001:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+```
+
+---
+
+## 📖 Documentation
+
+**📚 Full documentation available at [sip-agent.readme.io](https://sip-agent.readme.io)**
+
+| Document | Description |
+|----------|-------------|
+| [📖 Overview](https://sip-agent.readme.io/docs/overview) | Architecture and features |
+| [🚀 Getting Started](https://sip-agent.readme.io/docs/getting-started) | Installation guide |
+| [⚙️ Configuration](https://sip-agent.readme.io/docs/configuration) | Environment variables |
+| [🌐 API Reference](https://sip-agent.readme.io/docs/api-reference) | REST API endpoints |
+| [🔧 Built-in Tools](https://sip-agent.readme.io/docs/tools) | Available tools |
+| [🔌 Creating Plugins](https://sip-agent.readme.io/docs/plugins) | Custom tool development |
+| [📖 Examples](https://sip-agent.readme.io/docs/examples) | Integration patterns |
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome! Please read our contributing guidelines first.
+
+```bash
+# Fork and clone
+git clone https://github.com/your-username/sip-agent.git
+
+# Create branch
+git checkout -b feature/amazing-feature
+
+# Make changes and test
+docker compose up -d
+python -m pytest
+
+# Commit with emoji
+git commit -m "✨ feat: add amazing feature"
+
+# Push and PR
+git push origin feature/amazing-feature
+```
+
+**Commit prefixes:**
+
+| Prefix | Use |
+|--------|-----|
+| `✨ feat:` | New feature |
+| `🐛 fix:` | Bug fix |
+| `📚 docs:` | Documentation |
+| `🔧 chore:` | Maintenance |
+| `🎨 style:` | Formatting |
+| `♻️ refactor:` | Refactoring |
+
+---
+
+## 📜 License
+
+This project is licensed under the GNU Affero General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
+
+```
+SPDX-License-Identifier: AGPL-3.0-or-later
+```
+
+---
+
+## 🙏 Acknowledgments
+
+- [NVIDIA DGX Spark](https://www.nvidia.com/en-us/products/workstations/dgx-spark/) — AI supercomputer platform
+- [Speaches](https://github.com/speaches-ai/speaches) — Unified STT/TTS server
+- [PJSIP](https://www.pjsip.org/) — SIP stack
+- [FastAPI](https://fastapi.tiangolo.com/) — REST API framework
+- [WeatherFlow Tempest](https://tempestwx.com/) — Weather data
+
+---
+
+## 📞 Support
+
+| Resource | Link |
+|----------|------|
+| 📖 Docs | **[sip-agent.readme.io](https://sip-agent.readme.io)** |
+| 🐛 Issues | [GitHub Issues](https://github.com/MaxwellDPS/general-disarray/issues) |
+
+---
+
+<p align="center">
+  Made with ❤️ and 🤖
+</p>
