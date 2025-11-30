@@ -1,4 +1,4 @@
-name: Build and Push SIP agent Image
+name: sip-agent
 
 on:
   push:

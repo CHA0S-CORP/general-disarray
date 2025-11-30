@@ -1,4 +1,4 @@
-name: Build and Push nvitop exporter Image
+name: nvitop-exporter
 
 on:
   push:

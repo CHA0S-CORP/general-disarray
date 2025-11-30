@@ -5,10 +5,13 @@
 A voice-powered AI assistant that answers phone calls, understands natural language, and performs actions like checking weather, setting timers, scheduling callbacks, and more.
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![Version](https://img.shields.io/badge/Version-0.1.0-green.svg)](RELEASE.md)
 [![Docker](https://img.shields.io/badge/Docker-Ready-blue.svg)](https://www.docker.com/)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11+-green.svg)](https://www.python.org/)
 [![Runs on DGX Spark](https://img.shields.io/badge/Runs%20on-DGX%20Spark-76B900?logo=nvidia&logoColor=white)](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)
 [![Docs](https://img.shields.io/badge/Docs-readme.io-blue)](https://sip-agent.readme.io)
+[![Build Status](https://github.com/MaxwellDPS/general-disarray/actions/workflows/docker-build.yml/badge.svg)](https://github.com/your-org/sip-agent/actions/workflows/docker-build.yml)
+[![Build Status](https://github.com/MaxwellDPS/general-disarray/actions/workflows/docker-build-nvitop_exporter.yml/badge.svg)](https://github.com/your-org/sip-agent/actions/workflows/docker-build.yml)
 
 📖 **[Read the Documentation](https://sip-agent.readme.io)**
 
@@ -348,26 +351,76 @@ grafana/dashboards/sip-agent.json
 
 ```
 sip-agent/
-├── 📂 sip-agent/
-│   ├── 📂 src/
-│   │   ├── 📄 main.py              # Application entry
-│   │   ├── 📄 config.py            # Configuration
-│   │   ├── 📄 api.py               # REST API
-│   │   ├── 📄 sip_client.py        # SIP handling
-│   │   ├── 📄 audio_pipeline.py    # STT/TTS
-│   │   ├── 📄 llm_engine.py        # LLM integration
-│   │   ├── 📄 tool_manager.py      # Tool execution
-│   │   └── 📂 plugins/             # Tool plugins
+├── 📄 README.md                    # 👈 You are here
+├── 📄 RELEASE.md                   # Release notes
+├── 📄 CHANGELOG.md                 # Version history
+├── 📄 docker-compose.yml           # Main compose file
+├── 📄 docker-compose.observability.yml
+├── 📄 openapi.yaml                 # API specification
+│
+├── 📂 sip-agent/                   # Core application
 │   ├── 📄 Dockerfile
+│   ├── 📄 requirements.txt
 │   ├── 📄 .env.example
-│   └── 📄 requirements.txt
-├── 📂 tools/
-│   └── 📄 view-logs.py             # Log viewer
-├── 📂 grafana/
-│   └── 📂 dashboards/              # Grafana dashboards
+│   ├── 📂 data/
+│   │   └── 📄 phrases.json.example
+│   └── 📂 src/
+│       ├── 📄 main.py              # Application entry
+│       ├── 📄 config.py            # Configuration
+│       ├── 📄 api.py               # REST API
+│       ├── 📄 sip_handler.py       # SIP call handling
+│       ├── 📄 audio_pipeline.py    # STT/TTS processing
+│       ├── 📄 llm_engine.py        # LLM integration
+│       ├── 📄 tool_manager.py      # Tool orchestration
+│       ├── 📄 tool_plugins.py      # Plugin base classes
+│       ├── 📄 call_queue.py        # Redis call queue
+│       ├── 📄 realtime_client.py   # WebSocket STT
+│       ├── 📄 telemetry.py         # OpenTelemetry
+│       ├── 📄 logging_utils.py     # Structured logging
+│       ├── 📄 retry_utils.py       # API retry logic
+│       └── 📂 plugins/             # Built-in tools
+│           ├── 📄 weather_tool.py
+│           ├── 📄 timer_tool.py
+│           ├── 📄 callback_tool.py
+│           ├── 📄 hangup_tool.py
+│           ├── 📄 status_tool.py
+│           ├── 📄 cancel_tool.py
+│           ├── 📄 datetime_tool.py
+│           ├── 📄 calc_tool.py
+│           ├── 📄 joke_tool.py
+│           └── 📄 simon_says_tool.py
+│
 ├── 📂 docs/                        # Documentation
-├── 📄 docker-compose.yml
-└── 📄 README.md                    # 👈 You are here
+│   ├── 📄 index.md                 # Overview
+│   ├── 📄 getting-started.md       # Installation
+│   ├── 📄 configuration.md         # Config reference
+│   ├── 📄 api-reference.md         # REST API
+│   ├── 📄 tools.md                 # Built-in tools
+│   ├── 📄 plugins.md               # Plugin development
+│   ├── 📄 examples.md              # Integration examples
+│   └── 📂 screenshots/
+│
+├── 📂 observability/               # Monitoring stack
+│   ├── 📂 grafana/
+│   │   └── 📂 provisioning/
+│   │       ├── 📂 dashboards/      # Pre-built dashboards
+│   │       └── 📂 datasources/
+│   ├── 📂 prometheus/
+│   │   └── 📄 prometheus.yaml
+│   ├── 📂 loki/
+│   │   └── 📄 loki.yaml
+│   ├── 📂 tempo/
+│   │   └── 📄 tempo.yaml
+│   └── 📂 otel-collector/
+│       └── 📄 config.yaml
+│
+├── 📂 tools/                       # Utilities
+│   └── 📄 view-logs.py             # Log viewer
+│
+└── 📂 .github/
+    └── 📂 workflows/
+        ├── 📄 docker-build.yml     # Docker CI
+        └── 📄 readme-sync.yml      # Docs sync
 ```
 
 ---
