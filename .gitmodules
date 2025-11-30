@@ -1,3 +1,6 @@
 [submodule "docs"]
 	path = docs
 	url = https://github.com/MaxwellDPS/docs.git
+[submodule "nvitop"]
+	path = nvitop
+	url = https://github.com/MaxwellDPS/nvitop
