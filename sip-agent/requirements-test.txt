@@ -1,0 +1,22 @@
+# Test dependencies for the SIP agent test suite.
+# Install on top of the runtime deps:  pip install -r requirements.txt -r requirements-test.txt
+#
+# Tier 1 (unit + component) runs anywhere with these installed (no GPU, no docker).
+# Tier 2 (e2e) additionally needs Docker + the docker-compose stack (DGX).
+
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+
+# In-process mock Speaches/vLLM servers run as ASGI apps under uvicorn.
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+
+# HTTP client used by tests (and by FastAPI's TestClient via starlette).
+httpx>=0.25.0
+
+# In-memory Redis for the call-queue component tests.
+fakeredis>=2.21.0
+
+# Audio fixture generation / assertion helpers (WAV read, resample, RMS).
+numpy>=1.24.0
+soundfile>=0.12.0

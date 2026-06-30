@@ -1,0 +1,28 @@
+# Scriptable SIP softphone for e2e tests: the PJSIP `pjsua` sample CLI, which can
+# place/answer a call and play/record a WAV non-interactively. Built from source
+# (Debian has no reliable pjsua package) and pinned for reproducibility.
+FROM debian:bookworm-slim AS build
+
+ARG PJSIP_VERSION=2.14.1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential curl ca-certificates \
+        libasound2-dev libssl-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL "https://github.com/pjsip/pjproject/archive/refs/tags/${PJSIP_VERSION}.tar.gz" \
+        -o /tmp/pj.tgz \
+    && mkdir -p /src && tar -xzf /tmp/pj.tgz -C /src --strip-components=1
+
+WORKDIR /src
+# Disable video; we only need audio + signaling for the test client.
+RUN ./configure --disable-video --disable-libwebrtc \
+    && make dep && make \
+    && cp pjsip-apps/bin/pjsua-* /usr/local/bin/pjsua
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libasound2 libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /usr/local/bin/pjsua /usr/local/bin/pjsua
+# Default to null audio so it never touches a (non-existent) sound card.
+ENTRYPOINT ["pjsua", "--null-audio", "--no-tcp"]
