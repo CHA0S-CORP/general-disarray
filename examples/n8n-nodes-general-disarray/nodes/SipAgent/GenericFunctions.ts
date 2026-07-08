@@ -41,6 +41,20 @@ export async function sipAgentApiRequest(
 			json: true,
 		})) as IDataObject;
 	} catch (error) {
-		throw new NodeApiError(this.getNode(), error as JsonObject);
+		// Surface the agent's FastAPI error detail as the headline message instead
+		// of n8n's generic HTTP-status text (e.g. "No active call to speak to"
+		// rather than "The resource you are requesting could not be found").
+		const detail = (error as { response?: { data?: { detail?: unknown } } }).response?.data
+			?.detail;
+		let message: string | undefined;
+		if (typeof detail === 'string' && detail) {
+			message = detail;
+		} else if (Array.isArray(detail)) {
+			// FastAPI 422 validation errors: [{loc, msg, type}, ...]
+			message = detail
+				.map((d) => (d && typeof d === 'object' && 'msg' in d ? String(d.msg) : JSON.stringify(d)))
+				.join('; ');
+		}
+		throw new NodeApiError(this.getNode(), error as JsonObject, message ? { message } : undefined);
 	}
 }
