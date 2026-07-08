@@ -5,7 +5,7 @@ Custom [n8n](https://n8n.io) nodes for the **General Disarray** SIP AI phone ass
 The package ships two nodes plus one credential type:
 
 - **SIP Agent** (action node) — drives the agent's REST API on `:8080`: make outbound calls, check call status, fetch transcripts, speak into the active call, run tools, schedule calls, and probe system health/queue state.
-- **SIP Agent Trigger** — a webhook trigger that receives the agent's **choice-callback** POSTs (the JSON the agent sends to your `callback_url` when a call with a choice prompt completes), with optional HMAC-SHA256 signature verification.
+- **SIP Agent Trigger** — a webhook trigger that receives the agent's **call-lifecycle events** (`call.started` / `call.ended`, see below) and **choice-callback** POSTs (the JSON the agent sends to your `callback_url` when a call with a choice prompt completes), with an event filter and optional HMAC-SHA256 signature verification.
 - **SIP Agent API** credential — base URL, optional API token, and the webhook signing secret.
 
 ## Build
@@ -100,6 +100,46 @@ This is the flagship flow: call someone, ask them a question, branch a workflow 
    `choice_response` is the matched option value (absent if nothing matched); branch on it with an IF node.
 
 An importable example workflow (Trigger → IF on `{{$json.choice_response}}` → Confirmed / Declined) is in [`examples/choice-callback-workflow.json`](examples/choice-callback-workflow.json) — in n8n use *Import from File*.
+
+## Call lifecycle events (trigger on any call)
+
+The agent can push signed `call.started` / `call.ended` events for **every** call — inbound or outbound, no per-call `callback_url` needed — so a workflow can trigger whenever the assistant is on a call.
+
+> **⚠️ Same SSRF caveat as above:** the n8n trigger URL is a private address, so `WEBHOOK_ALLOW_PRIVATE=true` must be set in `.env`.
+
+1. **Add a SIP Agent Trigger** node, pick the events you want under **Events** (*Call Started*, *Call Ended*, and/or *Choice Result / Call Outcome*), activate the workflow, and copy its production URL.
+2. In `.env`, set:
+
+   ```bash
+   CALL_EVENT_WEBHOOK_URL=http://n8n:5678/webhook/<uuid>/webhook
+   CALL_EVENTS=call.started,call.ended        # or a subset
+   CALL_EVENT_INCLUDE_TRANSCRIPT=true         # embed the transcript in call.ended
+   WEBHOOK_ALLOW_PRIVATE=true
+   ```
+
+   then recreate the agent: `docker compose -f docker-compose.dgx.yml up -d sip-agent`.
+3. The agent now POSTs to the trigger on every call:
+
+   ```json
+   {
+     "event": "call.started",
+     "call_id": "in-1751970000-3",
+     "sip_call_id": "4",
+     "direction": "inbound",
+     "remote_uri": "sip:1001@pbx",
+     "started_at": "2026-07-08T17:00:00+00:00",
+     "timestamp": "2026-07-08T17:00:00+00:00"
+   }
+   ```
+
+   `call.ended` adds `duration_seconds` and (unless `CALL_EVENT_INCLUDE_TRANSCRIPT=false`) the full `transcript` record — `{call_id, direction, remote_uri, started_at, ended_at, turns: [{role, content, ts}]}` — so an "after every call" workflow can summarize, archive, or alert on the conversation without an extra API round-trip.
+
+Notes:
+
+- The event feed is signed with `WEBHOOK_SIGNING_SECRET` exactly like the choice callbacks, so HMAC verification (next section) applies unchanged.
+- Legacy choice/outcome callbacks carry **no `event` field**; the trigger classifies them as *Choice Result / Call Outcome*. Existing workflows keep working (the Events default selects everything).
+- Deliveries for deselected events are acknowledged with 200 (no retries on the agent side) but start no execution.
+- One agent URL feeds one trigger; to handle multiple event types differently in a single workflow, select several events and branch on `{{$json.event}}` with a Switch node.
 
 ## Verifying webhook signatures (HMAC)
 
