@@ -198,8 +198,13 @@ services:
       - N8N_PROTOCOL=http
       - WEBHOOK_URL=http://n8n:5678/
       - GENERIC_TIMEZONE=America/Los_Angeles
+      # Allow login over plain HTTP (LAN-only deployment, no TLS on :5678)
+      - N8N_SECURE_COOKIE=false
+      - N8N_CUSTOM_EXTENSIONS=/custom-nodes
     volumes:
       - n8n_data:/home/node/.n8n
+      # Custom SIP Agent nodes — built by examples/n8n-nodes-general-disarray/build.sh
+      - ./examples/n8n-nodes-general-disarray/dist:/custom-nodes/n8n-nodes-general-disarray:ro
 
 volumes:
   n8n_data:
