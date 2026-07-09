@@ -140,6 +140,14 @@ export const toolProperties: INodeProperties[] = [
 				default: '',
 				description: 'Custom call ID (letters, digits, ".", "_", "-"; max 64 chars)',
 			},
+			{
+				displayName: 'Reformat for Speech',
+				name: 'reformatForSpeech',
+				type: 'boolean',
+				default: false,
+				description:
+					'Whether the agent\'s LLM rewrites the composed message into natural spoken form without dropping any information',
+			},
 		],
 	},
 ];
@@ -196,6 +204,7 @@ export async function executeTool(
 			...(additionalFields.prefix ? { prefix: additionalFields.prefix } : {}),
 			...(additionalFields.suffix ? { suffix: additionalFields.suffix } : {}),
 			...(additionalFields.callId ? { call_id: additionalFields.callId } : {}),
+			...(additionalFields.reformatForSpeech ? { reformat_for_speech: true } : {}),
 			...(callbackUrl ? { callback_url: callbackUrl } : {}),
 			...(choice ? { choice } : {}),
 		};

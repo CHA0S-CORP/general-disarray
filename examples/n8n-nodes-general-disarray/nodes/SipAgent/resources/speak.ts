@@ -38,6 +38,15 @@ export const speakProperties: INodeProperties[] = [
 			'Optional call ID; when set it must match the currently active call, otherwise the request is rejected',
 		displayOptions: { show: { resource: ['speak'], operation: ['say'] } },
 	},
+	{
+		displayName: 'Reformat for Speech',
+		name: 'reformatForSpeech',
+		type: 'boolean',
+		default: false,
+		description:
+			'Whether the agent\'s LLM rewrites the message into natural spoken form without dropping any information',
+		displayOptions: { show: { resource: ['speak'], operation: ['say'] } },
+	},
 ];
 
 export async function executeSpeak(
@@ -48,11 +57,13 @@ export async function executeSpeak(
 	if (operation === 'say') {
 		const message = ctx.getNodeParameter('message', i) as string;
 		const callId = ctx.getNodeParameter('callId', i, '') as string;
+		const reformat = ctx.getNodeParameter('reformatForSpeech', i, false) as boolean;
 
 		// POST /speak takes query parameters only — no JSON body.
 		return sipAgentApiRequest.call(ctx, 'POST', '/speak', undefined, {
 			message,
 			...(callId && { call_id: callId }),
+			...(reformat && { reformat_for_speech: 'true' }),
 		});
 	}
 

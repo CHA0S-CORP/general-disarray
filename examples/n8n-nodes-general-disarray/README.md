@@ -69,6 +69,10 @@ In n8n, create a **SIP Agent API** credential:
 | System | Health | `GET /health` | Optional *Deep* toggle adds `?deep=true` (probes vLLM/Speaches/Redis). |
 | System | Get Queue | `GET /queue` | Outbound call queue status. |
 
+## Reformat for Speech
+
+Call:Make, Tool:Execute and Call, Schedule:Create, and Speak:Say expose a **Reformat for Speech** toggle (`reformat_for_speech` in the API). When on, the agent's own LLM rewrites the message into natural spoken form before it is voiced — `ALERT: svc-api p99=340ms @ 2026-07-08T17:03Z` becomes something like "Alert: the API service's ninety-ninth percentile latency is three hundred forty milliseconds, as of July eighth at five oh three PM" — preserving every fact (numbers, IDs, dates, statuses) rather than stripping them. Adds roughly one to two seconds of latency (one local LLM round-trip) before dialing; for schedules the rewrite happens at call time so tool-generated content is covered. Fail-open: on any LLM failure or timeout the original text is spoken unchanged.
+
 ## Choice prompt + callback walkthrough
 
 This is the flagship flow: call someone, ask them a question, branch a workflow on their answer.

@@ -186,6 +186,14 @@ export const scheduleProperties: INodeProperties[] = [
 				description: 'URL the agent POSTs the call result to',
 			},
 			{
+				displayName: 'Reformat for Speech',
+				name: 'reformatForSpeech',
+				type: 'boolean',
+				default: false,
+				description:
+					'Whether the agent\'s LLM rewrites the composed message into natural spoken form at call time without dropping any information',
+			},
+			{
 				displayName: 'Recurring',
 				name: 'recurring',
 				type: 'options',
@@ -276,6 +284,9 @@ export async function executeSchedule(
 		}
 		if (additionalFields.callbackUrl) {
 			body.callback_url = additionalFields.callbackUrl;
+		}
+		if (additionalFields.reformatForSpeech) {
+			body.reformat_for_speech = true;
 		}
 		const recurring = (additionalFields.recurring as string) || '';
 		if (recurring === 'cron') {

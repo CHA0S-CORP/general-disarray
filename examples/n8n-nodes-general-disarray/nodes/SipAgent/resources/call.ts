@@ -74,6 +74,14 @@ export const callProperties: INodeProperties[] = [
 		displayOptions: { show: { resource: ['call'], operation: ['make'] } },
 		options: [
 			{
+				displayName: 'Reformat for Speech',
+				name: 'reformatForSpeech',
+				type: 'boolean',
+				default: false,
+				description:
+					'Whether the agent\'s LLM rewrites the message into natural spoken form (dates, numbers, URLs, IDs said aloud) without dropping any information. Adds a moment of latency; falls back to the original text on failure.',
+			},
+			{
 				displayName: 'Ring Timeout (Seconds)',
 				name: 'ringTimeout',
 				type: 'number',
@@ -149,6 +157,9 @@ export async function executeCall(
 		};
 		if (additionalFields.callId) {
 			body.call_id = additionalFields.callId;
+		}
+		if (additionalFields.reformatForSpeech) {
+			body.reformat_for_speech = true;
 		}
 		if (callbackUrl) {
 			body.callback_url = callbackUrl;

@@ -2,4 +2,4 @@
 .venv/
 data/*/
 __pycache__/
-cache/
+cache/data/scheduled_tasks.json
