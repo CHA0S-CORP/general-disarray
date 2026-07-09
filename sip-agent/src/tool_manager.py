@@ -130,6 +130,19 @@ class ToolManager:
         from plugins.calc_tool import CalculatorTool
         from plugins.simon_says_tool import SimonSaysTool
         from plugins.knowledge_tool import KnowledgeTool
+        from plugins.random_tools import DiceTool, CoinTool
+        from plugins.trivia_tool import TriviaTool
+        from plugins.story_tool import StoryTool
+        from plugins.web_search_tool import WebSearchTool
+        from plugins.nws_weather_tool import NWSForecastTool
+        from plugins.space_weather_tool import KpIndexTool
+        from plugins.quake_tool import EarthquakeTool
+        from plugins.memory_tools import RememberTool, ForgetTool
+        from plugins.workflow_tool import TriggerWorkflowTool
+        from plugins.gpu_status_tool import GpuStatusTool
+        from plugins.alerts_tool import AlertsTool
+        from plugins.container_tool import ContainerControlTool
+        from plugins.transfer_tool import TransferTool
 
         # All available tool classes
         tool_classes = [
@@ -144,6 +157,26 @@ class ToolManager:
             CalculatorTool,
             SimonSaysTool,
             KnowledgeTool,
+            # Fun
+            DiceTool,
+            CoinTool,
+            TriviaTool,
+            StoryTool,
+            # Information
+            WebSearchTool,
+            NWSForecastTool,
+            KpIndexTool,
+            EarthquakeTool,
+            # Memory + automation
+            RememberTool,
+            ForgetTool,
+            TriggerWorkflowTool,
+            # Ops (self-gated: need the observability stack / docker socket)
+            GpuStatusTool,
+            AlertsTool,
+            ContainerControlTool,
+            # Telephony
+            TransferTool,
         ]
         
         for tool_class in tool_classes:
@@ -214,6 +247,13 @@ class ToolManager:
             kb = getattr(self.assistant, "knowledge_base", None)
             if kb is None or not kb.available:
                 return False
+        if name == "TRANSFER" and not self.config.enable_transfer_tool:
+            return False
+        if name in ("REMEMBER", "FORGET") and not self.config.caller_memory_enabled:
+            return False
+        # WEB_SEARCH, FORECAST and CONTAINER_CTL self-disable in __init__ when
+        # their required config (SearxNG URL / coordinates / allowlist+socket)
+        # is missing; the generic `enabled` check below catches them.
 
 
         # Check if tool disabled itself (e.g., missing API keys)
@@ -236,6 +276,8 @@ class ToolManager:
                 wrapper_self.description = plugin_class.description
                 wrapper_self.enabled = getattr(plugin_class, 'enabled', True)
                 wrapper_self.parameters = getattr(plugin_class, 'parameters', {})
+                # Informational tools: result message is spoken in marker mode.
+                wrapper_self.speak_result = getattr(plugin_class, 'speak_result', False)
                 
             async def execute(wrapper_self, params: Dict[str, Any]) -> ToolResult:
                 # Validate params if the plugin has validation

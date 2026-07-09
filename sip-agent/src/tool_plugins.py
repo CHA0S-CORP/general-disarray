@@ -97,13 +97,16 @@ class BaseTool(ABC):
     Optional:
     - Set `parameters` dict to define accepted parameters
     - Set `enabled` to False to disable the tool
+    - Set `speak_result` to True for informational tools whose result
+      message should be spoken to the caller in text-marker mode
     - Override `validate_params()` for custom validation
     """
-    
+
     name: str = "UNNAMED_TOOL"
     description: str = "No description provided"
     parameters: Dict[str, Dict[str, Any]] = {}
     enabled: bool = True
+    speak_result: bool = False
     
     def __init__(self, assistant: 'SIPAIAssistant'):
         self.assistant = assistant

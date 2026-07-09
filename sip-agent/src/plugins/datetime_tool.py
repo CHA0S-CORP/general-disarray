@@ -24,6 +24,7 @@ class DateTimeTool(BaseTool):
     name = "DATETIME"
     description = "Get the current date and/or time"
     enabled = True
+    speak_result = True  # informational: message is spoken in marker mode
     
     parameters = {
         "format": {

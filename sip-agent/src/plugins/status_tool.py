@@ -20,6 +20,7 @@ class StatusTool(BaseTool):
     name = "STATUS"
     description = "Check status of pending timers and scheduled callbacks"
     enabled = True
+    speak_result = True  # informational: message is spoken in marker mode
     
     parameters = {}  # No parameters needed
     

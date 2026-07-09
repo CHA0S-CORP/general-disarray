@@ -147,8 +147,9 @@ class LLMEngine:
             tool_name = result.get("tool", "")
             tool_result = result.get("result")
 
-            # For informational tools, append the result message
-            if tool_name in ("WEATHER", "STATUS", "JOKE", "DATETIME", "CALC", "SIMON_SAYS", "KNOWLEDGE") and tool_result:
+            # For informational tools (speak_result=True), append the message
+            tool = self.tool_manager.get_tool(tool_name)
+            if getattr(tool, "speak_result", False) and tool_result:
                 if hasattr(tool_result, 'message') and tool_result.message:
                     # Add the result to the response
                     if response_text:

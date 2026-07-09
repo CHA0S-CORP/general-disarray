@@ -153,6 +153,56 @@ class CallerMemoryStore:
         except Exception as e:
             logger.warning(f"Caller memory update failed for {caller_id}: {e}")
 
+    def add_fact(self, caller_id: str, fact: str) -> bool:
+        """Explicitly remember one fact for a caller (REMEMBER tool).
+
+        Appends to the existing record (creating one if needed), bounded by
+        the configured max facts (oldest dropped first). Returns False on any
+        failure — callers speak an apology instead of raising.
+        """
+        fact = (fact or "").strip()
+        if not fact or self._path(caller_id) is None:
+            return False
+        try:
+            record = self.get(caller_id) or {
+                "caller": caller_id, "call_count": 0,
+                "facts": [], "last_call_summary": "",
+            }
+            facts = [f for f in record.get("facts", []) if isinstance(f, str)]
+            if fact not in facts:
+                facts.append(fact)
+            record["facts"] = facts[-self.config.caller_memory_max_facts:]
+            record["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self._write_atomic(caller_id, record)
+            return True
+        except Exception as e:
+            logger.warning(f"add_fact failed for {caller_id}: {e}")
+            return False
+
+    def remove_facts(self, caller_id: str, needle: str) -> int:
+        """Forget facts matching `needle` (case-insensitive substring).
+
+        Returns how many facts were removed (0 on no match or failure).
+        """
+        needle = (needle or "").strip().lower()
+        if not needle:
+            return 0
+        try:
+            record = self.get(caller_id)
+            if not record:
+                return 0
+            facts = [f for f in record.get("facts", []) if isinstance(f, str)]
+            kept = [f for f in facts if needle not in f.lower()]
+            removed = len(facts) - len(kept)
+            if removed:
+                record["facts"] = kept
+                record["updated_at"] = datetime.now(timezone.utc).isoformat()
+                self._write_atomic(caller_id, record)
+            return removed
+        except Exception as e:
+            logger.warning(f"remove_facts failed for {caller_id}: {e}")
+            return 0
+
     @staticmethod
     def _parse_extraction(raw: str):
         """Parse the extraction LLM's JSON (tolerating fencing/prose around

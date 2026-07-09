@@ -1,0 +1,6 @@
+{
+  "lights_off": {
+    "url": "http://n8n:5678/webhook/your-webhook-id",
+    "description": "Turn off the living room lights"
+  }
+}

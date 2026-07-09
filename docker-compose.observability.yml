@@ -57,7 +57,10 @@ services:
       - ./observability/prometheus/prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
       - prometheus-data:/prometheus
     ports:
-      - "9090:9090"
+      # Host publish is parameterized so the stack can coexist with other
+      # services on the box; in-cluster traffic uses http://prometheus:9090
+      # regardless (that's what the GPU_STATUS / ALERTS tools query).
+      - "${PROMETHEUS_PORT:-9090}:9090"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]

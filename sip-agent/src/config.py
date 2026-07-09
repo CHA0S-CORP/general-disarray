@@ -336,6 +336,36 @@ class Config:
     # Tempest Weather API
     tempest_station_id: str = field(default_factory=lambda: os.getenv("TEMPEST_STATION_ID", ""))
     tempest_api_token: str = field(default_factory=lambda: os.getenv("TEMPEST_API_TOKEN", ""))
+
+    # Home coordinates for location-aware tools (NWS FORECAST, QUAKES "near").
+    # Empty disables those tools/filters.
+    weather_latitude: str = field(default_factory=lambda: os.getenv("WEATHER_LATITUDE", ""))
+    weather_longitude: str = field(default_factory=lambda: os.getenv("WEATHER_LONGITUDE", ""))
+
+    # SearxNG instance for the WEB_SEARCH tool (empty disables the tool).
+    # The compose files ship an optional service: docker compose --profile search up -d
+    searxng_url: str = field(default_factory=lambda: os.getenv("SEARXNG_URL", ""))
+    web_search_max_results: int = field(
+        default_factory=lambda: int(os.getenv("WEB_SEARCH_MAX_RESULTS", "3")))
+
+    # Observability endpoints for the GPU_STATUS / ALERTS tools. Prometheus is
+    # part of docker-compose.observability.yml; tools fail gracefully when
+    # it isn't running. ALERTS prefers Alertmanager when configured.
+    prometheus_url: str = field(
+        default_factory=lambda: os.getenv("PROMETHEUS_URL", "http://prometheus:9090"))
+    alertmanager_url: str = field(default_factory=lambda: os.getenv("ALERTMANAGER_URL", ""))
+
+    # CONTAINER_CTL: comma-separated container names the tool may act on.
+    # Empty (default) disables the tool entirely. Requires the docker socket
+    # mounted into the agent container (see the commented volume in compose).
+    container_ctl_allowlist: str = field(
+        default_factory=lambda: os.getenv("CONTAINER_CTL_ALLOWLIST", ""))
+    docker_socket_path: str = field(
+        default_factory=lambda: os.getenv("DOCKER_SOCKET_PATH", "/var/run/docker.sock"))
+
+    # TRANSFER tool (SIP REFER to another extension; same outbound dial policy).
+    enable_transfer_tool: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_TRANSFER_TOOL", "true").lower() == "true")
     
     # ===================
     # REST API / Webhook security & limits

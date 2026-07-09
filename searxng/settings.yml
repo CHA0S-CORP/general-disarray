@@ -1,0 +1,14 @@
+# SearxNG settings for the General Disarray WEB_SEARCH tool.
+# Minimal delta over defaults: enable the JSON API the agent queries and
+# disable the bot limiter (the only client is the agent on the compose net).
+use_default_settings: true
+
+server:
+  # Local-only instance on the compose network; not exposed beyond loopback.
+  secret_key: "change-me-general-disarray-local"
+  limiter: false
+
+search:
+  formats:
+    - html
+    - json

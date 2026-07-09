@@ -475,6 +475,25 @@ TTS_SPEED=1.1
 | 😄 `JOKE` | Tell a joke | *"Tell me a joke"* |
 | 🦜 `SIMON_SAYS` | Repeat back verbatim | *"Simon says hello world"* |
 | 📚 `KNOWLEDGE` | Search your local documents (RAG) | *"What's our refund policy?"* |
+| 🎲 `DICE` / 🪙 `COIN` | Roll dice, flip coins | *"Roll two twenty-sided dice"* |
+| ❓ `TRIVIA` | Play a trivia game | *"Ask me a trivia question"* |
+| 📖 `STORY` | Tell an original short story | *"Tell me a bedtime story about a fox"* |
+| 🔎 `WEB_SEARCH` | Search the web via self-hosted SearxNG | *"Search for tide times in Monterey"* |
+| 🌦️ `FORECAST` | NWS forecast for your coordinates | *"What's the forecast for tomorrow?"* |
+| 🌌 `KP_INDEX` | Geomagnetic activity / aurora odds (NOAA) | *"What's the Kp index?"* |
+| 🌎 `QUAKES` | Recent earthquakes (USGS) | *"Any earthquakes near me today?"* |
+| 🧠 `REMEMBER` / `FORGET` | Manage what the agent remembers about you | *"Remember my gate code is 1234"* |
+| ⚡ `TRIGGER_WORKFLOW` | Fire a registered n8n automation | *"Run the lights off automation"* |
+| 🖥️ `GPU_STATUS` | GPU utilization/temp from Prometheus | *"How's the GPU doing?"* |
+| 🚨 `ALERTS` | Firing monitoring alerts | *"Any alerts firing?"* |
+| 🐳 `CONTAINER_CTL` | Status/restart an allowlisted container | *"Restart n8n"* |
+| ☎️ `TRANSFER` | Blind-transfer the caller (SIP REFER) | *"Transfer me to extension 2001"* |
+
+Several tools stay hidden until configured: `WEB_SEARCH` needs `SEARXNG_URL`
+(`docker compose --profile search up -d`), `FORECAST` needs `WEATHER_LATITUDE`/`WEATHER_LONGITUDE`,
+`GPU_STATUS`/`ALERTS` need the observability stack, and `CONTAINER_CTL` needs **both** a
+`CONTAINER_CTL_ALLOWLIST` and the (commented-out) docker-socket mount — the socket is
+root-equivalent on the host, so enable it deliberately.
 
 ---
 

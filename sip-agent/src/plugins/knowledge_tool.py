@@ -22,6 +22,7 @@ class KnowledgeTool(BaseTool):
                    "for facts you don't know (policies, procedures, "
                    "site-specific information)")
     enabled = True
+    speak_result = True  # informational: message is spoken in marker mode
 
     parameters = {
         "query": {

@@ -169,6 +169,19 @@ services:
       - KNOWLEDGE_AUTO_INJECT=${KNOWLEDGE_AUTO_INJECT:-false}
       - CONVERSATION_SUMMARY_ENABLED=${CONVERSATION_SUMMARY_ENABLED:-true}
       - CONVERSATION_SUMMARY_TIMEOUT_S=${CONVERSATION_SUMMARY_TIMEOUT_S:-20.0}
+      # Location for FORECAST / QUAKES-near (empty disables those tools)
+      - WEATHER_LATITUDE=${WEATHER_LATITUDE:-}
+      - WEATHER_LONGITUDE=${WEATHER_LONGITUDE:-}
+      # WEB_SEARCH via SearxNG (start it with: docker compose --profile search up -d)
+      - SEARXNG_URL=${SEARXNG_URL:-}
+      - WEB_SEARCH_MAX_RESULTS=${WEB_SEARCH_MAX_RESULTS:-3}
+      # GPU_STATUS / ALERTS tools (observability stack; fail gracefully when down)
+      - PROMETHEUS_URL=${PROMETHEUS_URL:-http://prometheus:9090}
+      - ALERTMANAGER_URL=${ALERTMANAGER_URL:-}
+      # CONTAINER_CTL: allowlisted container names (empty disables the tool;
+      # also requires the docker socket mount below)
+      - CONTAINER_CTL_ALLOWLIST=${CONTAINER_CTL_ALLOWLIST:-}
+      - ENABLE_TRANSFER_TOOL=${ENABLE_TRANSFER_TOOL:-true}
       # Single-line prompt override; multi-line prompts go in data/system_prompt.txt
       - SYSTEM_PROMPT=${SYSTEM_PROMPT:-}
       # Per-turn acknowledgment: chime (earcon, default) | phrase | none
@@ -249,6 +262,26 @@ services:
       - ${API_BIND_ADDRESS:-127.0.0.1}:${API_PORT:-8080}:8080   # API server port (loopback-only by default; see API_BIND_ADDRESS)
     volumes:
       - ./data:/app/data
+      # Uncomment for the CONTAINER_CTL tool (voice-controlled docker restarts).
+      # WARNING: the docker socket is root-equivalent on this host — keep the
+      # tool's CONTAINER_CTL_ALLOWLIST tight.
+      # - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
+
+  # Optional: self-hosted metasearch for the WEB_SEARCH tool.
+  # Start with: docker compose --profile search up -d
+  # Then set SEARXNG_URL=http://searxng:8080 in .env.
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    profiles: ["search"]
+    volumes:
+      - ./searxng:/etc/searxng
+    environment:
+      - SEARXNG_BASE_URL=http://searxng:8080/
+    ports:
+      - "127.0.0.1:8081:8080"
     restart: unless-stopped
 
   n8n:

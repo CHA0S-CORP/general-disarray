@@ -29,6 +29,7 @@ class WeatherTool(BaseTool):
     name = "WEATHER"
     description = "Get current weather conditions from the local weather station"
     enabled = True
+    speak_result = True  # informational: message is spoken in marker mode
     
     parameters = {}  # No parameters needed - uses configured station
     

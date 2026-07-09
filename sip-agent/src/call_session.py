@@ -47,3 +47,7 @@ class CallSession:
     # True once the post-call memory update has been dispatched (teardown and
     # the audio-loop tail can both reach the update site).
     memory_update_started: bool = False
+    # Generic per-call scratch for stateful tools (e.g. a trivia game), keyed
+    # by tool. Tool instances are singletons across calls — never stash call
+    # state on the tool itself.
+    tool_state: Dict[str, Any] = field(default_factory=dict)

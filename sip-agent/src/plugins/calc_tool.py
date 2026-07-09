@@ -24,6 +24,7 @@ class CalculatorTool(BaseTool):
     name = "CALC"
     description = "Calculate mathematical expressions (add, subtract, multiply, divide, percentages)"
     enabled = True
+    speak_result = True  # informational: message is spoken in marker mode
     
     parameters = {
         "expression": {

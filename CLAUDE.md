@@ -49,7 +49,16 @@ Call flow: PJSIP receives RTP audio → VAD/STT (Speaches) → LLM (vLLM) → to
 1. **Built-ins** — `tool_manager.py` hard-codes the built-in tool classes in `_load_tools()` and wraps each in a `PluginToolWrapper`. **To add a built-in tool, import it and add it to the `tool_classes` list there.** Enablement is gated by config flags in `_should_enable_tool` (e.g. `ENABLE_TIMER_TOOL`, `ENABLE_WEATHER_TOOL`).
 2. **Auto-discovery** — after the built-ins, `_discover_extra_plugins()` uses `tool_plugins.PluginLoader` to scan the `plugins/` directories **plus `data/plugins/`** (the mounted data volume), so deployments can drop a tool file in without rebuilding the image. Gated by `ENABLE_PLUGIN_AUTODISCOVERY` (default true); discovered tools never override built-ins.
 
-Built-in tools live in `sip-agent/src/plugins/` (weather, timer, callback, hangup, status, cancel, datetime, calc, joke, simon_says, knowledge). Each subclasses `BaseTool` and implements `async def execute(self, params) -> ToolResult`.
+Built-in tools live in `sip-agent/src/plugins/`. Each subclasses `BaseTool` and implements `async def execute(self, params) -> ToolResult`:
+
+- **Core**: weather (Tempest), timer, callback, hangup, status, cancel, datetime, calc, joke, simon_says, knowledge (RAG)
+- **Fun**: `random_tools.py` (DICE/COIN), `trivia_tool.py` (game state on `session.tool_state`), `story_tool.py` (one-shot LLM via `llm_engine.summarize_text`)
+- **Information**: `web_search_tool.py` (SearxNG), `nws_weather_tool.py` (FORECAST — api.weather.gov, needs a descriptive User-Agent), `space_weather_tool.py` (KP_INDEX — NOAA SWPC), `quake_tool.py` (QUAKES — USGS feeds)
+- **Memory + automation**: `memory_tools.py` (REMEMBER/FORGET over `CallerMemoryStore.add_fact`/`remove_facts`), `workflow_tool.py` (TRIGGER_WORKFLOW — fires webhooks named in `data/workflows.json` via `deliver_webhook`)
+- **Ops**: `gpu_status_tool.py` + `alerts_tool.py` (Prometheus/Alertmanager queries), `container_tool.py` (CONTAINER_CTL — docker Engine API over the socket, allowlist-gated, restart requires `confirm=true`)
+- **Telephony**: `transfer_tool.py` (TRANSFER — blind REFER via `SIPHandler.transfer_call`, which marshals `Call.xfer` onto the PJSIP thread through `_queue_command`)
+
+`BaseTool.speak_result = True` marks informational tools whose result message is spoken verbatim in text-marker mode (`llm_engine._apply_marker_tools` reads it). Tools needing per-call state must use `session.tool_state[...]` — tool instances are singletons across calls.
 
 ### REST API endpoints (`api.py`)
 

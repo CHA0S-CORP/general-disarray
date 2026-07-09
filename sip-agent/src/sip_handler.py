@@ -574,7 +574,17 @@ class SIPHandler:
             elif cmd == "make_call":
                 uri = args[0]
                 return self._do_make_call(uri)
-                
+
+            elif cmd == "xfer":
+                # Blind transfer (SIP REFER); the far end re-INVITEs the
+                # target and this call ends via the normal disconnect path.
+                call = args[0]
+                dest = args[1]
+                prm = pj.CallOpParam()
+                call.xfer(dest, prm)
+                return True
+
+
             elif cmd == "play_file":
                 call_id = args[0]
                 wav_path = args[1]
@@ -877,6 +887,33 @@ class SIPHandler:
                 call_info.pj_call
             )
             
+    async def transfer_call(self, call_info: CallInfo, target_uri: str) -> bool:
+        """Blind-transfer an active call to another SIP URI (REFER).
+
+        Returns True when the REFER was issued; the call then tears down
+        through the normal disconnect flow. Mock mode (no PJSUA2) returns
+        False so callers fall back to a spoken error.
+        """
+        if not PJSUA_AVAILABLE:
+            logger.warning("transfer_call unavailable in mock SIP mode")
+            return False
+        if not call_info or not call_info.pj_call:
+            return False
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            self._queue_command,
+            "xfer",
+            call_info.pj_call,
+            target_uri,
+        )
+        ok = result is True
+        log_event(logger, logging.INFO if ok else logging.WARNING,
+                  f"Call transfer to {target_uri}: {'issued' if ok else 'failed'}",
+                  event="sip_transfer", target=target_uri, ok=ok,
+                  call_id=call_info.call_id)
+        return ok
+
     async def make_call(self, uri: str) -> Optional[CallInfo]:
         """Make an outbound call."""
         if not PJSUA_AVAILABLE:
