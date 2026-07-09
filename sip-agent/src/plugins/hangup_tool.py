@@ -32,15 +32,24 @@ class HangupTool(BaseTool):
     _pending_tasks: Set["asyncio.Task[None]"] = set()
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
-        if self.assistant.current_call:
+        # Bind the call we were asked to end. The delayed task must NOT
+        # re-read current_call later: this call can end during the delay and
+        # a different caller can already be live, and hangup_call() drops
+        # whatever CallInfo it is handed.
+        target_call = self.assistant.current_call
+        if target_call:
             try:
                 # Schedule hangup after a short delay to allow goodbye message to play
                 async def delayed_hangup():
                     try:
                         await asyncio.sleep(HANGUP_DELAY_SECONDS)
-                        if self.assistant.current_call:
-                            await self.assistant.sip_handler.hangup_call(self.assistant.current_call)
+                        if self.assistant.current_call is target_call:
+                            await self.assistant.sip_handler.hangup_call(target_call)
                             logger.info("Call ended via HANGUP tool")
+                        else:
+                            logger.info(
+                                "Skipping delayed hangup: the call it was "
+                                "scheduled for is no longer active")
                     except Exception as e:
                         # A failure here happens after execute() has already
                         # returned, so it must be logged here or it is lost.

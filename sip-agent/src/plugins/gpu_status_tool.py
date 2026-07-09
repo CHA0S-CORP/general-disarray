@@ -14,6 +14,7 @@ LLM: [TOOL:GPU_STATUS]
 """
 
 import logging
+import math
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -58,9 +59,15 @@ def _first_value(payload: Any) -> Optional[float]:
         result = payload["data"]["result"]
         if not result:
             return None
-        return float(result[0]["value"][1])
+        value = float(result[0]["value"][1])
     except (KeyError, IndexError, TypeError, ValueError):
         return None
+    # Prometheus encodes unavailable samples as the strings "NaN"/"+Inf";
+    # float() accepts them silently, and round(nan) later raises. An absent
+    # sensor (common for integrated GPUs) must read as "no value", not crash.
+    if math.isnan(value) or math.isinf(value):
+        return None
+    return value
 
 
 class GpuStatusTool(BaseTool):

@@ -152,3 +152,30 @@ async def test_metric_variants_include_real_exporter_names():
     assert "gpu_memory_percent_Percentage" in gpu_status_tool._METRICS["memory"]
     assert "gpu_temperature_C" in gpu_status_tool._METRICS["temperature"]
     assert "gpu_power_usage_W" in gpu_status_tool._METRICS["power"]
+
+
+@pytest.mark.parametrize("special", ["NaN", "+Inf", "-Inf"])
+def test_first_value_rejects_nan_and_inf(special):
+    """Prometheus sends unavailable samples as these literals; float() accepts
+    them silently and round(nan) later raises ValueError."""
+    assert _first_value(_vector(special)) is None
+
+
+async def test_nan_sensor_is_omitted_not_crashed(monkeypatch, config_factory):
+    """An absent temperature sensor (common on integrated GPUs) must not take
+    down the whole readout."""
+    async def fake_fetch(url, params=None, headers=None):
+        if "temperature" in params["query"]:
+            return _vector("NaN")
+        if "utilization" in params["query"]:
+            return _vector("42.0")
+        return _EMPTY
+
+    monkeypatch.setattr(gpu_status_tool, "_fetch_json", fake_fetch)
+    tool = _make_tool(config_factory)
+    result = await tool.execute({})  # must not raise
+
+    assert result.status == ToolStatus.SUCCESS
+    assert "42 percent" in result.message
+    assert "degrees" not in result.message
+    assert result.data["temperature"] is None

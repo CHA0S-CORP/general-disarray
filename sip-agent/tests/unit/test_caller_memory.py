@@ -1,4 +1,5 @@
 """Unit tests for the cross-call caller memory store."""
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -151,3 +152,75 @@ def test_format_for_prompt_bounds_chars(config_factory, tmp_path):
         "last_call_summary": "",
     })
     assert len(store.format_for_prompt("1001")) <= 40
+
+# --- concurrency: lost-update protection --------------------------------------
+
+class _SlowEngine:
+    """Extraction that yields control, letting another writer interleave."""
+
+    def __init__(self, reply, on_await=None):
+        self.reply = reply
+        self.on_await = on_await
+
+    async def summarize_text(self, system_prompt, text, timeout_s):
+        await asyncio.sleep(0)  # hand the event loop to the racing writer
+        if self.on_await:
+            self.on_await()
+        await asyncio.sleep(0)
+        return self.reply
+
+
+async def test_remember_during_extraction_is_not_clobbered(store):
+    """Regression: a REMEMBER made on a redial must survive the previous
+    call's post-call fact extraction completing afterwards."""
+    store._write_atomic("1001", {
+        "caller": "1001", "call_count": 1,
+        "facts": ["Name is Bob"], "last_call_summary": "s0",
+    })
+
+    def redial_remember():
+        store.add_fact("1001", "Address is 5 Elm Street")
+
+    engine = _SlowEngine(
+        json.dumps({"facts": ["Name is Bob", "Likes coffee"],
+                    "last_call_summary": "s1"}),
+        on_await=redial_remember)
+
+    await store.update_from_call("sip:1001@pbx", _transcript("hi"), engine)
+
+    facts = store.get("1001")["facts"]
+    assert "Address is 5 Elm Street" in facts, "REMEMBER was clobbered"
+    assert "Likes coffee" in facts, "extracted fact lost"
+
+
+async def test_forget_during_extraction_is_respected(store):
+    """A FORGET during the extraction window must not be undone by the
+    extraction writing the old fact back."""
+    store._write_atomic("1001", {
+        "caller": "1001", "call_count": 1,
+        "facts": ["Name is Bob", "Hates jazz"], "last_call_summary": "s0",
+    })
+
+    engine = _SlowEngine(
+        json.dumps({"facts": ["Name is Bob", "Hates jazz"],
+                    "last_call_summary": "s1"}),
+        on_await=lambda: store.remove_facts("1001", "jazz"))
+
+    await store.update_from_call("sip:1001@pbx", _transcript("hi"), engine)
+
+    facts = store.get("1001")["facts"]
+    assert not any("jazz" in f.lower() for f in facts), "FORGET was undone"
+
+
+async def test_concurrent_updates_for_same_caller_serialize(store):
+    """Two overlapping post-call extractions must not both write from the
+    same stale snapshot (call_count would undercount)."""
+    engine_a = _SlowEngine(json.dumps({"facts": ["A"], "last_call_summary": "a"}))
+    engine_b = _SlowEngine(json.dumps({"facts": ["B"], "last_call_summary": "b"}))
+
+    await asyncio.gather(
+        store.update_from_call("sip:1001@pbx", _transcript("one"), engine_a),
+        store.update_from_call("sip:1001@pbx", _transcript("two"), engine_b),
+    )
+
+    assert store.get("1001")["call_count"] == 2

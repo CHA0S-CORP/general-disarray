@@ -108,7 +108,12 @@ async def test_native_tool_calling_round_trip(assistant, config_factory):
 
 
 async def test_native_loop_respects_tool_round_budget(assistant, config_factory):
-    """LLM_MAX_TOOL_ROUNDS bounds the native loop (was hardcoded to 3)."""
+    """LLM_MAX_TOOL_ROUNDS bounds the native loop (was hardcoded to 3).
+
+    A model that keeps demanding tools gets exactly max_rounds tool rounds plus
+    one final completion (with tools withheld) to produce an answer; when it
+    still won't answer, the caller hears the apology rather than looping.
+    """
     from types import SimpleNamespace
 
     cfg = config_factory(llm_tool_calling="native", llm_max_tool_rounds="1")
@@ -127,7 +132,9 @@ async def test_native_loop_respects_tool_round_budget(assistant, config_factory)
         chat=SimpleNamespace(completions=SimpleNamespace(create=always_tools)))
 
     reply = await eng.generate_response([{"role": "user", "content": "loop"}])
-    assert len(requests) == 1  # budget of one round, not the old default
+    assert len(requests) == 2          # one tool round + the final answer call
+    assert requests[0]["tools"]        # tools offered during the tool round
+    assert requests[1]["tools"] is None  # withheld on the final call
     assert "too many steps" in reply.lower()
 
 
@@ -270,3 +277,73 @@ async def test_reformat_falls_back_on_timeout(engine):
 
 async def test_reformat_passes_empty_through(engine):
     assert await engine.reformat_for_speech("", timeout_s=10.0) == ""
+
+
+# --- history windowing vs the rolling summary --------------------------------
+
+def _history(n):
+    return [{"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}"}
+            for i in range(n)]
+
+
+async def test_summary_disabled_keeps_tail_bound(assistant, config_factory):
+    """Without the summary feature the engine must still bound the window."""
+    cfg = config_factory(max_conversation_turns="2",
+                         conversation_summary_enabled="false")
+    eng = LLMEngine(cfg, assistant.tool_manager)
+    window = eng._history_window(_history(10))
+    assert [m["content"] for m in window] == ["m6", "m7", "m8", "m9"]
+
+
+async def test_summary_enabled_does_not_retruncate(assistant, config_factory):
+    """Regression: main.py already sliced off the summarized turns, so the
+    engine must not tail-slice again — the just-overflowed turn is in neither
+    the summary (written a turn later) nor a re-truncated window."""
+    cfg = config_factory(max_conversation_turns="2",
+                         conversation_summary_enabled="true")
+    eng = LLMEngine(cfg, assistant.tool_manager)
+    history = _history(5)  # window is 4; main passes 5 while summary lags
+    window = eng._history_window(history)
+    assert [m["content"] for m in window] == ["m0", "m1", "m2", "m3", "m4"]
+
+
+async def test_summary_lag_is_capped(assistant, config_factory):
+    """Fail-open summarization must not grow the prompt without bound."""
+    cfg = config_factory(max_conversation_turns="2",
+                         conversation_summary_enabled="true")
+    eng = LLMEngine(cfg, assistant.tool_manager)
+    window = eng._history_window(_history(50))
+    assert len(window) == 8  # 2 * (max_turns * 2)
+    assert window[-1]["content"] == "m49"
+
+
+# --- native tool-round budget -------------------------------------------------
+
+async def test_native_loop_answers_after_the_last_tool_round(assistant, config_factory):
+    """Regression: with LLM_MAX_TOOL_ROUNDS=1 a single tool call must still
+    produce a spoken answer, not the 'too many steps' apology."""
+    from types import SimpleNamespace
+
+    cfg = config_factory(llm_tool_calling="native", llm_max_tool_rounds="1")
+    eng = LLMEngine(cfg, assistant.tool_manager)
+    requests = []
+
+    async def create(**kwargs):
+        requests.append(kwargs)
+        if len(requests) == 1:
+            msg = _StubMessage(tool_calls=[
+                _StubToolCall("tc-1", "CALC", '{"expression": "2+2"}')])
+        else:
+            msg = _StubMessage(content="The answer is four.")
+        return SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason="stop")],
+                               usage=None)
+
+    eng.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+    reply = await eng.generate_response([{"role": "user", "content": "what is 2+2"}])
+    assert "four" in reply.lower()
+    assert "too many steps" not in reply.lower()
+    # The final completion withholds the tools param so the model must answer.
+    assert requests[0]["tools"]
+    assert requests[-1]["tools"] is None

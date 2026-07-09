@@ -168,8 +168,10 @@ class LangChainEngine(LLMEngine):
 
         messages: List[Any] = [
             SystemMessage(content=self._build_system_prompt(call_context))]
+        # Same windowing rule as the classic engine (see _history_window):
+        # don't re-truncate history the rolling summary has already sliced.
         messages.extend(self._to_lc_messages(
-            conversation_history[-self.config.max_conversation_turns * 2:]))
+            self._history_window(conversation_history, call_context)))
 
         # Each tool round costs one agent step (model call) + one tool step.
         recursion_limit = 2 * self.config.llm_max_tool_rounds + 1

@@ -1279,7 +1279,10 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
         # treat a successfully completed call as an error.
         return {"call_id": call_id, "status": "not_found"}
 
-    @app.get("/call/{call_id}/transcript")
+    # Authenticated + rate-limited unlike the other read endpoints: a
+    # transcript is a verbatim record of what a caller said (addresses, PINs,
+    # order numbers), and call_ids are guessable (prefix-<unix_second>-<n>).
+    @app.get("/call/{call_id}/transcript", dependencies=protected)
     async def get_call_transcript(call_id: str):
         """Return the conversation transcript for a call (live or finished)."""
         store = getattr(assistant, "transcripts", None)

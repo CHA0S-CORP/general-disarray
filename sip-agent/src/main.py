@@ -694,14 +694,22 @@ class SIPAIAssistant:
     async def _generate_response(self, session: CallSession, user_input: str) -> str:
         """Generate LLM response."""
         try:
+            # Snapshot the summary pair BEFORE any await: the background
+            # summarizer sets rolling_summary and summarized_upto together,
+            # and reading them either side of an await can pick up the new
+            # index with the old (empty) summary — silently dropping the
+            # turns that were just folded in.
+            rolling_summary = session.rolling_summary
+            summarized_upto = session.summarized_upto
+
             call_context = {
                 "remote_uri": getattr(session.call_info, 'remote_uri', 'unknown'),
                 "duration": time.time() - session.start_time,
             }
             if session.caller_memory_prompt:
                 call_context["caller_memory"] = session.caller_memory_prompt
-            if session.rolling_summary:
-                call_context["conversation_summary"] = session.rolling_summary
+            if rolling_summary:
+                call_context["conversation_summary"] = rolling_summary
             if self.config.knowledge_auto_inject:
                 knowledge = await self.knowledge_base.format_for_prompt(user_input)
                 if knowledge:
@@ -710,7 +718,7 @@ class SIPAIAssistant:
             response = await self.llm_engine.generate_response(
                 # Turns already folded into the rolling summary stay out of
                 # the raw history window (the summary travels in call_context).
-                session.conversation_history[session.summarized_upto:],
+                session.conversation_history[summarized_upto:],
                 call_context,
             )
             return response

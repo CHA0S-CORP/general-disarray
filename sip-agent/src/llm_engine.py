@@ -116,12 +116,9 @@ class LLMEngine:
         messages = [
             {"role": "system", "content": self._build_system_prompt(call_context)}
         ]
-        
-        # Add conversation history (limited to max turns)
-        messages.extend(
-            conversation_history[-self.config.max_conversation_turns * 2:]
-        )
-        
+
+        messages.extend(self._history_window(conversation_history, call_context))
+
         # Generate response
         if self._native_tools_active():
             response_text = await self._generate_native(messages)
@@ -159,6 +156,35 @@ class LLMEngine:
 
         return response_text
 
+
+    def _history_window(
+        self,
+        conversation_history: List[Dict[str, str]],
+        call_context: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, str]]:
+        """The verbatim turns to send alongside the system prompt.
+
+        When the rolling summary is active, main.py has already sliced off the
+        turns it folded into `conversation_summary` and passes the rest — so
+        applying the tail bound again here would drop the newly-overflowed
+        turn from BOTH the window and the (not yet updated) summary. The
+        summarizer runs a turn behind by design, so the window it hands us is
+        legitimately a little longer than max_conversation_turns * 2.
+
+        A generous safety cap still applies: summarization is fail-open, and a
+        backend that keeps failing must not grow the prompt without bound.
+        """
+        window = self.config.max_conversation_turns * 2
+        if not self.config.summary_enabled:
+            return conversation_history[-window:]
+
+        cap = window * 2
+        if len(conversation_history) > cap:
+            logger.warning(
+                f"Summary is lagging ({len(conversation_history)} un-summarized "
+                f"messages); clipping history to the last {cap}")
+            return conversation_history[-cap:]
+        return list(conversation_history)
 
     def _build_system_prompt(self, call_context: Optional[Dict[str, Any]] = None) -> str:
         """Build system prompt with dynamic context and tools."""
@@ -364,7 +390,10 @@ class LLMEngine:
         tools = self._build_native_tools()
         messages = list(messages)
         # Bound on tool-call round trips per turn so a model that keeps asking
-        # for tools can't loop forever on a live phone call.
+        # for tools can't loop forever on a live phone call. The budget buys
+        # max_rounds *tool* rounds, plus one final completion to turn the last
+        # tool result into a spoken answer — that final call withholds the
+        # tools param so the model has to answer rather than ask again.
         max_rounds = self.config.llm_max_tool_rounds
 
         with create_span("llm.generate_native", {
@@ -372,11 +401,12 @@ class LLMEngine:
             "llm.tools_count": len(tools),
         }) as span:
             try:
-                for round_no in range(max_rounds):
+                for round_no in range(max_rounds + 1):
+                    budget_spent = round_no == max_rounds
                     start_time = time.time()
                     response = await self.client.chat.completions.create(
                         messages=messages,
-                        tools=tools or None,
+                        tools=None if budget_spent else (tools or None),
                         **self._sampling_kwargs(),
                     )
                     Metrics.record_llm_latency(

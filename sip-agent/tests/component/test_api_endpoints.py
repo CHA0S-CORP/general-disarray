@@ -198,3 +198,18 @@ def test_schedule_stores_reformat_flag(client, assistant):
     task = assistant.tool_manager.scheduled_tasks[r.json()["schedule_id"]]
     assert task.metadata["reformat_for_speech"] is True
     client.delete(f"/schedule/{r.json()['schedule_id']}")
+
+
+def test_transcript_endpoint_requires_auth_when_token_set(make_client, config_factory):
+    """Transcripts are verbatim recordings of what callers said, and call_ids
+    are guessable (prefix-<unix_second>-<n>) -- unlike the other read
+    endpoints this one must not be world-readable."""
+    cfg = config_factory(api_auth_token="s3cret")
+    c, a = make_client(cfg)
+    a.transcripts.start("t-1", "inbound", "sip:1001@host")
+    a.transcripts.add_turn("t-1", "user", "my pin is 1234")
+
+    assert c.get("/call/t-1/transcript").status_code == 401
+    r = c.get("/call/t-1/transcript", headers={"X-API-Key": "s3cret"})
+    assert r.status_code == 200
+    assert r.json()["turns"][0]["content"] == "my pin is 1234"
