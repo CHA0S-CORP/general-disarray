@@ -39,7 +39,13 @@ class TimerTool(BaseTool):
     }
     
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
-        duration = int(params.get('duration', 300))  # Default 5 minutes
+        try:
+            duration = int(params.get('duration', 300))  # Default 5 minutes
+        except (ValueError, TypeError):
+            return ToolResult(
+                status=ToolStatus.FAILED,
+                message="I couldn't understand that duration. Please tell me a number of seconds, like 300."
+            )
         message = params.get('message', 'Your timer is complete')
         
         # Validate duration

@@ -49,6 +49,18 @@ fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
 
 # ===================
+# Conversation intelligence (optional at runtime - imports are guarded)
+# ===================
+# Agentic engine (LLM_BACKEND=langgraph): LangGraph ReAct loop over the same
+# OpenAI-compatible backend. The classic engine runs without these.
+langchain-core>=1.0,<2.0
+langchain-openai>=1.0,<2.0
+langgraph>=1.0,<2.0
+# Knowledge base (RAG over data/knowledge): chunking + local CPU embeddings.
+langchain-text-splitters>=1.0,<2.0
+fastembed>=0.7,<1.0
+
+# ===================
 # OpenTelemetry (optional - for observability)
 # ===================
 # These are optional and only used when OTEL_ENABLED=true

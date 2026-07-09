@@ -41,8 +41,8 @@ class DateTimeTool(BaseTool):
     }
     
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
-        format_type = params.get("format", "datetime").lower()
-        timezone_str = params.get("timezone", "US/Pacific")
+        format_type = (params.get("format") or "datetime").lower()
+        timezone_str = params.get("timezone") or "US/Pacific"
         
         # Get timezone
         try:

@@ -33,6 +33,7 @@ except ImportError:
     SCIPY_AVAILABLE = False
 
 from config import Config
+from speech_text import sanitize_for_speech
 from telemetry import create_span, Metrics
 from logging_utils import log_event
 from retry_utils import retry_async, RetryError
@@ -99,16 +100,24 @@ class FastVoiceActivityDetector:
         
         self.silence_timeout_ms = config.silence_duration_ms
         
+    # Lower bound for the adaptive noise floor. Without it, sustained digital
+    # silence (zero-energy RTP) drives the floor to 0.0, after which any
+    # nonzero dither/line noise exceeds "floor * 2" and reads as speech —
+    # phantom barge-ins on a silent line.
+    MIN_NOISE_FLOOR = 50.0
+
     def is_speech(self, audio_chunk: bytes) -> bool:
         """Check if chunk contains speech with energy pre-filter."""
         samples = np.frombuffer(audio_chunk, dtype=np.int16)
-        energy = np.sqrt(np.mean(samples.astype(np.float32) ** 2))
-        
+        energy = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+
         if not self.is_speaking:
             self.noise_samples.append(energy)
             if len(self.noise_samples) >= 10:
-                self.noise_floor = np.percentile(list(self.noise_samples), 30)
-        
+                self.noise_floor = max(
+                    float(np.percentile(list(self.noise_samples), 30)),
+                    self.MIN_NOISE_FLOOR)
+
         if energy < self.noise_floor * 1.5:
             return False
             
@@ -124,8 +133,8 @@ class FastVoiceActivityDetector:
             except Exception:
                 pass
                 
-        return energy > self.noise_floor * 2
-        
+        return bool(energy > self.noise_floor * 2)
+
     def process_audio(self, audio_chunk: bytes) -> Tuple[bool, bool]:
         """Process audio with faster end-of-utterance detection."""
         is_speech = self.is_speech(audio_chunk)
@@ -187,8 +196,13 @@ class WhisperAPIClient:
                 
                 # Ensure the STT model is downloaded
                 await self._ensure_model_downloaded()
-                
+
                 self.available = True
+
+                # Force the model into memory now; Speaches loads Whisper
+                # lazily on the first transcription, which on a busy GPU can
+                # take minutes and would otherwise stall the first real call.
+                await self._warm_up()
             else:
                 logger.warning(f"Whisper API returned status {response.status_code}")
         except Exception as e:
@@ -231,7 +245,17 @@ class WhisperAPIClient:
         except Exception as e:
             logger.warning(f"Could not pre-download STT model: {e}")
             # Continue anyway - Speaches will download on first use
-            
+
+    async def _warm_up(self):
+        """Transcribe a short silent clip so the model is loaded before the first call."""
+        try:
+            silence = b'\x00\x00' * int(self.config.sample_rate * 0.5)
+            start = time.time()
+            await self.transcribe(silence)
+            logger.info(f"STT warm-up completed in {(time.time() - start) * 1000:.0f}ms")
+        except Exception as e:
+            logger.warning(f"STT warm-up failed: {e}")
+
     async def close(self):
         """Close the client."""
         if self.client:
@@ -347,6 +371,11 @@ class SpeachesTTSClient:
     # Sample rates for different TTS backends
     PIPER_SAMPLE_RATE = 22050
     KOKORO_SAMPLE_RATE = 24000
+
+    # Response formats that are raw little-endian int16 PCM (wav is unwrapped to
+    # raw PCM by _extract_wav_data). Anything else (mp3/opus/aac/flac) is a
+    # compressed byte stream that must NOT be reinterpreted as int16 samples.
+    RAW_PCM_FORMATS = frozenset({"wav", "pcm"})
     
     def __init__(self, config: Config):
         self.config = config
@@ -483,8 +512,10 @@ class SpeachesTTSClient:
             try:
                 audio = await self._synthesize_raw(phrase)
                 if audio:
-                    # Resample to target rate
-                    audio = self._resample(audio, self.tts_sample_rate, self.config.sample_rate)
+                    # Only resample raw PCM; compressed formats must not be
+                    # reinterpreted as int16 (see _is_raw_pcm_format).
+                    if self._is_raw_pcm_format():
+                        audio = self._resample(audio, self.tts_sample_rate, self.config.sample_rate)
                     self.audio_cache[phrase.lower()] = audio
             except Exception as e:
                 logger.warning(f"Failed to cache '{phrase}': {e}")
@@ -499,6 +530,15 @@ class SpeachesTTSClient:
     def get_cached(self, text: str) -> Optional[bytes]:
         """Get pre-cached audio if available."""
         return self.audio_cache.get(text.lower().strip())
+
+    def _is_raw_pcm_format(self) -> bool:
+        """True when synthesized audio is raw int16 PCM and safe to resample.
+
+        Compressed formats (mp3/opus/aac/flac) would be reinterpreted as int16
+        samples by _resample, producing noise — so callers must skip resampling
+        for those and treat the bytes as an opaque encoded stream.
+        """
+        return self.response_format.lower() in self.RAW_PCM_FORMATS
         
     async def _synthesize_raw(self, text: str) -> bytes:
         """
@@ -600,12 +640,20 @@ class SpeachesTTSClient:
         audio = await self._synthesize_raw(text)
         
         if audio:
-            # Resample to target rate (usually 16000Hz for SIP)
-            audio = self._resample(audio, self.tts_sample_rate, self.config.sample_rate)
-            
+            if self._is_raw_pcm_format():
+                # Resample to target rate (usually 16000Hz for SIP)
+                audio = self._resample(audio, self.tts_sample_rate, self.config.sample_rate)
+            else:
+                # Compressed format: resampling as int16 would emit noise. Pass the
+                # encoded bytes through un-resampled rather than corrupting them.
+                logger.warning(
+                    f"TTS_RESPONSE_FORMAT='{self.response_format}' is not raw PCM; "
+                    "skipping resample (audio left at native rate, not int16-resampled)"
+                )
+
             elapsed = (time.time() - start) * 1000
             logger.info(f"Speaches TTS: {elapsed:.0f}ms for '{text[:30]}...'")
-            
+
         return audio
         
     async def synthesize_stream(self, text: str) -> AsyncGenerator[bytes, None]:
@@ -797,6 +845,12 @@ class LowLatencyAudioPipeline:
         
         duration_ms = len(audio_data) / (self.config.sample_rate * 2) * 1000
         if duration_ms < self.config.min_speech_duration_ms:
+            # In realtime mode the sub-threshold audio was already streamed to the
+            # server via push_audio(); clear that buffer so it doesn't bleed into
+            # the next turn's transcript. Batch mode has no server-side buffer, so
+            # this is a no-op there.
+            if self._stt_manager and self._stt_manager.is_realtime:
+                await self._stt_manager.clear_audio()
             return ""
             
         self.last_metrics.stt_start = time.time()
@@ -804,10 +858,12 @@ class LowLatencyAudioPipeline:
         # Use the appropriate client
         if self._stt_manager and self._stt_manager.available:
             if self._stt_manager.is_realtime:
-                # In realtime mode, audio was already streamed via push_audio()
-                # The server VAD handles speech detection and triggers transcription
-                # We wait briefly for any pending result
-                result = await self._stt_manager.transcribe(b"")  # Empty - audio already sent
+                # In realtime mode the audio was already streamed via push_audio();
+                # the local VAD just detected end-of-turn, so commit the buffer and
+                # wait for the transcript deterministically.
+                result = await self._stt_manager.commit_and_wait(
+                    self.config.realtime_commit_timeout_s
+                )
             else:
                 result = await self._stt_manager.transcribe(audio_data)
         elif self._stt_batch_client and self._stt_batch_client.available:
@@ -825,12 +881,17 @@ class LowLatencyAudioPipeline:
         return result
         
     async def synthesize(self, text: str) -> bytes:
-        """Synthesize with caching."""
-        return await self.tts.synthesize(text)
-        
+        """Synthesize with caching.
+
+        Sanitizes here — the single choke point every spoken path flows
+        through (call turns, greeting, outbound messages, REST /speak, timer
+        announcements) — so formatting artifacts never reach the TTS engine.
+        """
+        return await self.tts.synthesize(sanitize_for_speech(text))
+
     async def synthesize_stream(self, text: str) -> AsyncGenerator[bytes, None]:
         """Stream synthesis."""
-        async for chunk in self.tts.synthesize_stream(text):
+        async for chunk in self.tts.synthesize_stream(sanitize_for_speech(text)):
             yield chunk
             
     def get_cached_audio(self, text: str) -> Optional[bytes]:

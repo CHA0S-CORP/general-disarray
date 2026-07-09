@@ -73,12 +73,15 @@ class CallInfo:
     media_ready: bool = False
     stream_player: Any = None  # PlaylistPlayer
     record_file_pos: int = 0  # Track how much we've read from recording
-    
+    dtmf_buffer: deque = None  # Digits received via onDtmfDigit (PJSIP thread)
+
     def __post_init__(self):
         if self.audio_buffer is None:
             self.audio_buffer = deque(maxlen=1000)
         if self.playback_queue is None:
             self.playback_queue = deque()
+        if self.dtmf_buffer is None:
+            self.dtmf_buffer = deque(maxlen=32)
             
     @property
     def duration(self) -> float:
@@ -161,6 +164,14 @@ class SIPCall(pj.Call if PJSUA_AVAILABLE else object):
                     self.call_info.media_ready = True
                     logger.info("Audio media ready")
                 
+    def onDtmfDigit(self, prm):
+        """DTMF digit received (PJSIP thread). Buffered on the CallInfo so the
+        async side (choice collection) can poll it."""
+        digit = getattr(prm, 'digit', '')
+        if self.call_info and digit:
+            self.call_info.dtmf_buffer.append(digit)
+            logger.debug("DTMF digit received")
+
     def _cleanup_media(self):
         """Clean up media resources (PJSIP thread only)."""
         # Note: When call disconnects, PJSIP automatically disconnects all media.
@@ -273,7 +284,10 @@ class PlaylistPlayer:
         self._current_start: float = 0
         self._current_duration: float = 0
         self._stopped = False
-        
+        # Transient barge-in flush request (distinct from the terminal _stopped
+        # latch); picked up and cleared by the PJSIP thread in _poll_and_update.
+        self._flush_requested = False
+
         # PJSIP player reference (only accessed from PJSIP thread)
         self._pj_player: Any = None
         
@@ -281,7 +295,15 @@ class PlaylistPlayer:
     def is_playing(self) -> bool:
         with self._lock:
             return self._is_playing
-            
+
+    def has_audio(self) -> bool:
+        """True while a file is playing or queued — the assistant is audibly speaking."""
+        with self._lock:
+            if self._is_playing:
+                return True
+        return not self.file_queue.empty()
+
+
     def enqueue_file(self, file_path: str):
         """Add file to playback queue (thread-safe, any thread)."""
         if self._stopped:
@@ -314,7 +336,29 @@ class PlaylistPlayer:
                     pass
             except queue.Empty:
                 break
-                
+
+    def clear(self):
+        """Flush queued + in-progress playback WITHOUT terminating the player.
+
+        Used for barge-in: the caller interrupted, so drop everything queued and
+        stop whatever is currently playing, but keep the player usable so the
+        assistant's next turn can still be heard. Unlike stop_all(), this does
+        NOT latch _stopped, so subsequently-enqueued audio still plays.
+        """
+        # Drain queued files here (any thread). The active pj_player is torn down
+        # on the PJSIP thread when it picks up _flush_requested in _poll_and_update.
+        while True:
+            try:
+                file_path, _ = self.file_queue.get_nowait()
+                try:
+                    os.unlink(file_path)
+                except OSError:
+                    pass
+            except queue.Empty:
+                break
+        with self._lock:
+            self._flush_requested = True
+
     def _poll_and_update(self, pj_call: SIPCall):
         """
         Poll playback state and start next file if needed.
@@ -323,7 +367,19 @@ class PlaylistPlayer:
         if self._stopped:
             self._cleanup_player(pj_call)
             return
-            
+
+        # Transient barge-in flush: stop current playback and reset, but keep the
+        # player alive so later-enqueued audio still plays. Handled here (the only
+        # thread allowed to touch _pj_player) BEFORE the start-next logic below, so
+        # the old player is always torn down before a new file starts.
+        if self._flush_requested:
+            self._cleanup_player(pj_call)
+            self._delete_current_file()
+            with self._lock:
+                self._is_playing = False
+                self._current_file = None
+                self._flush_requested = False
+
         with self._lock:
             # Check if current file finished
             if self._is_playing and self._current_file:
@@ -633,12 +689,22 @@ class SIPHandler:
             
             # Main loop
             while self._running:
-                # Handle SIP events (50ms timeout)
-                self.endpoint.libHandleEvents(50)
-                
-                # Process our command queue
-                self._process_commands()
-                
+                # A transient error from libHandleEvents (it can raise pj.Error),
+                # a media/state callback, or command processing must NOT escape and
+                # kill this thread - that would silently stop answering calls while
+                # /health still reports healthy. Log and continue; only _running
+                # going False ends the loop.
+                try:
+                    # Handle SIP events (50ms timeout)
+                    self.endpoint.libHandleEvents(50)
+
+                    # Process our command queue
+                    self._process_commands()
+                except Exception as e:
+                    logger.error(f"PJSIP loop iteration error (continuing): {e}")
+                    # Avoid a hot error-spin if the failure is persistent.
+                    time.sleep(0.1)
+
             # Cleanup in PJSIP thread (after loop exits)
             logger.info("PJSIP thread shutting down...")
             try:
@@ -928,24 +994,52 @@ class SIPHandler:
             await asyncio.sleep(timeout)
             return None
         
-    async def send_audio(self, call_info: CallInfo, audio_data: bytes):
-        """Send audio to a call using the playlist player."""
-        if not call_info or not call_info.is_active:
-            return
-            
-        player = self.get_playlist_player(call_info)
-        
-        # Write to temp file
+    def _write_audio_tempfile(self, audio_data: bytes) -> str:
+        """Encode audio to a temp WAV file (blocking; run off the event loop)."""
         import tempfile
         fd, wav_path = tempfile.mkstemp(suffix='.wav', prefix='sip_out_')
         os.close(fd)
-        
+
         with wave.open(wav_path, 'wb') as wav:
             wav.setnchannels(1)
             wav.setsampwidth(2)
             wav.setframerate(self.config.sample_rate)
             wav.writeframes(audio_data)
-            
+
+        return wav_path
+
+    def get_dtmf_digit(self, call_info: CallInfo) -> Optional[str]:
+        """Pop the oldest buffered DTMF digit for this call, if any."""
+        buf = getattr(call_info, 'dtmf_buffer', None)
+        if buf:
+            try:
+                return buf.popleft()
+            except IndexError:
+                return None
+        return None
+
+    def clear_dtmf(self, call_info: CallInfo):
+        """Discard any buffered DTMF digits (e.g. before a new prompt)."""
+        buf = getattr(call_info, 'dtmf_buffer', None)
+        if buf:
+            buf.clear()
+
+    async def send_audio(self, call_info: CallInfo, audio_data: bytes):
+        """Send audio to a call using the playlist player."""
+        if not call_info or not call_info.is_active:
+            return
+
+        player = self.get_playlist_player(call_info)
+
+        # Offload the blocking mkstemp + WAV encode/write off the event loop
+        # (mirrors make_call/hangup_call) so inbound audio isn't blocked.
+        loop = asyncio.get_event_loop()
+        wav_path = await loop.run_in_executor(
+            None,
+            self._write_audio_tempfile,
+            audio_data
+        )
+
         # Enqueue for playback
         player.enqueue_file(wav_path)
 

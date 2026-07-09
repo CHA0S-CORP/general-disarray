@@ -7,11 +7,14 @@ Provides configurable retry logic with exponential backoff for API calls.
 import asyncio
 import logging
 import random
-from typing import TypeVar, Callable, Awaitable, Optional, Tuple, Type
+from typing import TypeVar, Callable, Awaitable, Optional, Tuple, Type, TYPE_CHECKING
 from functools import wraps
 
 from config import Config
 from telemetry import Metrics
+
+if TYPE_CHECKING:
+    import httpx
 
 logger = logging.getLogger(__name__)
 

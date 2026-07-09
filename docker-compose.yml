@@ -41,13 +41,16 @@ services:
       stack: 67108864
     command: >
       vllm serve
-      ${LLM_MODEL:-meta-llama/Llama-3.1-70B-Instruct}
+      ${LLM_MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507-FP8}
       --port 8000
       --gpu-memory-utilization 0.50
       --max-model-len 8192
       --trust-remote-code
+      ${VLLM_TOOL_ARGS---enable-auto-tool-choice --tool-call-parser hermes}
     ports:
-      - "8000:8000"
+      # Host-side publish is parameterized so the stack can coexist with other
+      # services on the box; in-cluster traffic uses http://vllm:8000 regardless.
+      - "${VLLM_PORT:-8000}:8000"
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
     healthcheck:
@@ -93,7 +96,7 @@ services:
       - UVICORN_PORT=8001
       # TTS is configured via API request parameters (model/voice)
     ports:
-      - "8001:8001"
+      - "${SPEACHES_PORT:-8001}:8001"
     volumes:
       - ./cache/speaches-cache:/home/ubuntu/.cache/huggingface/hub
       - ./cache/piper-voices:/home/ubuntu/.local/share/piper_voices
@@ -133,14 +136,37 @@ services:
       - REDIS_URL=redis://redis:6379/0
       # Call queue settings
       - CALL_QUEUE_MAX_CONCURRENT=${CALL_QUEUE_MAX_CONCURRENT:-1}
-      # LLM settings
-      - LLM_BACKEND=vllm
+      # LLM settings (LLM_BACKEND=langgraph enables the agentic engine)
+      - LLM_BACKEND=${LLM_BACKEND:-vllm}
       - LLM_BASE_URL=http://vllm:8000/v1
-      - LLM_MODEL=${LLM_MODEL:-meta-llama/Llama-3.1-70B-Instruct}
+      - LLM_MODEL=${LLM_MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507-FP8}
       - LLM_MAX_TOKENS=${LLM_MAX_TOKENS:-512}
       - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.6}
       - LLM_TOP_P=${LLM_TOP_P:-0.85}
-      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_API_KEY=${LLM_API_KEY:-not-needed}
+      - LLM_TOOL_CALLING=${LLM_TOOL_CALLING:-text}
+      - LLM_FREQUENCY_PENALTY=${LLM_FREQUENCY_PENALTY:-0.0}
+      - LLM_MAX_TOOL_ROUNDS=${LLM_MAX_TOOL_ROUNDS:-5}
+      - LLM_AGENT_TIMEOUT_S=${LLM_AGENT_TIMEOUT_S:-30.0}
+      - MESSAGE_REFORMAT_TIMEOUT_S=${MESSAGE_REFORMAT_TIMEOUT_S:-20.0}
+      # Conversation intelligence: caller memory / knowledge base / summary
+      - CALLER_MEMORY_ENABLED=${CALLER_MEMORY_ENABLED:-true}
+      - CALLER_MEMORY_MAX_FACTS=${CALLER_MEMORY_MAX_FACTS:-15}
+      - CALLER_MEMORY_MAX_CHARS=${CALLER_MEMORY_MAX_CHARS:-1500}
+      - CALLER_MEMORY_TIMEOUT_S=${CALLER_MEMORY_TIMEOUT_S:-30.0}
+      - KNOWLEDGE_ENABLED=${KNOWLEDGE_ENABLED:-true}
+      - KNOWLEDGE_EMBEDDING_MODEL=${KNOWLEDGE_EMBEDDING_MODEL:-BAAI/bge-small-en-v1.5}
+      - KNOWLEDGE_CHUNK_SIZE=${KNOWLEDGE_CHUNK_SIZE:-800}
+      - KNOWLEDGE_CHUNK_OVERLAP=${KNOWLEDGE_CHUNK_OVERLAP:-120}
+      - KNOWLEDGE_TOP_K=${KNOWLEDGE_TOP_K:-3}
+      - KNOWLEDGE_AUTO_INJECT=${KNOWLEDGE_AUTO_INJECT:-false}
+      - CONVERSATION_SUMMARY_ENABLED=${CONVERSATION_SUMMARY_ENABLED:-true}
+      - CONVERSATION_SUMMARY_TIMEOUT_S=${CONVERSATION_SUMMARY_TIMEOUT_S:-20.0}
+      # Single-line prompt override; multi-line prompts go in data/system_prompt.txt
+      - SYSTEM_PROMPT=${SYSTEM_PROMPT:-}
+      # Per-turn acknowledgment: chime (earcon, default) | phrase | none
+      - TURN_ACK_MODE=${TURN_ACK_MODE:-chime}
+      - CHIME_VOLUME=${CHIME_VOLUME:-0.3}
       - MAX_CONVERSATION_TURNS=${MAX_CONVERSATION_TURNS:-10}
       # Speaches API settings (unified STT + TTS)
       - SPEACHES_API_URL=http://speaches:8001
@@ -150,11 +176,15 @@ services:
       - MIN_SPEECH_DURATION_MS=${MIN_SPEECH_DURATION_MS:-200}
       - MAX_SPEECH_DURATION_S=${MAX_SPEECH_DURATION_S:-8.0}
       - SILENCE_TIMEOUT_MS=${SILENCE_TIMEOUT_MS:-750}
+      - BARGE_IN_MIN_DURATION=${BARGE_IN_MIN_DURATION:-400}
+      - STT_MODE=${STT_MODE:-batch}
+      - REALTIME_COMMIT_TIMEOUT_S=${REALTIME_COMMIT_TIMEOUT_S:-5.0}
       # TTS settings (Kokoro via Speaches - auto-downloaded on first use)
       - TTS_MODEL=${TTS_MODEL:-speaches-ai/Kokoro-82M-v1.0-ONNX}
       - TTS_VOICE=${TTS_VOICE:-af_heart}
       - TTS_RESPONSE_FORMAT=${TTS_RESPONSE_FORMAT:-wav}
       - TTS_SPEED=${TTS_SPEED:-1.0}
+      - TTS_SENTENCE_STREAMING=${TTS_SENTENCE_STREAMING:-true}
       # SIP settings
       - SIP_USER=${SIP_USER:-ai-assistant}
       - SIP_PASSWORD=${SIP_PASSWORD:-}
@@ -165,16 +195,51 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       # Tools
       - CALLBACK_RING_TIMEOUT=${CALLBACK_RING_TIMEOUT:-30}
+      - ENABLE_PLUGIN_AUTODISCOVERY=${ENABLE_PLUGIN_AUTODISCOVERY:-true}
       # Tempest Weather API (optional)
       - TEMPEST_STATION_ID=${TEMPEST_STATION_ID:-}
       - TEMPEST_API_TOKEN=${TEMPEST_API_TOKEN:-}
-      # API settings
-      - API_PORT=${API_PORT:-8080}
+      # API settings. The container always listens on 8080; API_PORT selects
+      # only the HOST-side port it is published on (see ports: below).
+      - API_PORT=8080
+      # In-container bind must stay 0.0.0.0 for the published port to work;
+      # actual exposure is decided by API_BIND_ADDRESS below.
+      - API_HOST=${API_HOST:-0.0.0.0}
+      # API security & limits
+      # API_BIND_ADDRESS is the HOST interface the API port is published on
+      # (see ports: below). The default 127.0.0.1 keeps the API off the network,
+      # so an empty API_AUTH_TOKEN is safe out of the box. To expose the API
+      # beyond this machine, set API_BIND_ADDRESS=0.0.0.0 AND set API_AUTH_TOKEN
+      # (the agent refuses to start exposed without a token unless
+      # ALLOW_UNAUTHENTICATED=true).
+      - API_BIND_ADDRESS=${API_BIND_ADDRESS:-127.0.0.1}
+      - API_AUTH_TOKEN=${API_AUTH_TOKEN:-}
+      - ALLOW_UNAUTHENTICATED=${ALLOW_UNAUTHENTICATED:-false}
+      - WEBHOOK_ALLOW_PRIVATE=${WEBHOOK_ALLOW_PRIVATE:-false}
+      - WEBHOOK_REQUIRE_HTTPS=${WEBHOOK_REQUIRE_HTTPS:-false}
+      - WEBHOOK_SIGNING_SECRET=${WEBHOOK_SIGNING_SECRET:-}
+      # Call-lifecycle events: POST call.started/call.ended to this URL
+      # (empty = off). http://n8n:5678/... needs WEBHOOK_ALLOW_PRIVATE=true.
+      - CALL_EVENT_WEBHOOK_URL=${CALL_EVENT_WEBHOOK_URL:-}
+      - CALL_EVENTS=${CALL_EVENTS:-call.started,call.ended}
+      - CALL_EVENT_INCLUDE_TRANSCRIPT=${CALL_EVENT_INCLUDE_TRANSCRIPT:-true}
+      - OUTBOUND_ALLOW_SIP_URI=${OUTBOUND_ALLOW_SIP_URI:-false}
+      - OUTBOUND_EXTENSION_PATTERN=${OUTBOUND_EXTENSION_PATTERN:-}
+      - AMD_ENABLED=${AMD_ENABLED:-false}
+      - AMD_WINDOW_S=${AMD_WINDOW_S:-2.5}
+      - AMD_MACHINE_SPEECH_MS=${AMD_MACHINE_SPEECH_MS:-1500}
+      - RATE_LIMIT_RPM=${RATE_LIMIT_RPM:-0}
+      - RATE_LIMIT_BURST=${RATE_LIMIT_BURST:-0}
+      - MAX_RING_TIMEOUT_S=${MAX_RING_TIMEOUT_S:-120}
+      - MAX_CHOICE_TIMEOUT_S=${MAX_CHOICE_TIMEOUT_S:-120}
+      - MAX_CHOICE_REPEAT=${MAX_CHOICE_REPEAT:-5}
+      - MAX_QUEUE_DEPTH=${MAX_QUEUE_DEPTH:-1000}
+      - MAX_DIRECT_CONCURRENT_CALLS=${MAX_DIRECT_CONCURRENT_CALLS:-20}
     ports:
       - "5060:5060/udp"
       - "5060:5060/tcp"
       - "10000-10100:10000-10100/udp"  # RTP ports
-      - ${API_PORT:-8080}:8080                    # API server port
+      - ${API_BIND_ADDRESS:-127.0.0.1}:${API_PORT:-8080}:8080   # API server port (loopback-only by default; see API_BIND_ADDRESS)
     volumes:
       - ./data:/app/data
     restart: unless-stopped

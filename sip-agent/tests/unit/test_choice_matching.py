@@ -50,3 +50,30 @@ def test_matches(matcher, yes_no_options, spoken, expected):
 )
 def test_no_false_positive(matcher, yes_no_options, spoken):
     assert matcher._match_choice(spoken, yes_no_options) is None
+
+
+# --- DTMF matching -----------------------------------------------------------
+
+def test_dtmf_matches_positional(matcher, yes_no_options):
+    # Options without an explicit dtmf key answer to their 1-based position.
+    assert matcher._match_dtmf("1", yes_no_options) == "yes"
+    assert matcher._match_dtmf("2", yes_no_options) == "no"
+    assert matcher._match_dtmf("3", yes_no_options) is None
+
+
+def test_dtmf_explicit_key_wins(matcher):
+    options = [
+        ChoiceOption(value="confirm", dtmf="9"),
+        ChoiceOption(value="cancel"),
+    ]
+    assert matcher._match_dtmf("9", options) == "confirm"
+    # "1" no longer selects the first option — it opted out of positional.
+    assert matcher._match_dtmf("1", options) is None
+    # The second option still answers positionally.
+    assert matcher._match_dtmf("2", options) == "cancel"
+
+
+def test_dtmf_star_and_hash(matcher):
+    options = [ChoiceOption(value="repeat", dtmf="*"), ChoiceOption(value="operator", dtmf="#")]
+    assert matcher._match_dtmf("*", options) == "repeat"
+    assert matcher._match_dtmf("#", options) == "operator"

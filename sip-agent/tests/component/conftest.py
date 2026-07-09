@@ -84,6 +84,17 @@ def comp_config(config_factory, speaches_url, vllm_url):
     )
 
 
+class StubLLMEngine:
+    """Recording stub for the reformat_for_speech API surface."""
+
+    def __init__(self):
+        self.reformat_calls = []
+
+    async def reformat_for_speech(self, text, timeout_s):
+        self.reformat_calls.append(text)
+        return f"SPOKEN {text}"
+
+
 class FakeAssistant:
     """Minimal stand-in for SIPAIAssistant: real ToolManager, stub SIP."""
 
@@ -93,10 +104,13 @@ class FakeAssistant:
         # No `_registered` attr -> /health reports sip_registered: False.
         self.sip_handler = SimpleNamespace()
         self.audio_pipeline = None
+        self.llm_engine = StubLLMEngine()
         self.scheduled_callbacks = []
         # Import here so `src` is on sys.path (set by the root conftest).
         from tool_manager import ToolManager
+        from transcript_store import TranscriptStore
         self.tool_manager = ToolManager(self)
+        self.transcripts = TranscriptStore(config)
 
     async def schedule_callback(self, delay, message, destination):
         self.scheduled_callbacks.append((delay, message, destination))

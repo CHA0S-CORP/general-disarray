@@ -136,8 +136,9 @@ class WeatherTool(BaseTool):
             feels_like_f = round(feels_like_c * 9/5 + 32) if feels_like_c is not None else temp_f
             
             # Determine conditions based on solar radiation and time
-            solar = obs.get("solar_radiation", 0)
-            brightness = obs.get("brightness", 0)
+            # Use `or 0` so an explicit null (present-but-None) doesn't break comparisons
+            solar = obs.get("solar_radiation") or 0
+            brightness = obs.get("brightness") or 0
             
             if solar == 0 and brightness == 0:
                 condition = ""
@@ -196,10 +197,10 @@ class WeatherTool(BaseTool):
                 parts.append(wind_str)
         
         # Precipitation
-        precip_now = obs.get("precip", 0)
-        precip_hour = obs.get("precip_accum_last_1hr", 0)
-        precip_today = obs.get("precip_accum_local_day", 0)
-        precip_yesterday = obs.get("precip_accum_local_yesterday_final", 0)
+        precip_now = obs.get("precip") or 0
+        precip_hour = obs.get("precip_accum_last_1hr") or 0
+        precip_today = obs.get("precip_accum_local_day") or 0
+        precip_yesterday = obs.get("precip_accum_local_yesterday_final") or 0
         
         if precip_now and precip_now > 0:
             intensity = "lightly" if precip_now < 0.5 else "moderately" if precip_now < 2 else "heavily"
@@ -283,10 +284,10 @@ class WeatherTool(BaseTool):
             "wind_mph": round(wind * 2.237) if wind is not None else None,
             "wind_gust_mph": round(gust * 2.237) if gust is not None else None,
             "wind_direction": obs.get("wind_direction"),
-            "precip_today_in": round(obs.get("precip_accum_local_day", 0) * 0.0394, 2),
+            "precip_today_in": round((obs.get("precip_accum_local_day") or 0) * 0.0394, 2),
             "uv": obs.get("uv"),
             "pressure_mb": obs.get("barometric_pressure"),
             "pressure_trend": obs.get("pressure_trend"),
             "lightning_1hr": obs.get("lightning_strike_count_last_1hr"),
-            "dew_point_f": round(obs.get("dew_point", 0) * 9/5 + 32) if obs.get("dew_point") else None,
+            "dew_point_f": round(dp * 9/5 + 32) if (dp := obs.get("dew_point")) is not None else None,
         }

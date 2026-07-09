@@ -33,6 +33,10 @@ class CalculatorTool(BaseTool):
         }
     }
     
+    # Bounds for exponentiation to prevent CPU/memory DoS via huge powers.
+    MAX_EXPONENT = 1000
+    MAX_POW_BASE = 1_000_000
+
     # Allowed operators for safe evaluation
     ALLOWED_OPERATORS = {
         ast.Add: operator.add,
@@ -48,20 +52,23 @@ class CalculatorTool(BaseTool):
     
     def _safe_eval(self, node):
         """Safely evaluate an AST node."""
-        if isinstance(node, ast.Constant):  # Python 3.8+
-            if isinstance(node.value, (int, float)):
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
                 return node.value
             raise ValueError(f"Invalid constant: {node.value}")
-            
-        elif isinstance(node, ast.Num):  # Python 3.7 compatibility
-            return node.n
-            
+
         elif isinstance(node, ast.BinOp):
             op_type = type(node.op)
             if op_type not in self.ALLOWED_OPERATORS:
                 raise ValueError(f"Operator not allowed: {op_type.__name__}")
             left = self._safe_eval(node.left)
             right = self._safe_eval(node.right)
+            # Bound exponentiation: huge exponents (e.g. "9**9**9**9") produce
+            # multi-million-digit integers that pin the CPU and balloon memory,
+            # blocking the event loop. Reject anything that could be abusive.
+            if op_type is ast.Pow:
+                if abs(right) > self.MAX_EXPONENT or abs(left) > self.MAX_POW_BASE:
+                    raise ValueError("Exponent or base too large")
             return self.ALLOWED_OPERATORS[op_type](left, right)
             
         elif isinstance(node, ast.UnaryOp):
@@ -104,8 +111,10 @@ class CalculatorTool(BaseTool):
                     result = int(result)
                     result_str = str(result)
                 else:
-                    # Round to reasonable precision
-                    result_str = f"{result:.6g}"
+                    # 12 significant digits keeps real precision (123456.789,
+                    # 1000000.5) while rounding away binary-float noise so TTS
+                    # doesn't read "0.30000000000000004" aloud for 0.1+0.2.
+                    result_str = f"{result:.12g}"
             else:
                 result_str = str(result)
                 

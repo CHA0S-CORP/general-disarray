@@ -15,11 +15,15 @@ import io
 import wave
 
 import numpy as np
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import Response
 
 # Deterministic transcript returned for every STT request. Tests assert on this.
 MOCK_TRANSCRIPT = "the eagle has landed"
+
+# Input texts received by /v1/audio/speech, newest last. Tests that assert on
+# what actually reached TTS (e.g. sanitizer behavior) read and clear this.
+TTS_REQUESTS = []
 
 
 def make_wav(duration_s: float = 0.4, rate: int = 24000, freq: float = 220.0) -> bytes:
@@ -57,7 +61,9 @@ def build_app() -> FastAPI:
         return {"status": "ok", "id": model_id}
 
     @app.post("/v1/audio/speech")
-    async def speech():
+    async def speech(request: Request):
+        body = await request.json()
+        TTS_REQUESTS.append(body.get("input", ""))
         return Response(content=make_wav(), media_type="audio/wav")
 
     @app.post("/v1/audio/transcriptions")

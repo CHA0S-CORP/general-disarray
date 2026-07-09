@@ -6,12 +6,13 @@ Prevents overwhelming the SIP system when multiple calls are requested.
 """
 
 import os
+import time
 import json
 import asyncio
 import logging
-from typing import Optional, Dict, Any, TYPE_CHECKING
+from typing import Optional, Dict, Any, Set, TYPE_CHECKING
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 
 import redis.asyncio as redis
@@ -23,6 +24,11 @@ from telemetry import Metrics
 from logging_utils import log_event
 
 logger = logging.getLogger(__name__)
+
+
+def _utcnow_iso() -> str:
+    """Timezone-aware UTC timestamp (datetime.utcnow is deprecated)."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 class QueuedCallStatus(str, Enum):
@@ -89,6 +95,9 @@ class CallQueue:
         self._handler: Optional['OutboundCallHandler'] = None
         self._running = False
         self._semaphore: Optional[asyncio.Semaphore] = None
+        # Strong references to in-flight call-processing tasks so they are not
+        # garbage-collected mid-call and can be cancelled/awaited on stop().
+        self._tasks: Set[asyncio.Task] = set()
         
     async def connect(self):
         """Connect to Redis with optional authentication."""
@@ -143,7 +152,16 @@ class CallQueue:
                 await self._worker_task
             except asyncio.CancelledError:
                 pass
-                
+
+        # Cancel and await any in-flight call-processing tasks BEFORE the
+        # caller disconnects Redis, so each task's finally-block can clear the
+        # PROCESSING_KEY entry and persist final status while Redis is still up.
+        if self._tasks:
+            pending = list(self._tasks)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
         logger.info("Call queue stopped")
         
     async def enqueue(self, call_id: str, request: 'OutboundCallRequest') -> QueuedCall:
@@ -152,7 +170,7 @@ class CallQueue:
             call_id=call_id,
             request_json=request.model_dump_json(),
             status=QueuedCallStatus.QUEUED,
-            queued_at=datetime.utcnow().isoformat()
+            queued_at=_utcnow_iso()
         )
         
         # Store call data
@@ -218,43 +236,66 @@ class CallQueue:
         """Process calls from the queue."""
         while self._running:
             try:
-                # Try to get a call from queue (blocking with timeout)
-                result = await self.redis.blpop(self.QUEUE_KEY, timeout=1)
-                
-                if result is None:
-                    continue
-                    
-                _, call_id = result
-                
-                # Mark as processing
-                await self.redis.sadd(self.PROCESSING_KEY, call_id)
-                
-                # Spawn a task that will acquire semaphore and process
-                asyncio.create_task(self._process_call_with_semaphore(call_id))
-                    
+                # Acquire a processing slot BEFORE pulling a call from the queue
+                # so a call is only popped (and marked processing) when a slot is
+                # actually free. This keeps the PROCESSING_KEY count accurate and
+                # avoids draining the whole queue into the processing set at once.
+                slot_start = time.monotonic()
+                await self._semaphore.acquire()
+                wait_time = time.monotonic() - slot_start
+
+                try:
+                    # Try to get a call from queue (blocking with timeout)
+                    result = await self.redis.blpop(self.QUEUE_KEY, timeout=1)
+
+                    if result is None:
+                        # No call available; release the slot and retry.
+                        self._semaphore.release()
+                        continue
+
+                    _, call_id = result
+
+                    # Mark as processing
+                    await self.redis.sadd(self.PROCESSING_KEY, call_id)
+
+                    # Spawn the processing task (it releases the slot when done).
+                    # Keep a strong ref so it isn't GC'd and can be awaited on stop.
+                    task = asyncio.create_task(
+                        self._process_call_with_semaphore(call_id, wait_time)
+                    )
+                    self._tasks.add(task)
+                    task.add_done_callback(self._tasks.discard)
+                except BaseException:
+                    # If we failed before handing the slot to a task, release it
+                    # so the slot is not leaked (re-raise for the handlers below).
+                    self._semaphore.release()
+                    raise
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Queue worker error: {e}", exc_info=True)
                 await asyncio.sleep(1)
-    
-    async def _process_call_with_semaphore(self, call_id: str):
-        """Acquire semaphore and process call - semaphore held for entire call duration."""
-        import time
-        start = time.monotonic()
-        
-        async with self._semaphore:
-            wait_time = time.monotonic() - start
+
+    async def _process_call_with_semaphore(self, call_id: str, wait_time: float = 0.0):
+        """Process a call and release the processing slot when finished.
+
+        The semaphore is acquired by the worker loop before the call is popped;
+        this task owns it and releases it in the finally block.
+        """
+        try:
             wait_time_ms = wait_time * 1000
-            
+
             # Record queue wait time metric
             Metrics.record_queue_wait_time(wait_time_ms)
-            
+
             if wait_time > 0.1:  # Log if waited more than 100ms
                 log_event(logger, logging.INFO, f"Call {call_id} waited {wait_time:.1f}s for slot",
                          event="call_waited", call_id=call_id, wait_seconds=round(wait_time, 1))
-            
+
             await self._process_call(call_id)
+        finally:
+            self._semaphore.release()
                 
     async def _process_call(self, call_id: str):
         """Process a single call."""
@@ -268,7 +309,7 @@ class CallQueue:
                 
             # Update status
             call.status = QueuedCallStatus.PROCESSING
-            call.started_at = datetime.utcnow().isoformat()
+            call.started_at = _utcnow_iso()
             await self.redis.set(
                 f"{self.CALL_PREFIX}{call_id}",
                 json.dumps(call.to_dict()),
@@ -282,19 +323,27 @@ class CallQueue:
             from api import OutboundCallRequest
             request = OutboundCallRequest.model_validate_json(call.request_json)
             
-            # Execute the call
-            await self._handler._execute_call(call_id, request)
-            
-            # Update status
-            call.status = QueuedCallStatus.COMPLETED
-            call.completed_at = datetime.utcnow().isoformat()
+            # Execute the call. Expected failures (initiate failure, no
+            # answer) don't raise — the final CallStatus is returned instead,
+            # so persist the real outcome rather than blanket COMPLETED.
+            # A handler returning None (e.g. a test stub) counts as success,
+            # matching the old no-exception-means-completed contract.
+            result = await self._handler._execute_call(call_id, request)
+            final_status, error = result if result is not None else (None, None)
+
+            if final_status is None or final_status.value == "completed":
+                call.status = QueuedCallStatus.COMPLETED
+            else:
+                call.status = QueuedCallStatus.FAILED
+                call.error = error or f"Call ended with status '{final_status.value}'"
+            call.completed_at = _utcnow_iso()
             
         except Exception as e:
             logger.error(f"Call {call_id} failed: {e}", exc_info=True)
             if call:
                 call.status = QueuedCallStatus.FAILED
                 call.error = str(e)
-                call.completed_at = datetime.utcnow().isoformat()
+                call.completed_at = _utcnow_iso()
                 
         finally:
             # Remove from processing set

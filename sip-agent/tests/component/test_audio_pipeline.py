@@ -60,3 +60,9 @@ async def test_process_audio_returns_transcript_on_end_of_utterance(pipeline):
         if result:
             break
     assert result == MOCK_TRANSCRIPT
+
+
+async def test_synthesize_sanitizes_text_for_tts(pipeline):
+    import mock_speaches
+    await pipeline.synthesize("**bold** hi 🎉")
+    assert mock_speaches.TTS_REQUESTS[-1] == "bold hi"

@@ -5,12 +5,15 @@ Handles LLM inference with tool calling support.
 Supports multiple backends: vLLM, Ollama, LM Studio.
 """
 
+import asyncio
+import json
+import random
 import re
 import time
 import logging
 from datetime import datetime
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
 
 try:
     from openai import AsyncOpenAI
@@ -25,12 +28,32 @@ except ImportError:
     HTTPX_AVAILABLE = False
 
 from config import Config
+from logging_utils import log_event
 from telemetry import create_span, Metrics
+
+if TYPE_CHECKING:
+    from tool_manager import ToolManager
 
 
 
 
 logger = logging.getLogger(__name__)
+
+
+_REFORMAT_SYSTEM_PROMPT = """Rewrite the user's message so it can be read aloud naturally by a text-to-speech engine on a phone call.
+Preserve EVERY piece of information: numbers, names, identifiers, dates, times, quantities, statuses. Do not summarize, do not drop details, do not add commentary or greetings.
+- Say dates, times, and numbers the way a person would: "July eighth at five oh three PM", "ninety-nine point two percent".
+- Speak URLs as just their site name ("the Grafana dashboard", "example dot com"); spell out short IDs and codes letter by letter or digit by digit.
+- Expand abbreviations and symbols ("ms" -> "milliseconds", "%" -> "percent", "&" -> "and").
+- Plain spoken prose only: no markdown, bullets, emoji, or headings.
+Output ONLY the rewritten message."""
+
+
+def _format_caller(remote_uri: str) -> str:
+    """'sip:1001@pbx' / '"Bob" <sip:1001@pbx>' -> '1001'; falls back to raw."""
+    m = re.search(r'sips?:([^@;>\s]+)', remote_uri or "")
+    return m.group(1) if m else (remote_uri or "unknown")
+
 
 @dataclass
 class ToolCall:
@@ -100,28 +123,42 @@ class LLMEngine:
         )
         
         # Generate response
-        response_text = await self._generate(messages)
-        
-        # Parse and execute any tool calls
+        if self._native_tools_active():
+            response_text = await self._generate_native(messages)
+        else:
+            response_text = await self._generate(messages)
+
+        # Parse and execute any text-marker tool calls. This also runs in
+        # native mode as a safety net for models that ignore the tools param
+        # and emit [TOOL:...] markers anyway.
+        return await self._apply_marker_tools(response_text)
+
+    async def _apply_marker_tools(self, response_text: str) -> str:
+        """Execute [TOOL:...] markers in a reply and fold in spoken results.
+
+        Shared marker postprocess used by every generation path (classic,
+        native safety net, langgraph agent).
+        """
         response_text, tool_results = await self._process_tool_calls(response_text)
-        
+
         # Append results from informational tools (like WEATHER)
         # These tools return data that should be spoken to the user
         for result in tool_results:
             tool_name = result.get("tool", "")
             tool_result = result.get("result")
-            
+
             # For informational tools, append the result message
-            if tool_name in ("WEATHER", "STATUS", "JOKE", "DATETIME", "CALC", "SIMON_SAYS") and tool_result:
+            if tool_name in ("WEATHER", "STATUS", "JOKE", "DATETIME", "CALC", "SIMON_SAYS", "KNOWLEDGE") and tool_result:
                 if hasattr(tool_result, 'message') and tool_result.message:
                     # Add the result to the response
                     if response_text:
                         response_text = f"{response_text} {tool_result.message}"
                     else:
                         response_text = tool_result.message
-            
+
         return response_text
-        
+
+
     def _build_system_prompt(self, call_context: Optional[Dict[str, Any]] = None) -> str:
         """Build system prompt with dynamic context and tools."""
         prompt = self.config.system_prompt
@@ -133,15 +170,262 @@ class LLMEngine:
         # Add call context
         if call_context:
             prompt += f"\n\nCall information:"
-            prompt += f"\n- Caller: {call_context.get('remote_uri', 'unknown')}"
-            prompt += f"\n- Duration: {call_context.get('duration', 0):.0f} seconds"
-            
-        # Add dynamic tools section from ToolManager
-        tools_prompt = self.tool_manager.get_tools_prompt()
-        if tools_prompt:
-            prompt += f"\n\n{tools_prompt}"
-            
+            prompt += f"\n- Caller: {_format_caller(call_context.get('remote_uri', 'unknown'))}"
+            prompt += f"\n- Call length so far: {call_context.get('duration', 0):.0f} seconds"
+
+            # Cross-call caller memory (loaded at call start, engine-agnostic).
+            memory = call_context.get("caller_memory")
+            if memory:
+                prompt += (
+                    "\n\nWhat you remember about this caller from previous calls"
+                    " (use naturally, don't recite):\n" + memory)
+
+            # Rolling summary of earlier turns that no longer fit the window.
+            summary = call_context.get("conversation_summary")
+            if summary:
+                prompt += "\n\nConversation so far (earlier in this call):\n" + summary
+
+            # Optional auto-injected knowledge-base excerpts for this turn.
+            knowledge = call_context.get("knowledge_context")
+            if knowledge:
+                prompt += (
+                    "\n\nRelevant excerpts from your knowledge base:\n" + knowledge)
+
+
+        # Add dynamic tools section from ToolManager. In native mode the tool
+        # schemas travel in the request's `tools` param instead — including the
+        # [TOOL:...] marker instructions there would just confuse the model.
+        if not self._native_tools_active():
+            tools_prompt = self.tool_manager.get_tools_prompt()
+            if tools_prompt:
+                prompt += f"\n\n{tools_prompt}"
+
         return prompt
+
+    def _sampling_kwargs(self) -> Dict[str, Any]:
+        """Sampling params shared by both generation paths.
+
+        frequency_penalty is included only when nonzero so backends that
+        reject the param are unaffected at the default setting.
+        """
+        kwargs: Dict[str, Any] = {
+            "model": self.config.llm_model,
+            "max_tokens": self.config.llm_max_tokens,
+            "temperature": self.config.llm_temperature,
+            "top_p": self.config.llm_top_p,
+        }
+        if self.config.llm_frequency_penalty:
+            kwargs["frequency_penalty"] = self.config.llm_frequency_penalty
+        return kwargs
+
+    def _fallback_error(self) -> str:
+        """A configurable spoken fallback for generic LLM failures."""
+        return random.choice(self.config.phrases.errors)
+
+    async def reformat_for_speech(self, text: str, timeout_s: float) -> str:
+        """Rewrite `text` into natural spoken form, preserving all facts.
+
+        Fail-open: any failure (no client, timeout, error, suspicious result)
+        returns the original text — a call must never be blocked or corrupted
+        by the reformatter.
+        """
+        if not text or not text.strip():
+            return text
+        # Requires the OpenAI-compatible client (vLLM/LM Studio). Backends
+        # without it (Ollama override, mock mode) skip the rewrite entirely.
+        if self.client is None:
+            return text
+
+        # Reformat-specific request shape, NOT the conversation sampling:
+        # - Reasoning models (e.g. gpt-oss) spend hundreds of tokens thinking
+        #   before the rewrite, so the conversation budget (LLM_MAX_TOKENS) is
+        #   far too small — an exhausted budget means empty content.
+        # - They also misbehave under constrained sampling (temp/top_p tuned
+        #   for conversation makes gpt-oss deliberate for 30+ seconds and then
+        #   echo the input verbatim); the model's server-side defaults rewrite
+        #   quickly and well, so temperature/top_p are deliberately omitted.
+        kwargs: Dict[str, Any] = {
+            "model": self.config.llm_model,
+            "max_tokens": max(self.config.llm_max_tokens, 2048),
+        }
+        try:
+            response = await asyncio.wait_for(
+                self.client.chat.completions.create(
+                    messages=[
+                        {"role": "system", "content": _REFORMAT_SYSTEM_PROMPT},
+                        {"role": "user", "content": text},
+                    ],
+                    **kwargs,
+                ),
+                timeout=timeout_s,
+            )
+            result = response.choices[0].message.content
+        except (asyncio.TimeoutError, Exception) as e:
+            log_event(logger, logging.WARNING,
+                      f"Message reformat failed ({type(e).__name__}); using original",
+                      event="message_reformat", outcome="error",
+                      chars_in=len(text))
+            return text
+
+        if (not result or not result.strip()
+                or "[TOOL:" in result):
+            log_event(logger, logging.WARNING,
+                      "Message reformat produced no usable rewrite; using original",
+                      event="message_reformat", outcome="rejected",
+                      chars_in=len(text))
+            return text
+
+        result = result.strip()
+        log_event(logger, logging.INFO,
+                  f"Message reformatted for speech ({len(text)} -> {len(result)} chars)",
+                  event="message_reformat", outcome="ok",
+                  chars_in=len(text), chars_out=len(result))
+        return result
+
+    async def summarize_text(self, system_prompt: str, text: str,
+                             timeout_s: float) -> Optional[str]:
+        """Run a one-shot utility completion (summaries, fact extraction).
+
+        Returns the model's text, or None on any failure — callers treat None
+        as "keep what you had" (fail-open). Same request shape rationale as
+        reformat_for_speech: generous token budget for reasoning models,
+        server-default sampling.
+        """
+        if not text or not text.strip() or self.client is None:
+            return None
+        kwargs: Dict[str, Any] = {
+            "model": self.config.llm_model,
+            "max_tokens": max(self.config.llm_max_tokens, 2048),
+        }
+        try:
+            response = await asyncio.wait_for(
+                self.client.chat.completions.create(
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": text},
+                    ],
+                    **kwargs,
+                ),
+                timeout=timeout_s,
+            )
+            result = response.choices[0].message.content
+        except (asyncio.TimeoutError, Exception) as e:
+            log_event(logger, logging.WARNING,
+                      f"Utility summarization failed ({type(e).__name__})",
+                      event="summarize_text", outcome="error",
+                      chars_in=len(text))
+            return None
+        if not result or not result.strip() or "[TOOL:" in result:
+            return None
+        return result.strip()
+
+    def _native_tools_active(self) -> bool:
+        """True when native OpenAI function calling should be used."""
+        return (self.config.llm_tool_calling.lower() == "native"
+                and self.client is not None)
+
+    def _build_native_tools(self) -> List[Dict[str, Any]]:
+        """Convert registered tools into OpenAI function-calling schemas."""
+        tools = []
+        for name, tool in self.tool_manager.tools.items():
+            if not getattr(tool, "enabled", True):
+                continue
+            properties: Dict[str, Any] = {}
+            required: List[str] = []
+            for pname, spec in (getattr(tool, "parameters", {}) or {}).items():
+                prop: Dict[str, Any] = {"type": spec.get("type", "string")}
+                if spec.get("description"):
+                    prop["description"] = spec["description"]
+                properties[pname] = prop
+                if spec.get("required"):
+                    required.append(pname)
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": getattr(tool, "description", ""),
+                    "parameters": {
+                        "type": "object",
+                        "properties": properties,
+                        "required": required,
+                    },
+                },
+            })
+        return tools
+
+    async def _generate_native(self, messages: List[Dict[str, Any]]) -> str:
+        """Native function-calling loop (LLM_TOOL_CALLING=native).
+
+        Sends tool schemas via the OpenAI `tools` param, executes any returned
+        tool_calls through the ToolManager, feeds results back as `tool`
+        messages, and repeats until the model answers in plain text.
+        """
+        tools = self._build_native_tools()
+        messages = list(messages)
+        # Bound on tool-call round trips per turn so a model that keeps asking
+        # for tools can't loop forever on a live phone call.
+        max_rounds = self.config.llm_max_tool_rounds
+
+        with create_span("llm.generate_native", {
+            "llm.model": self.config.llm_model,
+            "llm.tools_count": len(tools),
+        }) as span:
+            try:
+                for round_no in range(max_rounds):
+                    start_time = time.time()
+                    response = await self.client.chat.completions.create(
+                        messages=messages,
+                        tools=tools or None,
+                        **self._sampling_kwargs(),
+                    )
+                    Metrics.record_llm_latency(
+                        (time.time() - start_time) * 1000, self.config.llm_model)
+
+                    msg = response.choices[0].message
+                    tool_calls = getattr(msg, "tool_calls", None)
+                    if not tool_calls:
+                        span.set_attribute("llm.tool_rounds", round_no)
+                        content = msg.content
+                        if content is None or not content.strip():
+                            logger.warning("LLM returned empty content in native mode")
+                            return self._fallback_error()
+                        return content.strip()
+
+                    messages.append({
+                        "role": "assistant",
+                        "content": msg.content,
+                        "tool_calls": [tc.model_dump() for tc in tool_calls],
+                    })
+                    for tc in tool_calls:
+                        try:
+                            params = json.loads(tc.function.arguments or "{}")
+                        except json.JSONDecodeError:
+                            params = {}
+                        try:
+                            result = await self.tool_manager.execute_tool(ToolCall(
+                                name=tc.function.name,
+                                params=params,
+                                raw=tc.function.arguments or "",
+                            ))
+                            result_text = getattr(result, "message", "") or ""
+                        except Exception as e:
+                            logger.error(f"Native tool execution error: {e}")
+                            result_text = f"Tool {tc.function.name} failed."
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": result_text,
+                        })
+
+                span.set_attribute("llm.tool_rounds", max_rounds)
+                logger.warning("Native tool-calling hit the round limit without a final answer")
+                return "I'm sorry, that request took too many steps. Could you try again?"
+
+            except Exception as e:
+                logger.error(f"LLM native generation error: {e}")
+                span.record_exception(e)
+                Metrics.record_llm_error(self.config.llm_model, type(e).__name__)
+                return self._fallback_error()
         
     async def _generate(self, messages: List[Dict[str, str]]) -> str:
         """Call the LLM to generate a response."""
@@ -158,11 +442,8 @@ class LLMEngine:
             first_token_time = None
             try:
                 response = await self.client.chat.completions.create(
-                    model=self.config.llm_model,
                     messages=messages,
-                    max_tokens=self.config.llm_max_tokens,
-                    temperature=self.config.llm_temperature,
-                    top_p=self.config.llm_top_p
+                    **self._sampling_kwargs(),
                 )
                 
                 end_time = time.time()
@@ -210,8 +491,8 @@ class LLMEngine:
                     # without more tokens, so we give a polite error.
                     if finish_reason == 'length':
                         return "I'm sorry, I was thinking too hard and ran out of time. Could you ask that again?"
-                    
-                    return "I didn't catch that. Could you repeat it?"
+
+                    return self._fallback_error()
 
                 span.set_attribute("llm.response_length", len(content))
                 return content
@@ -220,7 +501,7 @@ class LLMEngine:
                 logger.error(f"LLM generation error: {e}")
                 span.record_exception(e)
                 Metrics.record_llm_error(self.config.llm_model, type(e).__name__)
-                return "I'm sorry, I'm having trouble processing that. Could you try again?"
+                return self._fallback_error()
             
     def _mock_response(self, messages: List[Dict[str, str]]) -> str:
         """Generate mock response when LLM unavailable."""
@@ -257,8 +538,11 @@ class LLMEngine:
             params_str = match.group(2)
             
             # Parse parameters
+            # Split only on commas that immediately precede a `key=` token, so
+            # commas inside a value (e.g. timer/callback messages) are preserved
+            # rather than truncating the value and dropping trailing fragments.
             params = {}
-            for param in params_str.split(','):
+            for param in re.split(r',(?=\s*\w+=)', params_str):
                 if '=' in param:
                     key, value = param.split('=', 1)
                     value = self._parse_param_value(value)
@@ -323,25 +607,24 @@ class LLMEngine:
     def _parse_param_value(self, value: str) -> Any:
         """Parse parameter value to appropriate type."""
         value = value.strip()
-        
-        # Try integer
-        try:
-            return int(value)
-        except ValueError:
-            pass
-            
-        # Try float
-        try:
-            return float(value)
-        except ValueError:
-            pass
-            
+
         # Try boolean
         if value.lower() in ('true', 'yes'):
             return True
         if value.lower() in ('false', 'no'):
             return False
-            
+
+        # Only coerce numbers that can't be identifiers. Phone numbers (leading
+        # "+") and area/zip codes (leading "0" padding) must stay strings so the
+        # original value is preserved and the right number is dialed.
+        # Canonical int: optional "-", then "0" or a non-zero-leading run of digits.
+        if re.fullmatch(r'-?(?:0|[1-9]\d*)', value):
+            return int(value)
+        # Float: non-zero-padded integer part with optional/leading/trailing dot
+        # (".5", "5.", "1.25") and an optional exponent ("1e2", "1.5E-3").
+        if re.fullmatch(r'-?(?:(?:0|[1-9]\d*)(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?', value):
+            return float(value)
+
         # Return as string
         return value
 
@@ -401,10 +684,22 @@ class LMStudioEngine(LLMEngine):
 def create_llm_engine(config: Config, tool_manager: 'ToolManager') -> LLMEngine:
     """Create appropriate LLM engine based on config."""
     backend = config.llm_backend.lower()
-    
+
     if backend == "ollama":
         return OllamaEngine(config, tool_manager)
     elif backend == "lmstudio":
         return LMStudioEngine(config, tool_manager)
+    elif backend == "langgraph":
+        # Agentic engine (multi-step tool reasoning via LangGraph). Optional
+        # dependency: fall back to the classic engine when not installed so a
+        # slim image still runs.
+        try:
+            from langchain_engine import LangChainEngine
+            return LangChainEngine(config, tool_manager)
+        except ImportError as e:
+            logger.warning(
+                f"LLM_BACKEND=langgraph but LangChain deps unavailable ({e}); "
+                "falling back to the classic engine")
+            return LLMEngine(config, tool_manager)
     else:  # vllm or default
         return LLMEngine(config, tool_manager)

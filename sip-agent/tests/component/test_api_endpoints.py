@@ -18,6 +18,34 @@ def test_health(client):
     assert body["sip_registered"] is False
 
 
+def test_call_transcript_endpoint(client, assistant):
+    assistant.transcripts.start("t-1", "inbound", "sip:1001@host")
+    assistant.transcripts.add_turn("t-1", "user", "hello there")
+    assistant.transcripts.add_turn("t-1", "assistant", "hi, how can I help?")
+
+    r = client.get("/call/t-1/transcript")   # live call
+    assert r.status_code == 200
+    assert [t["content"] for t in r.json()["turns"]] == ["hello there", "hi, how can I help?"]
+
+    assistant.transcripts.end("t-1")
+    r = client.get("/call/t-1/transcript")   # finished call (LRU/disk)
+    assert r.status_code == 200
+    assert r.json()["ended_at"] is not None
+
+    assert client.get("/call/nope/transcript").status_code == 404
+    # Path-traversal-shaped ids must not read arbitrary files.
+    assert client.get("/call/..%2F..%2Fetc%2Fpasswd/transcript").status_code == 404
+
+
+def test_health_deep_reports_dependencies(client):
+    r = client.get("/health", params={"deep": "true"})
+    assert r.status_code == 200
+    body = r.json()
+    # Always reports all three dependencies; up/down depends on the environment.
+    assert set(body["dependencies"]) == {"vllm", "speaches", "redis"}
+    assert body["status"] in ("healthy", "degraded")
+
+
 def test_list_tools(client):
     r = client.get("/tools")
     assert r.status_code == 200
@@ -114,6 +142,19 @@ def test_schedule_rejects_bad_extension(client):
 
 # --- auth ------------------------------------------------------------------
 
+def test_rate_limit_enforced(make_client, config_factory):
+    cfg = config_factory(rate_limit_rpm=60, rate_limit_burst=2)
+    c, _ = make_client(cfg)
+
+    body = {"params": {"expression": "1+1"}}
+    assert c.post("/tools/CALC/execute", json=body).status_code == 200
+    assert c.post("/tools/CALC/execute", json=body).status_code == 200
+    # Burst of 2 exhausted -> 429.
+    assert c.post("/tools/CALC/execute", json=body).status_code == 429
+    # Read-only endpoints are not rate limited.
+    assert c.get("/health").status_code == 200
+
+
 def test_auth_enforced_when_token_set(make_client, config_factory):
     cfg = config_factory(api_auth_token="s3cret")
     c, _ = make_client(cfg)
@@ -129,3 +170,31 @@ def test_auth_enforced_when_token_set(make_client, config_factory):
     assert ok.status_code == 200
     # Read-only health stays open.
     assert c.get("/health").status_code == 200
+
+
+# --- reformat_for_speech -----------------------------------------------------
+
+def test_call_reformats_message_when_flagged(client, assistant):
+    r = client.post("/call", json={
+        "message": "ALERT: p99=340ms", "extension": "1001",
+        "reformat_for_speech": True,
+    })
+    assert r.status_code == 200
+    assert assistant.llm_engine.reformat_calls == ["ALERT: p99=340ms"]
+
+
+def test_call_skips_reformat_by_default(client, assistant):
+    r = client.post("/call", json={"message": "plain text", "extension": "1001"})
+    assert r.status_code == 200
+    assert assistant.llm_engine.reformat_calls == []
+
+
+def test_schedule_stores_reformat_flag(client, assistant):
+    r = client.post("/schedule", json={
+        "extension": "1001", "message": "wake up", "delay_seconds": 3600,
+        "reformat_for_speech": True,
+    })
+    assert r.status_code == 200
+    task = assistant.tool_manager.scheduled_tasks[r.json()["schedule_id"]]
+    assert task.metadata["reformat_for_speech"] is True
+    client.delete(f"/schedule/{r.json()['schedule_id']}")
