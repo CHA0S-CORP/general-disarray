@@ -42,7 +42,11 @@ def test_parse_drink_collects_ingredients():
 def test_spoken_recipe_reads_naturally():
     spoken = _spoken_recipe(_parse_drink(MARGARITA))
     assert spoken.startswith("Here's the Margarita.")
-    assert "You need 1 1/2 oz Tequila" in spoken
+    # Measurement abbreviations are expanded for TTS ("oz" -> "ounces"), with
+    # singular/plural agreement (see expand_units_for_speech).
+    assert "You need 1 1/2 ounces Tequila" in spoken
+    assert "1/2 ounce Triple sec" in spoken
+    assert " oz" not in spoken
     assert ", and Salt." in spoken
     assert "Serve it in a cocktail glass." in spoken
     assert "\n" not in spoken

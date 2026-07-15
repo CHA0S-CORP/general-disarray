@@ -32,6 +32,7 @@ gen_audio.FIXTURES.update({
     "search_dgx_spark.wav": "Search the web for the NVIDIA DGX Spark.",
     "time_now.wav": "What time is it?",
     "quakes_today.wav": "Any big earthquakes today?",
+    "kp_index_now.wav": "What's the current KP index? Please check the space weather.",
 })
 
 pytestmark = pytest.mark.e2e
@@ -270,4 +271,30 @@ def test_quakes(question_wav, place_info_call, assert_spoke,
 
     assert any(t.strip() for t in _texts_for(events, "assistant_response")), (
         "no assistant_response text logged for the quake question"
+    )
+
+
+def test_kp_index(question_wav, place_info_call, assert_spoke,
+                  agent_events, event_names):
+    """KP_INDEX: a space-weather question routes through the NOAA SWPC tool.
+
+    The index value is live data (0-9), so the deterministic assertion is the
+    tool_call event; a non-empty spoken reply is the secondary check.
+    """
+    fn = question_wav("kp_index_now.wav")
+    captured, started_at = place_info_call(fn, duration=30)
+
+    assert_spoke(captured)
+
+    events = agent_events(started_at)
+    names = event_names(events)
+    assert "user_speech" in names, f"STT never fired; saw {sorted(set(names))}"
+
+    tools = _tools_called(events)
+    assert "KP_INDEX" in tools, (
+        f"KP_INDEX tool never called; tools={tools}, events={sorted(set(names))}"
+    )
+
+    assert any(t.strip() for t in _texts_for(events, "assistant_response")), (
+        "no assistant_response text logged for the KP-index question"
     )

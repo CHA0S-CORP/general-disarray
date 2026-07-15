@@ -36,6 +36,7 @@ gen_audio.FIXTURES.update({
     "farewell_goodbye.wav": "Okay thanks, goodbye.",
     "timer_two_minutes.wav": "Set a timer for two minutes.",
     "transfer_ext_405.wav": "Transfer me to extension 405.",
+    "callback_15s.wav": "Please call me back in fifteen seconds.",
 })
 
 pytestmark = pytest.mark.e2e
@@ -233,3 +234,44 @@ def test_transfer_invokes_tool(question_wav, place_transfer_call, assert_spoke,
         f"no TRANSFER tool_call and no transfer event; "
         f"tools={_tool_calls(events)} events={sorted(set(names))}"
     )
+
+
+def test_callback_schedules_and_fires(question_wav, place_inbound_call, assert_spoke,
+                                      agent_events, event_names, agent_post,
+                                      wait_for_event):
+    """CALLBACK end to end: the tool schedules a callback (callback_scheduled),
+    and the background scheduler then actually fires the outbound dial.
+
+    Full exercise of tool -> scheduler -> outbound dial. With no destination the
+    callback targets the (now hung-up) e2e dialer, so the far end won't answer —
+    but the dial ATTEMPT firing proves the whole chain ran. The scheduled task
+    is cancelled in teardown so it can't dial into a later test.
+    """
+    # Clear any stale scheduled tasks first (a previous run's callback/timer).
+    agent_post("/tools/CANCEL/execute", {"params": {"task_type": "all"}})
+
+    fn = question_wav("callback_15s.wav")
+    captured, started_at = place_inbound_call(fn, duration=25,
+                                              capture_name="callback_captured.wav")
+    try:
+        assert_spoke(captured)
+
+        events = agent_events(started_at)
+        names = event_names(events)
+        assert "user_speech" in names, f"STT never fired; saw {sorted(set(names))}"
+
+        # Layer 1a: the CALLBACK tool ran and scheduled a callback.
+        tools = [t.upper() for t in _tool_calls(events)]
+        assert "CALLBACK" in tools, f"CALLBACK tool never fired; tool_calls={tools}"
+        assert "callback_scheduled" in names, (
+            f"no callback_scheduled event; events were {sorted(set(names))}"
+        )
+
+        # Layer 1b: the scheduler actually fired the outbound dial (~15s later).
+        assert wait_for_event("outbound_call_dialing", started_at, timeout=45) \
+            or wait_for_event("sip_outbound_call", started_at, timeout=5), (
+            "callback was scheduled but the scheduler never attempted the dial"
+        )
+    finally:
+        # Never leave a scheduled callback armed against the next test.
+        agent_post("/tools/CANCEL/execute", {"params": {"task_type": "all"}})

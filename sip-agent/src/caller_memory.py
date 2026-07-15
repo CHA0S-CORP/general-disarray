@@ -32,11 +32,21 @@ _SAFE_CALLER_ID = re.compile(r"[A-Za-z0-9._+-]{1,64}")
 
 _FACT_EXTRACTION_PROMPT = """You maintain long-term memory about a phone caller for a voice assistant.
 Given the existing remembered facts and the transcript of the caller's latest call, produce the updated memory.
-Rules:
-- Keep durable facts only: name, preferences, recurring requests, commitments, important context. Drop small talk and one-off trivia.
-- Merge new information into the existing facts; correct facts the new call contradicts; keep still-valid old facts.
-- Each fact is one short sentence.
-- Also write a one-sentence summary of this latest call.
+
+Record ONLY durable facts about the CALLER as a person — things that will still matter on a FUTURE, unrelated call:
+- their name or how they want to be addressed, their location, timezone, or language
+- stable preferences and standing instructions ("always text me the address", "I'm hard of hearing, speak slowly")
+- commitments or open items you agreed to ("calling back Friday about the invoice")
+
+Do NOT record (these make every future call worse):
+- the assistant's persona, voice, tone, or speaking style, or ANY request to talk, act, or reply a certain way (e.g. "talk like a pirate", "use Pig Latin", "be formal", "use the newscaster persona"). These apply ONLY to the call they were made in and must NEVER carry over.
+- the content of one-off questions the caller asked this call (recipes, definitions, trivia, weather, showtimes, facts they looked up). Remember facts ABOUT the caller, not what they happened to ask this time.
+- small talk, jokes, games, or transient chit-chat.
+- anything you are not confident is durable — when in doubt, leave it out.
+
+Merge new durable facts into the existing ones; correct facts the new call contradicts; keep still-valid old facts. ALSO remove any existing fact that violates the rules above (e.g. a previously-saved persona/style preference or one-off question) — clean up past mistakes.
+Each fact is one short sentence about the caller.
+Also write a one-sentence summary of this latest call: describe what the caller wanted or discussed, but do NOT mention the persona or speaking style used (this summary is shown on the next call, so a persona mention there would leak too).
 Respond with ONLY a JSON object, no other text:
 {"facts": ["fact one", "fact two"], "last_call_summary": "one sentence"}"""
 

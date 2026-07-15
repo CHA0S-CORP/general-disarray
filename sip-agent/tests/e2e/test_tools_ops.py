@@ -36,6 +36,7 @@ Stabilizations learned from the live stack:
     The flush call absorbs the foreign bleed, and its own harmless "Hello
     there" is what bleeds into the real measured call.
 """
+import json
 import os
 import pathlib
 import subprocess
@@ -60,6 +61,8 @@ gen_audio.FIXTURES.update({
         "Please check whether any monitoring alerts are currently firing.",
     "knowledge_trash.wav":
         "Check your knowledge base. Which day does the trash get picked up?",
+    "workflow_trigger.wav":
+        "Please trigger the workflow called e two e test hook.",
 })
 
 pytestmark = pytest.mark.e2e
@@ -212,4 +215,121 @@ def test_knowledge_over_call(flush_stale_audio, question_wav, place_call_fresh_c
     assert "tuesday" in haystack, (
         f"'Tuesday' (trash day from the knowledge doc) not found.\n"
         f"  reply_text={reply_text!r}\n  transcript={transcript!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Side-effectful tools. These change real system state (restart a container,
+# fire a webhook), so they FULL-EXERCISE the tool only when the operator has
+# deliberately prepared a safe environment — otherwise they skip, never touch
+# production services, and never flake. See each fixture's docstring.
+# ---------------------------------------------------------------------------
+
+def _container_started_at(name: str):
+    """State.StartedAt for a container, or None if it doesn't exist."""
+    res = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.StartedAt}}", name],
+        check=False, capture_output=True, text=True,
+    )
+    return res.stdout.strip() if res.returncode == 0 else None
+
+
+# A throwaway container the CONTAINER_CTL test may restart. The agent must have
+# it on CONTAINER_CTL_ALLOWLIST (set E2E_CONTAINER_TARGET to a name already
+# allowlisted). We never restart a real service.
+_CTL_TARGET = os.environ.get("E2E_CONTAINER_TARGET")
+
+
+@pytest.mark.skipif(
+    not _CTL_TARGET,
+    reason="set E2E_CONTAINER_TARGET to an allowlisted throwaway container to "
+           "full-exercise CONTAINER_CTL (restarting a real service is unsafe)",
+)
+def test_container_ctl_status_and_restart(agent_post):
+    """CONTAINER_CTL full exercise via REST: read status, then restart an
+    allowlisted throwaway container and confirm it actually restarted.
+
+    Driven over REST rather than voice because restart requires confirm=true (a
+    two-turn spoken flow) and an exact container name — both brittle to
+    transcribe. The tool, allowlist gate, and docker-socket path are the same
+    regardless of caller.
+    """
+    # status: read-only, must succeed and report the container.
+    status = agent_post("/tools/CONTAINER_CTL/execute",
+                        {"params": {"action": "status", "name": _CTL_TARGET}})
+    assert status.status_code == 200, status.text
+
+    before = _container_started_at(_CTL_TARGET)
+    assert before is not None, f"target container {_CTL_TARGET!r} not present"
+
+    # restart requires confirm=true; without it the tool must refuse.
+    refused = agent_post("/tools/CONTAINER_CTL/execute",
+                         {"params": {"action": "restart", "name": _CTL_TARGET}})
+    assert refused.status_code == 200, refused.text
+    assert "confirm" in refused.text.lower(), (
+        f"restart without confirm should ask for confirmation; got {refused.text}"
+    )
+
+    # restart with confirm=true: the container's StartedAt must advance.
+    done = agent_post("/tools/CONTAINER_CTL/execute",
+                      {"params": {"action": "restart", "name": _CTL_TARGET,
+                                  "confirm": True}})
+    assert done.status_code == 200, done.text
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        after = _container_started_at(_CTL_TARGET)
+        if after and after != before:
+            break
+        time.sleep(2)
+    else:
+        pytest.fail(f"{_CTL_TARGET} StartedAt did not advance after restart")
+
+
+# A URL the agent can POST to that records deliveries. Because outgoing webhooks
+# are SSRF-pinned, an internal receiver requires the agent to run with
+# WEBHOOK_ALLOW_PRIVATE=true; provide a reachable receiver here to enable this.
+_WORKFLOW_RECEIVER = os.environ.get("E2E_WORKFLOW_RECEIVER")
+
+
+@pytest.fixture
+def registered_workflow():
+    """Register an 'e2e test hook' workflow pointing at the receiver, in the
+    agent's live data/workflows.json (re-read on every invocation), and remove
+    it afterward."""
+    payload = json.dumps({"e2e test hook": {"url": _WORKFLOW_RECEIVER}})
+    subprocess.run(
+        ["docker", "exec", "-i", "sip-agent", "python3", "-c",
+         "import sys;open('/app/data/workflows.json','w').write(sys.stdin.read())"],
+        input=payload, text=True, check=False, capture_output=True,
+    )
+    yield
+    subprocess.run(
+        ["docker", "exec", "sip-agent", "rm", "-f", "/app/data/workflows.json"],
+        check=False, capture_output=True,
+    )
+
+
+@pytest.mark.skipif(not _WORKFLOW_RECEIVER, reason="needs E2E_WORKFLOW_RECEIVER")
+def test_trigger_workflow_over_call(registered_workflow, flush_stale_audio,
+                                    question_wav, place_call_fresh_caller,
+                                    assert_spoke, agent_events, event_names,
+                                    wait_for_event):
+    """TRIGGER_WORKFLOW: a voice request fires the named webhook end to end."""
+    fn = question_wav("workflow_trigger.wav")
+    captured, started_at = place_call_fresh_caller(fn, duration=30,
+                                                   capture_name="workflow_captured.wav")
+    assert_spoke(captured)
+
+    events = agent_events(started_at)
+    names = event_names(events)
+    assert "user_speech" in names, f"STT never fired; saw {sorted(set(names))}"
+
+    tools = _tools_called(events)
+    assert "TRIGGER_WORKFLOW" in tools, (
+        f"TRIGGER_WORKFLOW never fired; tools={tools}, events={sorted(set(names))}"
+    )
+    # The webhook delivery is logged by the agent on success.
+    assert wait_for_event("workflow_triggered", started_at, timeout=20) \
+        or wait_for_event("webhook_delivered", started_at, timeout=5), (
+        "TRIGGER_WORKFLOW ran but no delivery event was logged"
     )

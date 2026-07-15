@@ -27,6 +27,7 @@ LLM: [TOOL:PERSONA:action=clear]
 """
 
 import logging
+import re
 from typing import Any, Dict, Optional
 
 from tool_plugins import BaseTool, ToolResult, ToolStatus
@@ -44,12 +45,14 @@ class PersonaTool(BaseTool):
     name = "PERSONA"
     description = (
         "Change the agent's demeanor or speaking style for THIS call, or save "
-        "and recall named demeanor profiles. action=set adopts a demeanor "
-        "(pass `text` describing it); action=save stores the current demeanor "
-        "under `name`; action=load recalls a saved demeanor by `name`; "
-        "action=list names the saved profiles; action=clear returns to the "
-        "default demeanor. Use this when the caller asks you to act, talk, or "
-        "behave a certain way, or to save/recall such a style.")
+        "and recall named demeanor profiles. "
+        "When the caller names a saved style ('use the pirate persona', "
+        "'switch to Pig Latin', 'talk like my formal butler profile'), use "
+        "action=load with name set to that style — do NOT reinvent it with set. "
+        "Use action=set only when the caller describes a NEW style in their own "
+        "words. action=save stores the current demeanor under `name`; "
+        "action=load recalls a saved demeanor by `name`; action=list names the "
+        "saved profiles; action=clear returns to the default demeanor.")
     enabled = True
     speak_result = True  # informational: confirmation is spoken
 
@@ -110,12 +113,48 @@ class PersonaTool(BaseTool):
             return ToolResult(
                 status=ToolStatus.FAILED,
                 message="Tell me how you'd like me to act and I'll do it.")
+
+        # Safety net for the model reaching for `set` with its own paraphrase of
+        # a SAVED profile ("use pig latin" -> set text="speaking in pig latin,
+        # bouncy cartoon..."), which loses the saved profile's exact rules. If
+        # the description names exactly one saved profile, load that instead so
+        # the real saved text wins.
+        matched = self._saved_profile_named_in(text)
+        if matched is not None:
+            name, saved_text = matched
+            session.persona = saved_text[:MAX_PERSONA_CHARS]
+            log_event(logger, logging.INFO,
+                      f"Persona set redirected to saved profile: {name}",
+                      event="persona_load", name=name, via="set_redirect")
+            return ToolResult(
+                status=ToolStatus.SUCCESS,
+                message=f"Alright, switching to {name}.",
+                data={"name": name, "persona": session.persona})
+
         session.persona = text[:MAX_PERSONA_CHARS]
         log_event(logger, logging.INFO, "Persona set for call",
                   event="persona_set", chars=len(session.persona))
         return ToolResult(status=ToolStatus.SUCCESS,
                           message="Okay, I'll speak that way for the rest of this call.",
                           data={"persona": session.persona})
+
+    def _saved_profile_named_in(self, text: str):
+        """If exactly one saved profile's name appears in `text`, return
+        (display_name, text); else None. Guards the set->load redirect so an
+        ambiguous description never silently loads the wrong profile."""
+        store = self._store()
+        if store is None:
+            return None
+        norm = normalize_name(text)
+        hits = []
+        for display in store.names():
+            key = normalize_name(display)
+            # Match whole-word so "calm" doesn't fire inside "calminded".
+            if key and re.search(rf"\b{re.escape(key)}\b", norm):
+                saved = store.load(display)
+                if saved:
+                    hits.append((display, saved))
+        return hits[0] if len(hits) == 1 else None
 
     def _do_clear(self, session) -> ToolResult:
         had = bool(session.persona)
