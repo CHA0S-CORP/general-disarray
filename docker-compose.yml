@@ -35,19 +35,29 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      # DeepGEMM has no SM 12.1 (GB10) support — vLLM >= 0.24 crashes loading
+      # FP8 weights through it ("Unknown SF transformation"); force the
+      # Triton/CUTLASS fallback instead.
+      - VLLM_USE_DEEP_GEMM=0
     ipc: host
     ulimits:
       memlock: -1
       stack: 67108864
+    # Upstream :latest switched its ENTRYPOINT to ["vllm", "serve"]; blank it
+    # so the full command below works on any image vintage.
+    entrypoint: []
     command: >
       vllm serve
-      ${LLM_MODEL:-meta-llama/Llama-3.1-70B-Instruct}
+      ${LLM_MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507-FP8}
       --port 8000
       --gpu-memory-utilization 0.50
       --max-model-len 8192
       --trust-remote-code
+      ${VLLM_TOOL_ARGS---enable-auto-tool-choice --tool-call-parser hermes}
     ports:
-      - "8000:8000"
+      # Host-side publish is parameterized so the stack can coexist with other
+      # services on the box; in-cluster traffic uses http://vllm:8000 regardless.
+      - "${VLLM_PORT:-8000}:8000"
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
     healthcheck:
@@ -70,7 +80,11 @@ services:
   # OpenAI-compatible API for both transcription and speech synthesis
   # ============================================================================
   speaches:
-    image: ghcr.io/speaches-ai/speaches:0.9.0-rc.2-cuda-12.6.3
+    # GB10/aarch64: stock image's ctranslate2 wheel is CPU-only, so Whisper ran
+    # on the Grace cores. This local tag layers a CUDA 13 sm_121 CTranslate2
+    # build on top — rebuild with:
+    #   docker build -t ghcr.io/speaches-ai/speaches:gb10-cuda13 docker/speaches-gb10
+    image: ghcr.io/speaches-ai/speaches:gb10-cuda13
     container_name: sip-ai-speaches
     runtime: nvidia
     ipc: host
@@ -81,7 +95,9 @@ services:
       # Options: default, int8, int8_float16, int8_float32, int8_bfloat16, 
       #          int16, float16, bfloat16, float32
       - WHISPER__COMPUTE_TYPE=${WHISPER_COMPUTE_TYPE:-default}
-      - WHISPER__DEVICE=${WHISPER_DEVICE:-cuda}
+      # NOTE: the setting is INFERENCE_DEVICE — WHISPER__DEVICE is silently
+      # ignored by speaches (device fell back to 'auto' = CPU without CUDA).
+      - WHISPER__INFERENCE_DEVICE=${WHISPER_DEVICE:-cuda}
       - WHISPER__INFERENCE_CONFIG__BEAM_SIZE=${WHISPER_BEAM_SIZE:-1}
       - WHISPER__INFERENCE_CONFIG__LANGUAGE=${WHISPER_LANGUAGE:-en}
       - WHISPER__INFERENCE_CONFIG__VAD_FILTER=true
@@ -93,7 +109,7 @@ services:
       - UVICORN_PORT=8001
       # TTS is configured via API request parameters (model/voice)
     ports:
-      - "8001:8001"
+      - "${SPEACHES_PORT:-8001}:8001"
     volumes:
       - ./cache/speaches-cache:/home/ubuntu/.cache/huggingface/hub
       - ./cache/piper-voices:/home/ubuntu/.local/share/piper_voices
@@ -133,14 +149,63 @@ services:
       - REDIS_URL=redis://redis:6379/0
       # Call queue settings
       - CALL_QUEUE_MAX_CONCURRENT=${CALL_QUEUE_MAX_CONCURRENT:-1}
-      # LLM settings
-      - LLM_BACKEND=vllm
+      # LLM settings (LLM_BACKEND=langgraph enables the agentic engine)
+      - LLM_BACKEND=${LLM_BACKEND:-vllm}
       - LLM_BASE_URL=http://vllm:8000/v1
-      - LLM_MODEL=${LLM_MODEL:-meta-llama/Llama-3.1-70B-Instruct}
+      - LLM_MODEL=${LLM_MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507-FP8}
       - LLM_MAX_TOKENS=${LLM_MAX_TOKENS:-512}
       - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.6}
       - LLM_TOP_P=${LLM_TOP_P:-0.85}
-      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_API_KEY=${LLM_API_KEY:-not-needed}
+      - LLM_TOOL_CALLING=${LLM_TOOL_CALLING:-text}
+      - LLM_STREAMING=${LLM_STREAMING:-true}
+      - LLM_FREQUENCY_PENALTY=${LLM_FREQUENCY_PENALTY:-0.0}
+      - LLM_MAX_TOOL_ROUNDS=${LLM_MAX_TOOL_ROUNDS:-5}
+      - LLM_AGENT_TIMEOUT_S=${LLM_AGENT_TIMEOUT_S:-30.0}
+      - MESSAGE_REFORMAT_TIMEOUT_S=${MESSAGE_REFORMAT_TIMEOUT_S:-20.0}
+      # Conversation intelligence: caller memory / knowledge base / summary
+      - CALLER_MEMORY_ENABLED=${CALLER_MEMORY_ENABLED:-true}
+      # Persona/demeanor tool: caller sets the agent's speaking style for a
+      # call and saves/recalls named profiles (data/personas.json).
+      - ENABLE_PERSONA_TOOL=${ENABLE_PERSONA_TOOL:-true}
+      - CALLER_MEMORY_MAX_FACTS=${CALLER_MEMORY_MAX_FACTS:-15}
+      - CALLER_MEMORY_MAX_CHARS=${CALLER_MEMORY_MAX_CHARS:-1500}
+      - CALLER_MEMORY_TIMEOUT_S=${CALLER_MEMORY_TIMEOUT_S:-30.0}
+      - KNOWLEDGE_ENABLED=${KNOWLEDGE_ENABLED:-true}
+      - KNOWLEDGE_EMBEDDING_MODEL=${KNOWLEDGE_EMBEDDING_MODEL:-BAAI/bge-small-en-v1.5}
+      - KNOWLEDGE_CHUNK_SIZE=${KNOWLEDGE_CHUNK_SIZE:-800}
+      - KNOWLEDGE_CHUNK_OVERLAP=${KNOWLEDGE_CHUNK_OVERLAP:-120}
+      - KNOWLEDGE_TOP_K=${KNOWLEDGE_TOP_K:-3}
+      - KNOWLEDGE_AUTO_INJECT=${KNOWLEDGE_AUTO_INJECT:-false}
+      - CONVERSATION_SUMMARY_ENABLED=${CONVERSATION_SUMMARY_ENABLED:-true}
+      - CONVERSATION_SUMMARY_TIMEOUT_S=${CONVERSATION_SUMMARY_TIMEOUT_S:-20.0}
+      # Location for WEATHER / FORECAST / QUAKES-near (empty disables those tools)
+      - WEATHER_LATITUDE=${WEATHER_LATITUDE:-}
+      - WEATHER_LONGITUDE=${WEATHER_LONGITUDE:-}
+      # WEB_SEARCH via SearxNG (start it with: docker compose --profile search up -d)
+      - SEARXNG_URL=${SEARXNG_URL:-}
+      - WEB_SEARCH_MAX_RESULTS=${WEB_SEARCH_MAX_RESULTS:-3}
+      # GPU_STATUS / ALERTS tools (observability stack; fail gracefully when down)
+      - PROMETHEUS_URL=${PROMETHEUS_URL:-http://prometheus:9090}
+      - ALERTMANAGER_URL=${ALERTMANAGER_URL:-}
+      # CONTAINER_CTL: allowlisted container names (empty disables the tool;
+      # also requires the docker socket mount below)
+      - CONTAINER_CTL_ALLOWLIST=${CONTAINER_CTL_ALLOWLIST:-}
+      - ENABLE_TRANSFER_TOOL=${ENABLE_TRANSFER_TOOL:-true}
+      # DRINK_RECIPE tool (TheCocktailDB lookups)
+      - ENABLE_DRINK_TOOL=${ENABLE_DRINK_TOOL:-true}
+      # Single-line prompt override; multi-line prompts go in data/system_prompt.txt
+      - SYSTEM_PROMPT=${SYSTEM_PROMPT:-}
+      # Per-turn acknowledgment: chime (earcon, default) | phrase | none
+      - TURN_ACK_MODE=${TURN_ACK_MODE:-chime}
+      - CHIME_VOLUME=${CHIME_VOLUME:-0.3}
+      # Deterministic hangup when the caller's utterance is purely a farewell
+      - FAREWELL_HANGUP_ENABLED=${FAREWELL_HANGUP_ENABLED:-true}
+      # "Still thinking" tick while a slow LLM turn is in flight (0 delay disables)
+      - THINKING_SOUND_DELAY_S=${THINKING_SOUND_DELAY_S:-2.0}
+      - THINKING_SOUND_INTERVAL_S=${THINKING_SOUND_INTERVAL_S:-2.5}
+      # Byte cap for POST /play audio uploads
+      - PLAY_AUDIO_MAX_BYTES=${PLAY_AUDIO_MAX_BYTES:-10485760}
       - MAX_CONVERSATION_TURNS=${MAX_CONVERSATION_TURNS:-10}
       # Speaches API settings (unified STT + TTS)
       - SPEACHES_API_URL=http://speaches:8001
@@ -150,11 +215,24 @@ services:
       - MIN_SPEECH_DURATION_MS=${MIN_SPEECH_DURATION_MS:-200}
       - MAX_SPEECH_DURATION_S=${MAX_SPEECH_DURATION_S:-8.0}
       - SILENCE_TIMEOUT_MS=${SILENCE_TIMEOUT_MS:-750}
+      # Endpointing: fixed | adaptive | speculative (see ENDPOINT_MODE docs)
+      - ENDPOINT_MODE=${ENDPOINT_MODE:-fixed}
+      - ENDPOINT_MIN_SILENCE_MS=${ENDPOINT_MIN_SILENCE_MS:-350}
+      - ENDPOINT_MAX_SILENCE_MS=${ENDPOINT_MAX_SILENCE_MS:-1500}
+      - BARGE_IN_MIN_DURATION=${BARGE_IN_MIN_DURATION:-400}
+      # Gap (ms) of VAD-negative audio tolerated INSIDE a barge-in speech run.
+      # Real speech is not VAD-positive end to end (syllable gaps, unvoiced
+      # consonants); without this the run resets on the first negative chunk
+      # and the caller has to talk far longer than BARGE_IN_MIN_DURATION.
+      - BARGE_IN_MAX_GAP_MS=${BARGE_IN_MAX_GAP_MS:-250}
+      - STT_MODE=${STT_MODE:-batch}
+      - REALTIME_COMMIT_TIMEOUT_S=${REALTIME_COMMIT_TIMEOUT_S:-5.0}
       # TTS settings (Kokoro via Speaches - auto-downloaded on first use)
       - TTS_MODEL=${TTS_MODEL:-speaches-ai/Kokoro-82M-v1.0-ONNX}
       - TTS_VOICE=${TTS_VOICE:-af_heart}
       - TTS_RESPONSE_FORMAT=${TTS_RESPONSE_FORMAT:-wav}
       - TTS_SPEED=${TTS_SPEED:-1.0}
+      - TTS_SENTENCE_STREAMING=${TTS_SENTENCE_STREAMING:-true}
       # SIP settings
       - SIP_USER=${SIP_USER:-ai-assistant}
       - SIP_PASSWORD=${SIP_PASSWORD:-}
@@ -163,20 +241,100 @@ services:
       - SIP_REGISTRAR=${SIP_REGISTRAR:-}
       # General
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # Wall-clock: container TZ (logs, naive clocks) + the agent's spoken/
+      # scheduled timezone (system-prompt clock, DATETIME default, recurring schedules)
+      - TZ=${TZ:-America/Los_Angeles}
+      - LOCAL_TIMEZONE=${LOCAL_TIMEZONE:-America/Los_Angeles}
+      # Reliability: busy-reject over-capacity inbound calls; forced-tool retry
+      # when the model answers live-data questions without calling a tool.
+      # MAX_CONCURRENT_CALLS=1 keeps the classic one-live-call behavior; 2-3 is
+      # realistic on a DGX Spark (concurrent calls share STT/TTS/LLM, so
+      # latency stacks with each added call). SIP_MAX_CALLS is the PJSIP
+      # stack-level slot count — keep it above MAX_CONCURRENT_CALLS (the
+      # agent auto-raises it to MAX_CONCURRENT_CALLS + 2 if set lower).
+      - SIP_BUSY_REJECT=${SIP_BUSY_REJECT:-true}
+      - MAX_CONCURRENT_CALLS=${MAX_CONCURRENT_CALLS:-1}
+      - SIP_MAX_CALLS=${SIP_MAX_CALLS:-4}
+      - GROUNDING_RETRY_ENABLED=${GROUNDING_RETRY_ENABLED:-true}
+      - GROUNDING_RETRY_TIMEOUT_S=${GROUNDING_RETRY_TIMEOUT_S:-15.0}
       # Tools
       - CALLBACK_RING_TIMEOUT=${CALLBACK_RING_TIMEOUT:-30}
-      # Tempest Weather API (optional)
-      - TEMPEST_STATION_ID=${TEMPEST_STATION_ID:-}
-      - TEMPEST_API_TOKEN=${TEMPEST_API_TOKEN:-}
-      # API settings
-      - API_PORT=${API_PORT:-8080}
+      - ENABLE_PLUGIN_AUTODISCOVERY=${ENABLE_PLUGIN_AUTODISCOVERY:-true}
+      # API settings. The container always listens on 8080; API_PORT selects
+      # only the HOST-side port it is published on (see ports: below).
+      - API_PORT=8080
+      # In-container bind must stay 0.0.0.0 for the published port to work;
+      # actual exposure is decided by API_BIND_ADDRESS below.
+      - API_HOST=${API_HOST:-0.0.0.0}
+      # API security & limits
+      # API_BIND_ADDRESS is the HOST interface the API port is published on
+      # (see ports: below). The default 127.0.0.1 keeps the API off the network,
+      # so an empty API_AUTH_TOKEN is safe out of the box. To expose the API
+      # beyond this machine, set API_BIND_ADDRESS=0.0.0.0 AND set API_AUTH_TOKEN
+      # (the agent refuses to start exposed without a token unless
+      # ALLOW_UNAUTHENTICATED=true).
+      - API_BIND_ADDRESS=${API_BIND_ADDRESS:-127.0.0.1}
+      - API_AUTH_TOKEN=${API_AUTH_TOKEN:-}
+      - ALLOW_UNAUTHENTICATED=${ALLOW_UNAUTHENTICATED:-false}
+      # Operator dashboard page at GET /admin (data endpoints stay auth-gated)
+      - ADMIN_UI_ENABLED=${ADMIN_UI_ENABLED:-true}
+      - WEBHOOK_ALLOW_PRIVATE=${WEBHOOK_ALLOW_PRIVATE:-false}
+      - WEBHOOK_REQUIRE_HTTPS=${WEBHOOK_REQUIRE_HTTPS:-false}
+      - WEBHOOK_SIGNING_SECRET=${WEBHOOK_SIGNING_SECRET:-}
+      # Call-lifecycle events: POST call.started/call.ended to this URL
+      # (empty = off). http://n8n:5678/... needs WEBHOOK_ALLOW_PRIVATE=true.
+      - CALL_EVENT_WEBHOOK_URL=${CALL_EVENT_WEBHOOK_URL:-}
+      - CALL_EVENTS=${CALL_EVENTS:-call.started,call.ended}
+      - CALL_EVENT_INCLUDE_TRANSCRIPT=${CALL_EVENT_INCLUDE_TRANSCRIPT:-true}
+      # Virtual numbers: ephemeral single-use inbound extensions (POST /virtual-numbers)
+      - VIRTUAL_NUMBERS_ENABLED=${VIRTUAL_NUMBERS_ENABLED:-false}
+      - VIRTUAL_NUMBER_DEFAULT_TTL_S=${VIRTUAL_NUMBER_DEFAULT_TTL_S:-900}
+      - VIRTUAL_NUMBER_MAX_TTL_S=${VIRTUAL_NUMBER_MAX_TTL_S:-86400}
+      - VIRTUAL_NUMBER_RANGE=${VIRTUAL_NUMBER_RANGE:-7300-7399}
+      - VIRTUAL_NUMBER_MAX_ACTIVE=${VIRTUAL_NUMBER_MAX_ACTIVE:-50}
+      # MCP client: tools from external MCP servers (see data/mcp_servers.json.example)
+      - MCP_ENABLED=${MCP_ENABLED:-false}
+      - MCP_SERVERS_FILE=${MCP_SERVERS_FILE:-data/mcp_servers.json}
+      - MCP_TOOL_TIMEOUT_S=${MCP_TOOL_TIMEOUT_S:-10}
+      - OUTBOUND_ALLOW_SIP_URI=${OUTBOUND_ALLOW_SIP_URI:-false}
+      - OUTBOUND_EXTENSION_PATTERN=${OUTBOUND_EXTENSION_PATTERN:-}
+      - AMD_ENABLED=${AMD_ENABLED:-false}
+      - AMD_WINDOW_S=${AMD_WINDOW_S:-2.5}
+      - AMD_MACHINE_SPEECH_MS=${AMD_MACHINE_SPEECH_MS:-1500}
+      - RATE_LIMIT_RPM=${RATE_LIMIT_RPM:-0}
+      - RATE_LIMIT_BURST=${RATE_LIMIT_BURST:-0}
+      - MAX_RING_TIMEOUT_S=${MAX_RING_TIMEOUT_S:-120}
+      - MAX_CHOICE_TIMEOUT_S=${MAX_CHOICE_TIMEOUT_S:-120}
+      - MAX_CHOICE_REPEAT=${MAX_CHOICE_REPEAT:-5}
+      - MAX_QUEUE_DEPTH=${MAX_QUEUE_DEPTH:-1000}
+      - MAX_DIRECT_CONCURRENT_CALLS=${MAX_DIRECT_CONCURRENT_CALLS:-20}
     ports:
       - "5060:5060/udp"
       - "5060:5060/tcp"
       - "10000-10100:10000-10100/udp"  # RTP ports
-      - ${API_PORT:-8080}:8080                    # API server port
+      - ${API_BIND_ADDRESS:-127.0.0.1}:${API_PORT:-8080}:8080   # API server port (loopback-only by default; see API_BIND_ADDRESS)
     volumes:
       - ./data:/app/data
+      # Uncomment for the CONTAINER_CTL tool (voice-controlled docker restarts).
+      # WARNING: the docker socket is root-equivalent on this host — keep the
+      # tool's CONTAINER_CTL_ALLOWLIST tight.
+      # - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
+
+  # Optional: self-hosted metasearch for the WEB_SEARCH tool.
+  # Start with: docker compose --profile search up -d
+  # Then set SEARXNG_URL=http://searxng:8080 in .env.
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    profiles: ["search"]
+    volumes:
+      - ./searxng:/etc/searxng
+    environment:
+      - SEARXNG_BASE_URL=http://searxng:8080/
+    ports:
+      - "127.0.0.1:8081:8080"
     restart: unless-stopped
 
   n8n:
@@ -191,8 +349,13 @@ services:
       - N8N_PROTOCOL=http
       - WEBHOOK_URL=http://n8n:5678/
       - GENERIC_TIMEZONE=America/Los_Angeles
+      # Allow login over plain HTTP (LAN-only deployment, no TLS on :5678)
+      - N8N_SECURE_COOKIE=false
+      - N8N_CUSTOM_EXTENSIONS=/custom-nodes
     volumes:
       - n8n_data:/home/node/.n8n
+      # Custom SIP Agent nodes — built by examples/n8n-nodes-general-disarray/build.sh
+      - ./examples/n8n-nodes-general-disarray/dist:/custom-nodes/n8n-nodes-general-disarray:ro
 
 volumes:
   n8n_data:

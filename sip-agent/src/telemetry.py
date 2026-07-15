@@ -263,6 +263,8 @@ class Metrics:
     
     # Track active calls for gauge
     _active_calls = 0
+    # Track last-known absolute queue depth for gauge
+    _queue_depth = 0
     
     @classmethod
     def _get_or_create_counter(cls, name: str, description: str, unit: str = "1"):
@@ -305,6 +307,27 @@ class Metrics:
                     unit=unit
                 )
         return cls._gauges.get(name)
+
+    @classmethod
+    def _ensure_observable_gauge(cls, name: str, description: str, value_getter: Callable[[], Any], unit: str = "1"):
+        """
+        Register an OTEL observable gauge whose callback reports the current
+        absolute value via value_getter at each collection. Idempotent: the
+        instrument is created once; the callback always reads the live value.
+        """
+        if name not in cls._observable_gauges:
+            meter = get_meter()
+            if meter:
+                from opentelemetry.metrics import Observation
+                def _callback(options, _getter=value_getter):
+                    return [Observation(_getter())]
+                cls._observable_gauges[name] = meter.create_observable_gauge(
+                    name=name,
+                    callbacks=[_callback],
+                    description=description,
+                    unit=unit
+                )
+        return cls._observable_gauges.get(name)
     
     # ===================
     # Call Quality & Reliability
@@ -334,11 +357,13 @@ class Metrics:
     
     @classmethod
     def _update_active_calls(cls):
-        gauge = cls._get_or_create_gauge(
+        # Bridge the in-process counter to an OTEL observable gauge that reports
+        # the current absolute number of active calls at collection time.
+        cls._ensure_observable_gauge(
             "sip.calls.active",
-            "Currently active calls"
+            "Currently active calls",
+            lambda: cls._active_calls
         )
-        # Note: Using up_down_counter, we track delta. For true gauge, we'd need observable gauge
     
     @classmethod
     def record_call_failed(cls, call_type: str = "inbound", reason: str = "error"):
@@ -594,6 +619,15 @@ class Metrics:
             histogram.record(ttft_ms, {"llm.model": model})
     
     @classmethod
+    def record_time_to_first_audio(cls, ttfa_ms: float, model: str = "unknown"):
+        histogram = cls._get_or_create_histogram(
+            "sip.call.time_to_first_audio",
+            "Time from turn start (transcription handled) to the first response audio chunk enqueued"
+        )
+        if histogram:
+            histogram.record(ttfa_ms, {"llm.model": model})
+
+    @classmethod
     def record_llm_tokens_per_second(cls, tps: float, model: str = "unknown"):
         histogram = cls._get_or_create_histogram(
             "sip.llm.tokens_per_second",
@@ -628,12 +662,15 @@ class Metrics:
     
     @classmethod
     def record_queue_depth(cls, depth: int):
-        gauge = cls._get_or_create_gauge(
+        # Store the latest absolute depth and expose it via an observable gauge.
+        # An up_down_counter fed absolute snapshots via add() would accumulate
+        # instead of reflecting the current depth.
+        cls._queue_depth = depth
+        cls._ensure_observable_gauge(
             "sip.queue.depth",
-            "Number of calls in queue"
+            "Number of calls in queue",
+            lambda: cls._queue_depth
         )
-        if gauge:
-            gauge.add(depth)
     
     @classmethod
     def record_queue_enqueued(cls):

@@ -11,6 +11,7 @@ THREAD SAFETY:
 """
 
 import os
+import re
 import asyncio
 import logging
 import time
@@ -18,7 +19,7 @@ import queue
 import wave
 import contextlib
 from dataclasses import dataclass
-from typing import Callable, Optional, Dict, Any
+from typing import Callable, List, Optional, Dict, Any, Tuple
 from collections import deque
 import threading
 import numpy as np
@@ -66,6 +67,9 @@ class CallInfo:
     remote_uri: str
     is_active: bool
     start_time: float
+    # URI the caller dialed (local/To URI); matches inbound calls to virtual
+    # numbers. Empty for outbound calls.
+    local_uri: str = ""
     pj_call: Any = None
     audio_buffer: deque = None
     record_file: Optional[str] = None
@@ -73,12 +77,15 @@ class CallInfo:
     media_ready: bool = False
     stream_player: Any = None  # PlaylistPlayer
     record_file_pos: int = 0  # Track how much we've read from recording
-    
+    dtmf_buffer: deque = None  # Digits received via onDtmfDigit (PJSIP thread)
+
     def __post_init__(self):
         if self.audio_buffer is None:
             self.audio_buffer = deque(maxlen=1000)
         if self.playback_queue is None:
             self.playback_queue = deque()
+        if self.dtmf_buffer is None:
+            self.dtmf_buffer = deque(maxlen=32)
             
     @property
     def duration(self) -> float:
@@ -161,6 +168,14 @@ class SIPCall(pj.Call if PJSUA_AVAILABLE else object):
                     self.call_info.media_ready = True
                     logger.info("Audio media ready")
                 
+    def onDtmfDigit(self, prm):
+        """DTMF digit received (PJSIP thread). Buffered on the CallInfo so the
+        async side (choice collection) can poll it."""
+        digit = getattr(prm, 'digit', '')
+        if self.call_info and digit:
+            self.call_info.dtmf_buffer.append(digit)
+            logger.debug("DTMF digit received")
+
     def _cleanup_media(self):
         """Clean up media resources (PJSIP thread only)."""
         # Note: When call disconnects, PJSIP automatically disconnects all media.
@@ -217,10 +232,37 @@ class SIPAccount(pj.Account if PJSUA_AVAILABLE else object):
         ci = call.getInfo()
         log_event(logger, logging.INFO, f"Incoming call from: {ci.remoteUri}",
                  event="sip_incoming_call", remote_uri=ci.remoteUri, call_id=str(prm.callId))
-        
+
+        # Capacity gate: decline an over-capacity INVITE with 486 Busy Here
+        # instead of evicting a current caller (SIP_BUSY_REJECT +
+        # MAX_CONCURRENT_CALLS; the shipped cap of 1 keeps the old one-live-
+        # call behavior). A busy INVITE to a virtual number leaves its entry
+        # unclaimed until TTL.
+        if self.handler._busy():
+            log_event(logger, logging.INFO,
+                      f"Rejecting incoming call (busy): {ci.remoteUri}",
+                      event="sip_call_rejected_busy", remote_uri=ci.remoteUri,
+                      call_id=str(prm.callId),
+                      active_calls=len(self.handler.active_calls))
+            Metrics.record_call_failed("inbound", "busy_rejected")
+            try:
+                op = pj.CallOpParam()
+                op.statusCode = 486  # Busy Here (declines unanswered INVITE)
+                call.hangup(op)
+            except Exception as e:
+                logger.error(f"Error rejecting call: {e}")
+            # Keep the pj.Call object alive until DISCONNECTED fires.
+            call.rejected_id = str(prm.callId)
+            self.handler._rejected_calls[call.rejected_id] = call
+            return
+
         call_info = CallInfo(
             call_id=str(prm.callId),
             remote_uri=ci.remoteUri,
+            # Capture only the string here: this runs on the PJSIP thread, so
+            # matching against the virtual-number registry happens later on
+            # the asyncio side.
+            local_uri=str(getattr(ci, "localUri", "") or ""),
             is_active=False,
             start_time=time.time(),
             pj_call=call
@@ -272,8 +314,18 @@ class PlaylistPlayer:
         self._current_file: Optional[str] = None
         self._current_start: float = 0
         self._current_duration: float = 0
+        # Playback ledger bookkeeping: caller-assigned tags travel with each
+        # queued file so the asyncio side can later ask "which chunks actually
+        # finished playing?" (barge-in truthfulness). All mutation happens on
+        # the PJSIP thread in _poll_and_update, under _lock; snapshot() is the
+        # read side, callable from any thread.
+        self._current_tag: Optional[int] = None
+        self._completed_tags: List[int] = []
         self._stopped = False
-        
+        # Transient barge-in flush request (distinct from the terminal _stopped
+        # latch); picked up and cleared by the PJSIP thread in _poll_and_update.
+        self._flush_requested = False
+
         # PJSIP player reference (only accessed from PJSIP thread)
         self._pj_player: Any = None
         
@@ -281,12 +333,25 @@ class PlaylistPlayer:
     def is_playing(self) -> bool:
         with self._lock:
             return self._is_playing
-            
-    def enqueue_file(self, file_path: str):
-        """Add file to playback queue (thread-safe, any thread)."""
+
+    def has_audio(self) -> bool:
+        """True while a file is playing or queued — the assistant is audibly speaking."""
+        with self._lock:
+            if self._is_playing:
+                return True
+        return not self.file_queue.empty()
+
+
+    def enqueue_file(self, file_path: str, tag: Optional[int] = None):
+        """Add file to playback queue (thread-safe, any thread).
+
+        ``tag`` is an optional caller-assigned id that travels with the queue
+        entry; when the file finishes playing it lands in the completed-tags
+        ledger (see snapshot()). Untagged files never touch the ledger.
+        """
         if self._stopped:
             return
-            
+
         # Get duration
         duration = 0.5
         try:
@@ -294,27 +359,72 @@ class PlaylistPlayer:
                 duration = f.getnframes() / float(f.getframerate())
         except Exception as e:
             logger.warning(f"Could not read WAV duration: {e}")
-            
-        self.file_queue.put((file_path, duration))
-        logger.debug(f"Enqueued: {file_path} ({duration:.2f}s)")
+
+        self.file_queue.put((file_path, duration, tag))
+        logger.debug(f"Enqueued: {file_path} ({duration:.2f}s, tag={tag})")
+
+    def snapshot(self) -> Tuple[List[int], Optional[int], float]:
+        """Read the playback ledger (thread-safe, any thread).
+
+        Returns ``(completed_tags, current_tag, current_fraction)`` where
+        ``completed_tags`` are the tags of files that finished playing (in
+        play order), ``current_tag`` is the tag of the file playing right now
+        (None when idle or the file was untagged), and ``current_fraction`` is
+        how far into the current file playback is, clamped to [0, 1] (0.0 when
+        idle). A slightly stale fraction is fine — this is deliberately a
+        polled read, not a cross-thread callback.
+        """
+        with self._lock:
+            completed = list(self._completed_tags)
+            if self._is_playing and self._current_duration > 0:
+                fraction = (time.time() - self._current_start) / self._current_duration
+                return completed, self._current_tag, max(0.0, min(1.0, fraction))
+            return completed, None, 0.0
         
     def stop_all(self):
         """Stop all playback (thread-safe, any thread)."""
         with self._lock:
             self._stopped = True
             self._is_playing = False
-            
-        # Clear queue and delete files
+            # The interrupted current file did not finish: its tag must never
+            # land in _completed_tags.
+            self._current_tag = None
+
+        # Clear queue and delete files (queued-and-dropped tags are simply
+        # never completed)
         while True:
             try:
-                file_path, _ = self.file_queue.get_nowait()
+                file_path, _, _ = self.file_queue.get_nowait()
                 try:
                     os.unlink(file_path)
                 except OSError:
                     pass
             except queue.Empty:
                 break
-                
+
+    def clear(self):
+        """Flush queued + in-progress playback WITHOUT terminating the player.
+
+        Used for barge-in: the caller interrupted, so drop everything queued and
+        stop whatever is currently playing, but keep the player usable so the
+        assistant's next turn can still be heard. Unlike stop_all(), this does
+        NOT latch _stopped, so subsequently-enqueued audio still plays.
+        """
+        # Drain queued files here (any thread). The active pj_player is torn down
+        # on the PJSIP thread when it picks up _flush_requested in _poll_and_update.
+        # Dropped queue entries' tags simply never reach _completed_tags.
+        while True:
+            try:
+                file_path, _, _ = self.file_queue.get_nowait()
+                try:
+                    os.unlink(file_path)
+                except OSError:
+                    pass
+            except queue.Empty:
+                break
+        with self._lock:
+            self._flush_requested = True
+
     def _poll_and_update(self, pj_call: SIPCall):
         """
         Poll playback state and start next file if needed.
@@ -323,7 +433,21 @@ class PlaylistPlayer:
         if self._stopped:
             self._cleanup_player(pj_call)
             return
-            
+
+        # Transient barge-in flush: stop current playback and reset, but keep the
+        # player alive so later-enqueued audio still plays. Handled here (the only
+        # thread allowed to touch _pj_player) BEFORE the start-next logic below, so
+        # the old player is always torn down before a new file starts.
+        if self._flush_requested:
+            self._cleanup_player(pj_call)
+            self._delete_current_file()
+            with self._lock:
+                self._is_playing = False
+                self._current_file = None
+                # Interrupted mid-file: the tag must NOT count as completed.
+                self._current_tag = None
+                self._flush_requested = False
+
         with self._lock:
             # Check if current file finished
             if self._is_playing and self._current_file:
@@ -334,16 +458,20 @@ class PlaylistPlayer:
                     self._delete_current_file()
                     self._is_playing = False
                     self._current_file = None
-                    
+                    if self._current_tag is not None:
+                        self._completed_tags.append(self._current_tag)
+                        self._current_tag = None
+
             # Start next file if not playing
             if not self._is_playing:
                 try:
-                    file_path, duration = self.file_queue.get_nowait()
-                    self._start_playback(pj_call, file_path, duration)
+                    file_path, duration, tag = self.file_queue.get_nowait()
+                    self._start_playback(pj_call, file_path, duration, tag)
                 except queue.Empty:
                     pass
-                    
-    def _start_playback(self, pj_call: SIPCall, file_path: str, duration: float):
+
+    def _start_playback(self, pj_call: SIPCall, file_path: str, duration: float,
+                        tag: Optional[int] = None):
         """Start playing a file (PJSIP thread only)."""
         if not pj_call.aud_med:
             logger.warning("No audio media for playback")
@@ -361,9 +489,10 @@ class PlaylistPlayer:
             self._current_file = file_path
             self._current_duration = duration + 0.05  # Small buffer
             self._current_start = time.time()
+            self._current_tag = tag
             self._is_playing = True
-            
-            logger.debug(f"Playing: {file_path} ({duration:.2f}s)")
+
+            logger.debug(f"Playing: {file_path} ({duration:.2f}s, tag={tag})")
             
         except Exception as e:
             logger.error(f"Playback error: {e}")
@@ -414,6 +543,9 @@ class SIPHandler:
         self.endpoint: Optional[pj.Endpoint] = None
         self.account: Optional[SIPAccount] = None
         self.active_calls: Dict[str, SIPCall] = {}
+        # Calls declined with 486 Busy: keep the pj.Call alive until its
+        # DISCONNECTED lands (PJSIP-thread-only, like active_calls).
+        self._rejected_calls: Dict[str, SIPCall] = {}
         
         # Playlist players per call (protected by lock)
         self._playlist_players: Dict[str, PlaylistPlayer] = {}
@@ -423,13 +555,56 @@ class SIPHandler:
         self._pj_thread: Optional[threading.Thread] = None
         self._initialized = threading.Event()
         self._registered = threading.Event()
-        
+
         # Command queue for thread-safe operations
         self._cmd_queue: queue.Queue = queue.Queue()
         self._result_queues: Dict[int, queue.Queue] = {}
         self._cmd_id = 0
         self._cmd_lock = threading.Lock()
-        
+
+    def _busy(self) -> bool:
+        """Should a new inbound INVITE be declined 486 Busy Here?
+
+        Capacity gate: busy once the number of live calls has reached
+        MAX_CONCURRENT_CALLS (default 1 — today's one-live-call behavior;
+        raising it admits additional concurrent inbound calls).
+
+        active_calls is only mutated on the PJSIP thread (insert in
+        onIncomingCall/_do_make_call, removal in _on_call_ended on
+        DISCONNECTED), so checking it from onIncomingCall is race-free.
+        Covers our own outbound calls too: an inbound INVITE while the line
+        is at capacity with outbound calls is also busy.
+
+        Only calls PJSIP still considers live count: a stale entry (its
+        DISCONNECTED was missed or its cleanup failed) must not leave the
+        line permanently busy, so dead entries are pruned here instead of
+        rejecting every future caller until restart.
+        """
+        if not self.config.sip_busy_reject or not self.active_calls:
+            return False
+        capacity = max(1, getattr(self.config, "max_concurrent_calls", 1))
+        alive_count = 0
+        stale = []
+        for call_id, call in self.active_calls.items():
+            try:
+                alive = call.isActive()
+            except AttributeError:
+                alive = True   # not a pj.Call (mock mode): can't probe, count it
+            except Exception:
+                alive = False  # invalid/destroyed pj.Call: treat as dead
+            if alive:
+                alive_count += 1
+                if alive_count >= capacity:
+                    return True
+                continue
+            stale.append(call_id)
+        for call_id in stale:
+            log_event(logger, logging.WARNING,
+                      f"Pruning stale call {call_id} from active_calls",
+                      event="sip_stale_call_pruned", call_id=call_id)
+            self.active_calls.pop(call_id, None)
+        return False
+
     def get_playlist_player(self, call_info: CallInfo) -> PlaylistPlayer:
         """Get or create playlist player for a call (thread-safe)."""
         call_id = call_info.call_id  # Extract string first to avoid accessing CallInfo in lock
@@ -517,8 +692,19 @@ class SIPHandler:
                 
             elif cmd == "make_call":
                 uri = args[0]
-                return self._do_make_call(uri)
-                
+                caller_name = args[1] if len(args) > 1 else None
+                return self._do_make_call(uri, caller_name)
+
+            elif cmd == "xfer":
+                # Blind transfer (SIP REFER); the far end re-INVITEs the
+                # target and this call ends via the normal disconnect path.
+                call = args[0]
+                dest = args[1]
+                prm = pj.CallOpParam()
+                call.xfer(dest, prm)
+                return True
+
+
             elif cmd == "play_file":
                 call_id = args[0]
                 wav_path = args[1]
@@ -593,7 +779,22 @@ class SIPHandler:
             ep_cfg = pj.EpConfig()
             ep_cfg.logConfig.level = 1
             ep_cfg.logConfig.consoleLevel = 1
-            ep_cfg.uaConfig.maxCalls = int(os.environ.get("SIP_MAX_CALLS", "4"))
+            # PJSIP call slots must not silently undercut the app-level
+            # capacity gate: pjsua 486-rejects INVITEs beyond maxCalls before
+            # onIncomingCall (and thus _busy()) ever runs, and outbound calls
+            # plus just-rejected INVITEs briefly hold slots too. Keep at
+            # least MAX_CONCURRENT_CALLS + 2; SIP_MAX_CALLS can raise it.
+            max_calls = getattr(self.config, "sip_max_calls", 4)
+            slots_floor = getattr(self.config, "max_concurrent_calls", 1) + 2
+            if max_calls < slots_floor:
+                logger.warning(
+                    f"SIP_MAX_CALLS={max_calls} is too low for "
+                    f"MAX_CONCURRENT_CALLS="
+                    f"{getattr(self.config, 'max_concurrent_calls', 1)}; "
+                    f"raising PJSIP call slots to {slots_floor} so the "
+                    "capacity gate stays reachable")
+                max_calls = slots_floor
+            ep_cfg.uaConfig.maxCalls = max_calls
             ep_cfg.uaConfig.userAgent = "SIP-AI-Assistant/1.0"
             
             self.endpoint.libInit(ep_cfg)
@@ -633,12 +834,22 @@ class SIPHandler:
             
             # Main loop
             while self._running:
-                # Handle SIP events (50ms timeout)
-                self.endpoint.libHandleEvents(50)
-                
-                # Process our command queue
-                self._process_commands()
-                
+                # A transient error from libHandleEvents (it can raise pj.Error),
+                # a media/state callback, or command processing must NOT escape and
+                # kill this thread - that would silently stop answering calls while
+                # /health still reports healthy. Log and continue; only _running
+                # going False ends the loop.
+                try:
+                    # Handle SIP events (50ms timeout)
+                    self.endpoint.libHandleEvents(50)
+
+                    # Process our command queue
+                    self._process_commands()
+                except Exception as e:
+                    logger.error(f"PJSIP loop iteration error (continuing): {e}")
+                    # Avoid a hot error-spin if the failure is persistent.
+                    time.sleep(0.1)
+
             # Cleanup in PJSIP thread (after loop exits)
             logger.info("PJSIP thread shutting down...")
             try:
@@ -778,6 +989,11 @@ class SIPHandler:
             
     def _on_call_ended(self, call: SIPCall):
         """Called when call ends (PJSIP thread)."""
+        # Busy-rejected calls have no CallInfo; just release the keep-alive.
+        rejected_id = getattr(call, "rejected_id", None)
+        if rejected_id:
+            self._rejected_calls.pop(rejected_id, None)
+
         if call.call_info:
             call_id = call.call_info.call_id
             if call_id in self.active_calls:
@@ -811,31 +1027,75 @@ class SIPHandler:
                 call_info.pj_call
             )
             
-    async def make_call(self, uri: str) -> Optional[CallInfo]:
-        """Make an outbound call."""
+    async def transfer_call(self, call_info: CallInfo, target_uri: str) -> bool:
+        """Blind-transfer an active call to another SIP URI (REFER).
+
+        Returns True when the REFER was issued; the call then tears down
+        through the normal disconnect flow. Mock mode (no PJSUA2) returns
+        False so callers fall back to a spoken error.
+        """
+        if not PJSUA_AVAILABLE:
+            logger.warning("transfer_call unavailable in mock SIP mode")
+            return False
+        if not call_info or not call_info.pj_call:
+            return False
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            self._queue_command,
+            "xfer",
+            call_info.pj_call,
+            target_uri,
+        )
+        ok = result is True
+        log_event(logger, logging.INFO if ok else logging.WARNING,
+                  f"Call transfer to {target_uri}: {'issued' if ok else 'failed'}",
+                  event="sip_transfer", target=target_uri, ok=ok,
+                  call_id=call_info.call_id)
+        return ok
+
+    async def make_call(self, uri: str,
+                        caller_name: Optional[str] = None) -> Optional[CallInfo]:
+        """Make an outbound call.
+
+        ``caller_name`` overrides the From display name for THIS call only
+        (e.g. "Weather Alert"), leaving the registered account identity alone.
+        None keeps the account's own identity.
+        """
         if not PJSUA_AVAILABLE:
             return None
-            
+
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None,
             self._queue_command,
             "make_call",
-            uri
+            uri,
+            caller_name
         )
-        
+
         if isinstance(result, CallInfo):
             return result
         return None
-        
-    def _do_make_call(self, uri: str) -> Optional[CallInfo]:
+
+    def _local_uri(self, caller_name: str) -> str:
+        """The account's own URI wearing a different display name."""
+        # Quotes and backslashes would break out of the quoted display-name
+        # string in the From header; strip rather than escape, since a caller
+        # name containing them is a mistake, not an intent.
+        clean = re.sub(r'[\\"<>\r\n]', "", caller_name).strip()
+        base = f"sip:{self.config.sip_user}@{self.config.sip_domain}"
+        return f'"{clean}" <{base}>' if clean else base
+
+    def _do_make_call(self, uri: str,
+                      caller_name: Optional[str] = None) -> Optional[CallInfo]:
         """Make call (PJSIP thread only)."""
         if not self.account:
             return None
-            
+
         try:
             call = SIPCall(self.account, pj.PJSUA_INVALID_ID, self)
-            
+
             call_info = CallInfo(
                 call_id=str(id(call)),
                 remote_uri=uri,
@@ -844,8 +1104,14 @@ class SIPHandler:
                 pj_call=call
             )
             call.call_info = call_info
-            
+
             prm = pj.CallOpParam(True)
+            if caller_name:
+                # Per-call From override. Whether the callee actually SEES it is
+                # up to what's downstream: an internal PBX passes the display
+                # name through to the handset, but a PSTN carrier will usually
+                # discard it and substitute its own CNAM for the trunk.
+                prm.txOption.localUri = self._local_uri(caller_name)
             call.makeCall(uri, prm)
             
             self.active_calls[call_info.call_id] = call
@@ -928,24 +1194,57 @@ class SIPHandler:
             await asyncio.sleep(timeout)
             return None
         
-    async def send_audio(self, call_info: CallInfo, audio_data: bytes):
-        """Send audio to a call using the playlist player."""
-        if not call_info or not call_info.is_active:
-            return
-            
-        player = self.get_playlist_player(call_info)
-        
-        # Write to temp file
+    def _write_audio_tempfile(self, audio_data: bytes) -> str:
+        """Encode audio to a temp WAV file (blocking; run off the event loop)."""
         import tempfile
         fd, wav_path = tempfile.mkstemp(suffix='.wav', prefix='sip_out_')
         os.close(fd)
-        
+
         with wave.open(wav_path, 'wb') as wav:
             wav.setnchannels(1)
             wav.setsampwidth(2)
             wav.setframerate(self.config.sample_rate)
             wav.writeframes(audio_data)
-            
+
+        return wav_path
+
+    def get_dtmf_digit(self, call_info: CallInfo) -> Optional[str]:
+        """Pop the oldest buffered DTMF digit for this call, if any."""
+        buf = getattr(call_info, 'dtmf_buffer', None)
+        if buf:
+            try:
+                return buf.popleft()
+            except IndexError:
+                return None
+        return None
+
+    def clear_dtmf(self, call_info: CallInfo):
+        """Discard any buffered DTMF digits (e.g. before a new prompt)."""
+        buf = getattr(call_info, 'dtmf_buffer', None)
+        if buf:
+            buf.clear()
+
+    async def send_audio(self, call_info: CallInfo, audio_data: bytes,
+                         tag: Optional[int] = None):
+        """Send audio to a call using the playlist player.
+
+        ``tag`` (optional) travels with the queued file into the playlist
+        player's playback ledger — see PlaylistPlayer.snapshot().
+        """
+        if not call_info or not call_info.is_active:
+            return
+
+        player = self.get_playlist_player(call_info)
+
+        # Offload the blocking mkstemp + WAV encode/write off the event loop
+        # (mirrors make_call/hangup_call) so inbound audio isn't blocked.
+        loop = asyncio.get_event_loop()
+        wav_path = await loop.run_in_executor(
+            None,
+            self._write_audio_tempfile,
+            audio_data
+        )
+
         # Enqueue for playback
-        player.enqueue_file(wav_path)
+        player.enqueue_file(wav_path, tag=tag)
 

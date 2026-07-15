@@ -106,8 +106,12 @@ RUN pip install --no-cache-dir -r requirements.txt --break-system-packages
 # Copy application code
 COPY src/ ./
 
+# fastembed downloads its ONNX embedding model on first use; point the cache
+# into /app/data (bind-mounted) so it persists across container recreates.
+ENV FASTEMBED_CACHE_PATH=/app/data/models/fastembed
+
 # Create directories
-RUN mkdir -p /app/data/recordings /app/data/logs /app/data/voices
+RUN mkdir -p /app/data/recordings /app/data/logs /app/data/voices /app/data/models/fastembed
 
 # Expose ports
 EXPOSE 5060/udp 5060/tcp 10000-10100/udp

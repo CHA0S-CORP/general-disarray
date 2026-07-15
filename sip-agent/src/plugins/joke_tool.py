@@ -24,6 +24,7 @@ class JokeTool(BaseTool):
     name = "JOKE"
     description = "Tell a random joke to lighten the mood"
     enabled = True
+    speak_result = True  # informational: message is spoken in marker mode
     
     # Optional parameters
     parameters = {

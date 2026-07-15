@@ -57,7 +57,10 @@ services:
       - ./observability/prometheus/prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
       - prometheus-data:/prometheus
     ports:
-      - "9090:9090"
+      # Host publish is parameterized so the stack can coexist with other
+      # services on the box; in-cluster traffic uses http://prometheus:9090
+      # regardless (that's what the GPU_STATUS / ALERTS tools query).
+      - "${PROMETHEUS_PORT:-9090}:9090"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
@@ -210,7 +213,7 @@ services:
       - OTEL_EXPORTER_OTLP_TRACES_INSECURE=true
       - OTEL_RESOURCE_ATTRIBUTES=service.namespace=sip-ai,deployment.environment=docker
     command:
-      - --model=${LLM_MODEL:-meta-llama/Llama-3.1-70B-Instruct}
+      - --model=${LLM_MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507-FP8}
       - --host=0.0.0.0
       - --port=8000
       - --tensor-parallel-size=${TENSOR_PARALLEL_SIZE:-1}

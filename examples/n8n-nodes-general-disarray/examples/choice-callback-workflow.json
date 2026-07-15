@@ -1,0 +1,120 @@
+{
+  "name": "SIP Agent choice callback",
+  "nodes": [
+    {
+      "parameters": {
+        "requireSignature": false,
+        "tolerance": 300
+      },
+      "id": "a1f6d0c2-3b7e-4c8a-9f21-5d0e8b4c7a10",
+      "name": "SIP Agent Trigger",
+      "type": "CUSTOM.sipAgentTrigger",
+      "typeVersion": 1,
+      "position": [
+        -200,
+        0
+      ],
+      "webhookId": "6f2c9b8e-1d4a-4e5f-8a3b-0c7d2e9f6a41",
+      "credentials": {
+        "sipAgentApi": {
+          "id": "1",
+          "name": "SIP Agent API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c3e8f1a2-7b6d-4a9c-b5e0-2f4d8c1a9e73",
+              "leftValue": "={{ $json.choice_response }}",
+              "rightValue": "yes",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b2d7e9f4-8c1a-4b6d-a3e5-9f0c2d7b8e64",
+      "name": "Choice Is Yes?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        60,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "d4f9a2b6-0e3c-4d7f-b8a1-6c5e9f2d0b37",
+      "name": "Confirmed",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        320,
+        -100
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "e5a0b3c7-1f4d-4e8a-c9b2-7d6f0a3e1c48",
+      "name": "Declined",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        320,
+        100
+      ]
+    }
+  ],
+  "connections": {
+    "SIP Agent Trigger": {
+      "main": [
+        [
+          {
+            "node": "Choice Is Yes?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Choice Is Yes?": {
+      "main": [
+        [
+          {
+            "node": "Confirmed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Declined",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "meta": {
+    "instanceId": "example"
+  },
+  "tags": []
+}

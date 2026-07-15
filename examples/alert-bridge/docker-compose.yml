@@ -1,0 +1,31 @@
+# Alert bridge — run alongside the main stack:
+#
+#   docker compose -f examples/alert-bridge/docker-compose.yml up -d
+#
+# Joins the main stack's network so `sip-agent` and `alert-bridge` resolve by
+# name (the agent must be able to reach http://alert-bridge:8000/ack, and the
+# agent blocks private-network webhooks unless WEBHOOK_ALLOW_PRIVATE=true).
+services:
+  alert-bridge:
+    build: .
+    container_name: alert-bridge
+    environment:
+      - AGENT_API_URL=${AGENT_API_URL:-http://sip-agent:8080}
+      - AGENT_API_TOKEN=${API_AUTH_TOKEN:-}
+      - ONCALL_PRIMARY=${ONCALL_PRIMARY:-}
+      - ONCALL_SECONDARY=${ONCALL_SECONDARY:-}
+      - BRIDGE_CALLBACK_URL=${BRIDGE_CALLBACK_URL:-http://alert-bridge:8000/ack}
+      - ACK_TIMEOUT_S=${ACK_TIMEOUT_S:-30}
+      - CALL_ON_RESOLVED=${CALL_ON_RESOLVED:-false}
+      - WEBHOOK_SIGNING_SECRET=${WEBHOOK_SIGNING_SECRET:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    ports:
+      - "${ALERT_BRIDGE_BIND:-127.0.0.1}:${ALERT_BRIDGE_PORT:-8100}:8000"
+    restart: unless-stopped
+    networks:
+      - sip-stack
+
+networks:
+  sip-stack:
+    name: general-disarray_default
+    external: true

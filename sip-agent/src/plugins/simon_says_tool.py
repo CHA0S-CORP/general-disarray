@@ -27,6 +27,7 @@ class SimonSaysTool(BaseTool):
     name = "SIMON_SAYS"
     description = "Repeat back exactly what the user says. Use when user says 'simon says', 'repeat after me', 'say this', 'echo', or asks you to repeat something verbatim."
     enabled = True
+    speak_result = True  # informational: message is spoken in marker mode
     
     parameters = {
         "text": {
