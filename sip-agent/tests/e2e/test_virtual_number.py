@@ -27,7 +27,14 @@ PURPOSE = ("The caller is confirming pizza order number four two one one "
            "in twenty minutes.")
 
 
+_API_AUTH_TOKEN = os.environ.get("E2E_API_AUTH_TOKEN", "")
+
+
 def _api(method: str, path: str, **kwargs) -> httpx.Response:
+    # Send the bearer token when the deployment has API_AUTH_TOKEN enabled.
+    if _API_AUTH_TOKEN:
+        headers = {"Authorization": f"Bearer {_API_AUTH_TOKEN}", **kwargs.pop("headers", {})}
+        kwargs["headers"] = headers
     return httpx.request(method, f"{AGENT_API}{path}", timeout=15.0, **kwargs)
 
 

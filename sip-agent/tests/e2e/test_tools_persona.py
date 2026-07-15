@@ -35,12 +35,16 @@ gen_audio.FIXTURES.update({
     "persona_set_pirate.wav":
         "Please use your persona tool to talk like a pirate for the rest of "
         "this call. Greet me with ahoy and call me matey.",
-    "persona_save.wav":
-        "Now save that speaking style using your persona tool, and call it "
-        "ee two ee buccaneer.",
-    "persona_load.wav":
-        "Use your persona tool to load the saved style called ee two ee "
-        "buccaneer, then say hello.",
+    # Single save action with the style supplied inline: chaining set-then-save
+    # in one voice turn proved unreliable (the model set the persona but skipped
+    # the save). "Space Captain" is a clean name STT/the model round-trip
+    # consistently (unlike "E2E Buccaneer").
+    "persona_save_v3.wav":
+        "Using your persona tool, save a speaking style under the name Space "
+        "Captain. The style is: talk like a pirate, say ahoy and call me matey.",
+    "persona_load_v2.wav":
+        "Use your persona tool to load the saved style called Space Captain, "
+        "then say hello.",
 })
 
 pytestmark = pytest.mark.e2e
@@ -51,10 +55,9 @@ SIP_TARGET = os.environ.get("E2E_SIP_TARGET", "sip:ai-assistant@sip-agent:5060")
 
 CALLER_ID = "sip:e2epersona@tester"
 PERSONA_FILE_IN_CONTAINER = "/app/data/personas.json"
-# Normalized key the store will use for "EE two EE Buccaneer" (spoken) once the
-# model writes it back as a name. We match loosely on the 'buccaneer' token so
-# STT/phrasing variance in the spoken name doesn't break the test.
-SAVED_TOKEN = "buccaneer"
+# Token matched (loosely) against saved profile keys so STT/phrasing variance in
+# the spoken name ("Space Captain") doesn't break the test.
+SAVED_TOKEN = "captain"
 
 PIRATE_MARKERS = ("ahoy", "matey", "arr", "aye", "avast", "ye ", "yer ")
 
@@ -157,9 +160,11 @@ def test_persona_set_shapes_the_reply(question_wav, place_persona_call, assert_s
     names = event_names(events)
     assert "user_speech" in names, f"STT never fired; saw {sorted(set(names))}"
 
-    # Layer 1 (deterministic): the persona was applied.
-    assert "persona_set" in names, (
-        f"PERSONA tool did not set a demeanor; events were {sorted(set(names))}"
+    # Layer 1 (deterministic): a demeanor was applied. Either event counts —
+    # 'pirate' is a seeded profile, so a set naming it is redirected to load
+    # (persona_load via set_redirect); an ad-hoc description stays persona_set.
+    assert ("persona_set" in names or "persona_load" in names), (
+        f"PERSONA tool did not apply a demeanor; events were {sorted(set(names))}"
     )
 
     # Layer 2 (soft): the demeanor actually reached the caller.
@@ -173,28 +178,25 @@ def test_persona_set_shapes_the_reply(question_wav, place_persona_call, assert_s
 
 def test_persona_save_persists_profile(question_wav, place_persona_call, assert_spoke,
                                        agent_events, event_names):
-    """PERSONA save: after setting a demeanor and saving it, the named profile
-    is written to the persisted store."""
-    # One call that sets AND saves: set in the first sentence is a prerequisite
-    # for save, but the model reliably does both when asked to save a style.
-    set_fn = question_wav("persona_set_pirate.wav")
-    place_persona_call(set_fn, duration=20, capture_name="persona_presave.wav")
-
-    fn = question_wav("persona_save.wav")
-    captured, started_at = place_persona_call(fn, duration=30,
+    """PERSONA save: setting a demeanor and saving it (in ONE call, since the
+    active persona is per-call) writes the named profile to the persisted
+    store."""
+    fn = question_wav("persona_save_v3.wav")
+    captured, started_at = place_persona_call(fn, duration=35,
                                               capture_name="persona_save_cap.wav")
     assert_spoke(captured)
 
     events = agent_events(started_at)
     names = event_names(events)
-    assert "persona_save" in names, (
-        f"PERSONA did not save a profile; events were {sorted(set(names))}"
-    )
+    assert "user_speech" in names, f"STT never fired; saw {sorted(set(names))}"
 
-    # Deterministic: the profile is on disk under a name carrying our token.
+    # Outcome is the real test of "save persists a profile": the named profile
+    # lands on disk. (persona_save fires on success, but the disk check is the
+    # ground truth and is robust to event-name drift.)
     data = _read_personas()
     assert any(SAVED_TOKEN in k for k in data), (
-        f"saved profile not in personas.json; keys were {sorted(data)}"
+        f"PERSONA save did not persist a profile.\n  events={sorted(set(names))}"
+        f"\n  personas keys={sorted(data)}"
     )
 
 
@@ -205,8 +207,8 @@ def test_persona_load_recalls_saved_profile(question_wav, place_persona_call, as
     # this test is self-contained: write it straight into the store.
     data = _read_personas()
     if not any(SAVED_TOKEN in k for k in data):
-        data["ee two ee buccaneer"] = {
-            "name": "EE two EE Buccaneer",
+        data["space captain"] = {
+            "name": "Space Captain",
             "text": "Talk like a pirate: greet with 'ahoy' and call the caller 'matey'.",
         }
         subprocess.run(
@@ -215,7 +217,7 @@ def test_persona_load_recalls_saved_profile(question_wav, place_persona_call, as
             input=json.dumps(data), text=True, check=False, capture_output=True,
         )
 
-    fn = question_wav("persona_load.wav")
+    fn = question_wav("persona_load_v2.wav")
     captured, started_at = place_persona_call(fn, duration=30,
                                               capture_name="persona_load_cap.wav")
     assert_spoke(captured)

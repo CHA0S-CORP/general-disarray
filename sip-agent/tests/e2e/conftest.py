@@ -297,11 +297,24 @@ def transcribe():
     return _transcribe
 
 
+# Bearer token for mutating endpoints when the agent runs with API_AUTH_TOKEN
+# set (a hardened deployment). Empty -> no auth header (open deployment).
+API_AUTH_TOKEN = os.environ.get("E2E_API_AUTH_TOKEN", "")
+
+
+def _auth_headers() -> dict:
+    return {"Authorization": f"Bearer {API_AUTH_TOKEN}"} if API_AUTH_TOKEN else {}
+
+
 @pytest.fixture
 def agent_post(stack):
-    """POST to the agent's REST API (returns the httpx.Response, never raises)."""
+    """POST to the agent's REST API (returns the httpx.Response, never raises).
+
+    Sends the bearer token when E2E_API_AUTH_TOKEN is set, so REST tests work
+    against a deployment that has API_AUTH_TOKEN enabled."""
     def _post(path: str, json_body: dict, timeout: float = 30.0):
-        return httpx.post(f"{AGENT_API}{path}", json=json_body, timeout=timeout)
+        return httpx.post(f"{AGENT_API}{path}", json=json_body,
+                          headers=_auth_headers(), timeout=timeout)
     return _post
 
 

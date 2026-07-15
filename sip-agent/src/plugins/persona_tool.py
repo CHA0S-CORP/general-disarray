@@ -109,10 +109,20 @@ class PersonaTool(BaseTool):
     # -- actions ---------------------------------------------------------
     def _do_set(self, session, params: Dict[str, Any]) -> ToolResult:
         text = (params.get("text") or "").strip()
+        name = (params.get("name") or "").strip()
         if not text:
             return ToolResult(
                 status=ToolStatus.FAILED,
                 message="Tell me how you'd like me to act and I'll do it.")
+
+        # The model routinely conflates set and save: asked to "save a style
+        # named X, the style is Y", it calls set with BOTH text=Y and name=X.
+        # A name alongside set means "save this new style and use it" — save it
+        # and apply it (and don't run the redirect below: the text is a new
+        # definition, not a reference to an existing profile).
+        if name:
+            return self._do_save(session, {"name": name, "text": text},
+                                 apply_after=True)
 
         # Safety net for the model reaching for `set` with its own paraphrase of
         # a SAVED profile ("use pig latin" -> set text="speaking in pig latin,
@@ -139,9 +149,17 @@ class PersonaTool(BaseTool):
                           data={"persona": session.persona})
 
     def _saved_profile_named_in(self, text: str):
-        """If exactly one saved profile's name appears in `text`, return
-        (display_name, text); else None. Guards the set->load redirect so an
-        ambiguous description never silently loads the wrong profile."""
+        """Return (display_name, saved_text) for the saved profile the model's
+        `set` description is really naming, or None.
+
+        The model paraphrases ("use pig latin" -> "a bouncy voice that speaks in
+        Pig Latin with a cheerful tone"), and those paraphrases routinely brush
+        against OTHER profile names used as ordinary adjectives ('cheerful',
+        'calm', 'witty'). So "exactly one match" almost never held. Instead pick
+        the MOST SPECIFIC match: the longest profile name (by word count, then
+        characters) wins — 'pig latin' / 'formal butler' beat an incidental
+        'cheerful'. Only bail when the top two are equally specific (a genuine
+        tie, e.g. 'a calm, witty expert' — leave that as a novel set)."""
         store = self._store()
         if store is None:
             return None
@@ -153,8 +171,22 @@ class PersonaTool(BaseTool):
             if key and re.search(rf"\b{re.escape(key)}\b", norm):
                 saved = store.load(display)
                 if saved:
-                    hits.append((display, saved))
-        return hits[0] if len(hits) == 1 else None
+                    hits.append((display, saved, key))
+        if not hits:
+            return None
+        hits.sort(key=lambda h: (len(h[2].split()), len(h[2])), reverse=True)
+        if len(hits) == 1:
+            return hits[0][0], hits[0][1]
+        # Several matched. Only redirect on a CLEAR, MULTI-WORD winner: a
+        # specific name like 'pig latin' or 'formal butler' is intentional,
+        # whereas a lone adjective ('calm', 'witty') colliding with a profile
+        # name is almost always incidental — leave those as a novel set.
+        top, second = hits[0], hits[1]
+        top_spec = (len(top[2].split()), len(top[2]))
+        second_spec = (len(second[2].split()), len(second[2]))
+        if len(top[2].split()) >= 2 and top_spec > second_spec:
+            return top[0], top[1]
+        return None
 
     def _do_clear(self, session) -> ToolResult:
         had = bool(session.persona)
@@ -165,7 +197,8 @@ class PersonaTool(BaseTool):
                else "I'm already using my normal demeanor.")
         return ToolResult(status=ToolStatus.SUCCESS, message=msg)
 
-    def _do_save(self, session, params: Dict[str, Any]) -> ToolResult:
+    def _do_save(self, session, params: Dict[str, Any],
+                 apply_after: bool = False) -> ToolResult:
         store = self._store()
         if store is None:
             return ToolResult(status=ToolStatus.FAILED,
@@ -183,6 +216,16 @@ class PersonaTool(BaseTool):
         if store.save(name, text):
             log_event(logger, logging.INFO, f"Persona saved: {name}",
                       event="persona_save", name=name)
+            # apply_after: the caller asked to save AND use it this call (the
+            # set-with-name path), so adopt it now too.
+            if apply_after:
+                session.persona = text[:MAX_PERSONA_CHARS]
+                log_event(logger, logging.INFO, "Persona set for call",
+                          event="persona_set", chars=len(session.persona))
+                return ToolResult(
+                    status=ToolStatus.SUCCESS,
+                    message=f"Saved that as {name}, and I'll speak that way now.",
+                    data={"name": name, "persona": session.persona})
             return ToolResult(status=ToolStatus.SUCCESS,
                               message=f"Saved that style as {name}.",
                               data={"name": name})

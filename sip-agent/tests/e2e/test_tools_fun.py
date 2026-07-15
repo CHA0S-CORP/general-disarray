@@ -215,8 +215,14 @@ def test_story_over_call(single_play_wav, place_inbound_call, assert_spoke,
     tools = _tools_called(events)
     assert "STORY" in tools, f"STORY tool never fired; tool_calls={tools}"
 
-    assert any(t.strip() for t in _texts_for(events, "assistant_response")), (
-        "no assistant_response logged for the story"
+    # STORY is a speak_result tool: the generated story is folded into the
+    # reply and streamed straight to TTS, so there may be no assistant_response
+    # event — the story_told event (the tool ran) plus non-silent audio
+    # (assert_spoke above) is the delivery proof. Accept either signal.
+    assert ("story_told" in names
+            or "tool_result_folded" in names
+            or any(t.strip() for t in _texts_for(events, "assistant_response"))), (
+        f"story was not delivered; events were {sorted(set(names))}"
     )
 
 
