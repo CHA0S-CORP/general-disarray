@@ -49,6 +49,48 @@ async def test_clear_reverts_to_default(tmp_path, config_factory):
     assert a.session.persona == ""
 
 
+async def test_set_naming_a_saved_profile_redirects_to_load(tmp_path, config_factory):
+    """The model often reaches for set with its own paraphrase of a saved
+    profile ("use pig latin" -> set text="speaking in pig latin, bouncy..."),
+    losing the saved rules. When the description names a saved profile, the
+    real saved text must win."""
+    a = make_assistant(tmp_path, config_factory)
+    a.persona_store.save("Pig Latin", "Reply ONLY in Pig Latin. Every word.")
+
+    result = await PersonaTool(a).execute({
+        "action": "set",
+        "text": "speaking in pig latin, like a playful bouncy cartoon character",
+    })
+
+    assert result.status == ToolStatus.SUCCESS
+    # The saved profile's exact text is applied, not the model's paraphrase.
+    assert a.session.persona == "Reply ONLY in Pig Latin. Every word."
+    assert "Pig Latin" in result.message
+
+
+async def test_set_with_novel_description_is_not_redirected(tmp_path, config_factory):
+    """A genuinely new style that matches no saved profile is set as-is."""
+    a = make_assistant(tmp_path, config_factory)
+    a.persona_store.save("Pirate", "Talk like a pirate.")
+
+    result = await PersonaTool(a).execute({
+        "action": "set", "text": "a sleepy, mumbling night-shift clerk",
+    })
+    assert result.status == ToolStatus.SUCCESS
+    assert a.session.persona == "a sleepy, mumbling night-shift clerk"
+
+
+async def test_set_redirect_is_word_boundary_safe(tmp_path, config_factory):
+    """A saved name must match as a whole word, not inside another word."""
+    a = make_assistant(tmp_path, config_factory)
+    a.persona_store.save("Calm", "Be calm and steady.")
+    # "calminded" contains "calm" but is not naming the Calm profile.
+    result = await PersonaTool(a).execute({
+        "action": "set", "text": "a calminded improviser with wild energy",
+    })
+    assert a.session.persona == "a calminded improviser with wild energy"
+
+
 async def test_persona_is_capped(tmp_path, config_factory):
     a = make_assistant(tmp_path, config_factory)
     await PersonaTool(a).execute({"action": "set", "text": "x" * 5000})

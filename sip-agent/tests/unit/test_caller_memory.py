@@ -224,3 +224,21 @@ async def test_concurrent_updates_for_same_caller_serialize(store):
     )
 
     assert store.get("1001")["call_count"] == 2
+
+
+def test_extraction_prompt_excludes_persona_and_oneoffs():
+    """Regression: the extraction prompt must tell the model NOT to remember
+    persona/speaking-style choices or one-off questions, or those bleed into
+    every future call and mix (observed live: 'Pigleton'/Pig-Latin facts
+    injected into unrelated calls)."""
+    from caller_memory import _FACT_EXTRACTION_PROMPT
+    p = _FACT_EXTRACTION_PROMPT.lower()
+    assert "persona" in p and "pig latin" in p, "must name persona/style exclusion"
+    assert "carry over" in p or "only to the call" in p
+    assert "one-off" in p or "not what they" in p
+    # The one-line summary is ALSO injected into the next call, so it must be
+    # told not to mention the persona either (else the style leaks via the
+    # summary even when it's kept out of the facts).
+    assert "summary" in p
+    summary_guidance = p.split("summary of this latest call", 1)[-1]
+    assert "do not mention the persona" in summary_guidance

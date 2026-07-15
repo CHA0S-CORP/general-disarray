@@ -200,7 +200,7 @@ services:
       - THINKING_SOUND_INTERVAL_S=${THINKING_SOUND_INTERVAL_S:-2.5}
       # Byte cap for POST /play audio uploads
       - PLAY_AUDIO_MAX_BYTES=${PLAY_AUDIO_MAX_BYTES:-10485760}
-      - MAX_CONVERSATION_TURNS=${MAX_CONVERSATION_TURNS:-10}
+      - MAX_CONVERSATION_TURNS=${MAX_CONVERSATION_TURNS:-20}
       # Speaches API settings (unified STT + TTS)
       - SPEACHES_API_URL=http://speaches:8001
       # STT settings

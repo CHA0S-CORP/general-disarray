@@ -317,7 +317,12 @@ class Config:
     system_prompt: str = field(
         default_factory=lambda: os.getenv("SYSTEM_PROMPT") or _DEFAULT_SYSTEM_PROMPT)
     
-    max_conversation_turns: int = field(default_factory=lambda: int(os.getenv("MAX_CONVERSATION_TURNS", "10")))
+    # In-call history window (user+assistant pairs kept verbatim before older
+    # turns fold into the rolling summary). Keep this generously large: too
+    # small and the agent "forgets" what was said earlier in the same call.
+    # 20 turns (~40 messages) sits comfortably inside an 8k-token model context
+    # alongside the system prompt, tools, and caller memory.
+    max_conversation_turns: int = field(default_factory=lambda: int(os.getenv("MAX_CONVERSATION_TURNS", "20")))
 
     # Tool-call round trips allowed per turn (native tool-calling loop and the
     # langgraph agent's recursion budget). Bounds how long a model can chain

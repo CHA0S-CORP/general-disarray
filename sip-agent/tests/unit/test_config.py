@@ -12,6 +12,13 @@ def test_defaults(config):
     assert config.llm_backend == "vllm"
 
 
+def test_conversation_window_default_is_generous(config):
+    """Gotcha guard: a too-small in-call history window makes the agent 'forget'
+    what was said earlier in the same call (a live .env had it set to 1). The
+    shipped default must keep a usable amount of context."""
+    assert config.max_conversation_turns >= 10
+
+
 def test_whisper_api_url_alias(config):
     assert config.whisper_api_url == config.speaches_api_url
 
