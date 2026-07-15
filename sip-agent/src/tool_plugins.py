@@ -69,12 +69,21 @@ class ToolStatus(str, Enum):
 class ToolResult:
     """Result of a tool execution."""
     status: ToolStatus
+    # What the MODEL sees as the tool's result (the `tool` role message in
+    # native/agent mode). Source material: it may be long, and structured for
+    # comprehension rather than for a phone call.
     message: str = ""
     data: Dict[str, Any] = field(default_factory=dict)
-    
+    # What the CALLER hears, when a speak_result tool's output is spoken
+    # (marker mode) or folded in because the model didn't relay it. Defaults to
+    # `message` — set it only when the two must differ, i.e. when `message`
+    # carries material that is useful to read but unbearable to listen to
+    # (scraped search snippets, bullet lists, URLs).
+    spoken_message: str = ""
+
     def to_speech(self) -> str:
         """Convert result to speech-friendly text."""
-        return self.message
+        return self.spoken_message or self.message
 
 
 @dataclass

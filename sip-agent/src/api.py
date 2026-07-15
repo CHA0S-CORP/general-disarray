@@ -20,8 +20,14 @@ from typing import Optional, List, Dict, Any, TYPE_CHECKING
 from dataclasses import dataclass
 from enum import Enum
 
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, model_validator
+
+from admin_events import EventBus
+from call_session import set_current_session
 
 from telemetry import create_span, Metrics
 from logging_utils import log_event
@@ -74,6 +80,35 @@ def make_auth_dependency(token: str):
             raise HTTPException(status_code=401, detail="Invalid or missing API credentials")
 
     return _verify
+
+
+async def csrf_protect(request: Request):
+    """Reject cross-site browser requests to state-changing endpoints.
+
+    In the (supported) tokenless localhost mode a bodyless, header-free POST
+    is a CORS-"simple" request: any web page the operator's browser visits can
+    fire it without a preflight (drive-by CSRF). Browsers attach fetch
+    metadata (``Sec-Fetch-Site``) and/or an ``Origin`` header to such
+    requests, so we reject anything that self-identifies as cross-site.
+    Non-browser clients (curl, n8n, scripts) send neither header and pass
+    through untouched, as do same-origin requests from the admin page.
+    """
+    fetch_site = request.headers.get("sec-fetch-site")
+    if fetch_site:
+        # Modern browsers: trust the fetch metadata outright ("none" is a
+        # user-initiated navigation; anything not same-origin is rejected).
+        if fetch_site in ("same-origin", "none"):
+            return
+        raise HTTPException(status_code=403,
+                            detail="Cross-site browser requests are not allowed")
+    origin = request.headers.get("origin")
+    if origin:
+        # Older browsers without fetch metadata: compare Origin to Host.
+        host = request.headers.get("host", "")
+        origin_host = urlparse(origin).netloc
+        if not origin_host or not host or origin_host.lower() != host.lower():
+            raise HTTPException(status_code=403,
+                                detail="Cross-origin browser requests are not allowed")
 
 
 class RateLimiter:
@@ -396,6 +431,13 @@ class OutboundCallRequest(ChoiceCallbackModel):
         default=False,
         description="Rewrite the message into natural spoken form via the LLM "
                     "(preserves all facts; falls back to the original on failure)")
+    caller_name: Optional[str] = Field(
+        default=None, max_length=64,
+        description="Display name shown to the person being called, e.g. "
+                    "'Weather Alert'. Overrides the From header for this call "
+                    "only; unset keeps the agent's registered identity. An "
+                    "internal PBX passes this through to the handset, but a "
+                    "PSTN carrier will typically replace it with its own CNAM.")
 
 
 class CallStatus(str, Enum):
@@ -550,6 +592,42 @@ class ScheduledCallInfo(BaseModel):
     status: str
 
 
+class VirtualNumberRequest(BaseModel):
+    """Request to create an ephemeral inbound extension."""
+    number: Optional[str] = Field(
+        default=None,
+        description="Explicit extension (digits/*/#); omit to auto-allocate "
+                    "from VIRTUAL_NUMBER_RANGE")
+    ttl_s: Optional[int] = Field(
+        default=None, gt=0,
+        description="Seconds until the unused number expires "
+                    "(default VIRTUAL_NUMBER_DEFAULT_TTL_S, clamped to max)")
+    purpose: str = Field(
+        ..., min_length=1, max_length=2000,
+        description="What this number is for; injected into the system prompt "
+                    "for the call that arrives on it")
+    greeting: Optional[str] = Field(
+        default=None, max_length=500,
+        description="Custom greeting spoken instead of the default one")
+    callback_url: Optional[str] = Field(
+        default=None,
+        description="Webhook URL to POST the call outcome (and transcript) to")
+    include_transcript: bool = Field(
+        default=True,
+        description="Include the transcript in the completion webhook")
+
+
+class VirtualNumberResponse(BaseModel):
+    """A virtual number registry entry."""
+    id: str
+    number: str
+    sip_uri: str
+    status: str
+    purpose: str
+    expires_at: float
+    created_at: float
+
+
 class ToolExecuteResponse(BaseModel):
     """Response from tool execution."""
     success: bool
@@ -660,6 +738,11 @@ class OutboundCallHandler:
         can persist the real outcome; expected failures (initiate failure,
         no answer) do not raise.
         """
+        # Task body top: this notification call has no CallSession of its
+        # own — explicitly unbind so nothing in this task (AMD, choice
+        # collection, hangups) can resolve to a live conversational session
+        # inherited from the spawning context.
+        set_current_session(None)
         start_time = asyncio.get_event_loop().time()
         status = CallStatus.FAILED
         message_played = False
@@ -703,7 +786,8 @@ class OutboundCallHandler:
                     choice_audio = await self.assistant.audio_pipeline.synthesize(request.choice.prompt)
                 
                 # Make the call
-                call_info = await self.assistant.sip_handler.make_call(extension)
+                call_info = await self.assistant.sip_handler.make_call(
+                    extension, caller_name=request.caller_name)
                 if not call_info:
                     status = CallStatus.FAILED
                     error = "Failed to initiate call"
@@ -745,8 +829,14 @@ class OutboundCallHandler:
                 # Classify the answerer before speaking (config-gated). The
                 # message still plays either way — voicemail delivery is often
                 # wanted — but the webhook reports who (or what) answered.
+                # Per-call audio state for AMD + choice collection (shared
+                # across both stages of this call, isolated from the live
+                # inbound session's pipeline state).
+                audio_state = self.assistant.audio_pipeline.new_session_state()
+
                 if self.assistant.config.amd_enabled:
-                    machine_answered = await self._detect_answering_machine(call_info)
+                    machine_answered = await self._detect_answering_machine(
+                        call_info, audio_state)
                     span.set_attribute("call.machine_answered", machine_answered)
                     log_event(logger, logging.INFO,
                              f"AMD result: {'machine' if machine_answered else 'human'}",
@@ -768,7 +858,8 @@ class OutboundCallHandler:
                 # Handle choice collection if configured
                 if request.choice and choice_audio:
                     choice_response, choice_raw_text = await self._collect_choice(
-                        call_id, call_info, request.choice, choice_audio
+                        call_id, call_info, request.choice, choice_audio,
+                        audio_state
                     )
                     if transcripts:
                         transcripts.add_turn(call_id, "assistant", request.choice.prompt)
@@ -848,7 +939,7 @@ class OutboundCallHandler:
 
         return status, error
 
-    async def _detect_answering_machine(self, call_info) -> bool:
+    async def _detect_answering_machine(self, call_info, audio_state) -> bool:
         """Heuristic AMD: a human answers briefly ("Hello?") then waits; a
         machine greeting keeps talking. Listens for AMD_WINDOW_S and returns
         True once continuous speech exceeds AMD_MACHINE_SPEECH_MS.
@@ -868,8 +959,16 @@ class OutboundCallHandler:
             except Exception as e:
                 logger.debug(f"AMD audio receive error: {e}")
 
-            if chunk and self.assistant.audio_pipeline.has_speech(chunk):
-                continuous_ms += cfg.chunk_duration_ms
+            # update_noise=True: has_speech() is the ONLY per-chunk check in
+            # this window (process_audio never runs during AMD), so it must
+            # keep feeding the adaptive noise floor — with a frozen floor,
+            # steady line noise would read as continuous machine speech.
+            if chunk and self.assistant.audio_pipeline.has_speech(
+                    audio_state, chunk, update_noise=True):
+                # Chunks are variable-length (up to 100ms from receive_audio);
+                # credit the real duration, not a flat chunk_duration_ms, or
+                # amd_machine_speech_ms takes ~5x longer to reach than configured.
+                continuous_ms += len(chunk) / 2 / cfg.sample_rate * 1000
                 if continuous_ms >= cfg.amd_machine_speech_ms:
                     return True
             elif chunk:
@@ -881,11 +980,12 @@ class OutboundCallHandler:
         return False
 
     async def _collect_choice(
-        self, 
+        self,
         call_id: str,
         call_info,
         choice: ChoicePrompt,
-        choice_audio: bytes
+        choice_audio: bytes,
+        audio_state
     ) -> tuple[Optional[str], Optional[str]]:
         """
         Collect user choice via voice.
@@ -907,7 +1007,8 @@ class OutboundCallHandler:
             # Listen for a spoken response or a DTMF keypress
             response = await self._listen_for_response(
                 call_info,
-                timeout=choice.timeout_seconds
+                timeout=choice.timeout_seconds,
+                audio_state=audio_state
             )
 
             if response:
@@ -930,7 +1031,8 @@ class OutboundCallHandler:
 
         return None, last_text
         
-    async def _listen_for_response(self, call_info, timeout: float) -> Optional[tuple]:
+    async def _listen_for_response(self, call_info, timeout: float,
+                                   audio_state=None) -> Optional[tuple]:
         """Listen for a spoken response or a DTMF keypress.
 
         Returns ("speech", transcription) or ("dtmf", digit), or None on
@@ -939,6 +1041,17 @@ class OutboundCallHandler:
         """
         start_time = asyncio.get_event_loop().time()
         get_dtmf = getattr(self.assistant.sip_handler, 'get_dtmf_digit', None)
+        if audio_state is None:
+            audio_state = self.assistant.audio_pipeline.new_session_state()
+
+        # Speculative endpointing's short silence cutoff relies on main.py's
+        # hold/merge machinery, which this collection path does not have —
+        # fall back to the fixed timeout so a mid-answer hesitation ("um ...
+        # option two") isn't committed as a fragment. Adaptive mode is
+        # self-contained in the VAD and stays as configured.
+        endpoint_mode = ("fixed"
+                        if self.assistant.config.endpoint_mode == "speculative"
+                        else None)
 
         while asyncio.get_event_loop().time() - start_time < timeout:
             if not getattr(call_info, 'is_active', False):
@@ -959,7 +1072,8 @@ class OutboundCallHandler:
                 )
 
                 if audio_chunk:
-                    transcription = await self.assistant.audio_pipeline.process_audio(audio_chunk)
+                    transcription = await self.assistant.audio_pipeline.process_audio(
+                        audio_state, audio_chunk, endpoint_mode=endpoint_mode)
                     if transcription and len(transcription.strip()) > 1:
                         return ("speech", transcription.strip())
 
@@ -1111,6 +1225,16 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
     auth = make_auth_dependency(assistant.config.api_auth_token)
     rate_limit = make_rate_limit_dependency(assistant.config)
     protected = [Depends(auth), Depends(rate_limit)]
+
+    # In-process event bus feeding the admin dashboard's SSE stream. The real
+    # assistant attaches one at construction; attach one here too so any
+    # assistant-shaped object (tests, embedding) gets a working bus.
+    events_bus: EventBus = getattr(assistant, "events", None) or EventBus()
+    if getattr(assistant, "events", None) is None:
+        try:
+            assistant.events = events_bus
+        except Exception:
+            pass
     if not assistant.config.api_auth_token:
         logger.warning(
             "API_AUTH_TOKEN is not set - REST API endpoints are unauthenticated. "
@@ -1290,6 +1414,109 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
         if transcript is None:
             raise HTTPException(status_code=404, detail=f"No transcript for call '{call_id}'")
         return transcript
+
+    # ==========================================================================
+    # Admin dashboard API (call summaries, live call, SSE event stream, page)
+    # ==========================================================================
+
+    # Auth-gated like the transcript endpoint: call summaries and the live
+    # event stream expose who called and what was said.
+    @app.get("/calls", dependencies=protected)
+    async def list_calls():
+        """Recent call summaries (live + the in-memory LRU), newest first."""
+        store = getattr(assistant, "transcripts", None)
+        return store.list_recent() if store else []
+
+    def _session_summary(session) -> Dict[str, Any]:
+        history = getattr(session, "conversation_history", []) or []
+        return {
+            "call_id": session.transcript_id,
+            "caller": getattr(session.call_info, "remote_uri", "") or "",
+            "direction": session.direction,
+            "duration_seconds": round(time.time() - session.start_time, 1),
+            "turns": len([m for m in history if m.get("role") == "user"]),
+        }
+
+    @app.get("/calls/active", dependencies=protected)
+    async def get_active_calls():
+        """Summaries of ALL live call sessions (several may be active with
+        MAX_CONCURRENT_CALLS > 1). ``calls`` is empty when idle."""
+        sessions = _active_call_sessions(assistant)
+        calls = [_session_summary(s) for s in sessions]
+        return {"active": bool(calls), "count": len(calls), "calls": calls}
+
+    @app.post("/calls/active/hangup",
+              dependencies=protected + [Depends(csrf_protect)])
+    async def hangup_active_call(call_id: Optional[str] = None):
+        """Hang up a live call. 404 when there is no active call; with 2+
+        active calls a call_id is required (409 lists the active ids)."""
+        sessions = _active_call_sessions(assistant)
+        if not sessions:
+            raise HTTPException(status_code=404, detail="No active call")
+        if call_id:
+            session = next(
+                (s for s in sessions if _session_matches(s, call_id)), None)
+            if session is None:
+                raise HTTPException(status_code=404,
+                                    detail=f"No active call '{call_id}'")
+        elif len(sessions) > 1:
+            raise HTTPException(status_code=409, detail={
+                "error": "Multiple active calls; specify call_id",
+                "active_call_ids": [s.transcript_id for s in sessions]})
+        else:
+            session = sessions[0]
+        log_event(logger, logging.INFO, "Admin hangup of active call",
+                 event="admin_hangup", call_id=session.transcript_id)
+        await assistant.sip_handler.hangup_call(session.call_info)
+        return {"success": True, "call_id": session.transcript_id}
+
+    @app.get("/admin/events", dependencies=protected)
+    async def admin_event_stream():
+        """Server-Sent Events stream of live call/turn/tool events.
+
+        Plain SSE frames (`data: {json}\\n\\n`) with a `: keepalive` comment
+        every ~15s. Browsers' EventSource cannot send auth headers, so the
+        dashboard consumes this with fetch() + a streaming reader instead —
+        the wire format is standard SSE either way.
+        """
+        async def _stream():
+            # Subscribe INSIDE the generator, as its first statement: if the
+            # client aborts before the response body starts streaming, the
+            # generator is never started and a never-started async generator's
+            # `finally` block never runs — so subscribing eagerly in the
+            # handler would leak the queue on EventBus._subscribers forever
+            # (one 256-slot queue per aborted connect, fed on every publish).
+            # Subscribing lazily means the abort-before-first-iteration path
+            # never subscribes at all, and every path that DOES subscribe
+            # reaches the `finally` below on disconnect.
+            q = events_bus.subscribe()
+            try:
+                while True:
+                    try:
+                        item = await asyncio.wait_for(q.get(), timeout=15.0)
+                        yield f"data: {json.dumps(item)}\n\n"
+                    except asyncio.TimeoutError:
+                        yield ": keepalive\n\n"
+            finally:
+                events_bus.unsubscribe(q)
+
+        return StreamingResponse(
+            _stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # No auth on the page itself: it is a static shell containing no data —
+    # every data endpoint it calls is auth-gated individually.
+    @app.get("/admin", include_in_schema=False)
+    async def admin_page():
+        """Serve the self-contained operator dashboard page."""
+        if not assistant.config.admin_ui_enabled:
+            raise HTTPException(status_code=404, detail="Admin UI is disabled")
+        page = Path(__file__).parent / "admin" / "index.html"
+        if not page.is_file():
+            raise HTTPException(status_code=404, detail="Admin page not found")
+        return FileResponse(page, media_type="text/html")
 
     # Store handler reference for queue worker
     app.state.handler = handler
@@ -1518,7 +1745,15 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
             
             # Speak result to active call if requested
             if request.speak_result and success and result.message:
-                spoken = await _speak_to_call(assistant, result.message, request.call_id)
+                try:
+                    spoken = await _speak_to_call(assistant, result.message, request.call_id)
+                except AmbiguousActiveCall:
+                    # The tool itself succeeded; ambiguity only means the
+                    # result couldn't be spoken anywhere unambiguous.
+                    spoken = False
+                    log_event(logger, logging.WARNING,
+                             "Multiple active calls; pass call_id to speak the result",
+                             event="api_tool_ambiguous_call")
                 response.spoken = spoken
                 if not spoken:
                     log_event(logger, logging.WARNING, "No active call to speak to",
@@ -1644,13 +1879,62 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
             raise HTTPException(status_code=400, detail="Message is required")
 
         message = await _maybe_reformat(assistant, message, reformat_for_speech)
-        spoken = await _speak_to_call(assistant, message, call_id)
-        
+        try:
+            spoken = await _speak_to_call(assistant, message, call_id)
+        except AmbiguousActiveCall as e:
+            raise HTTPException(status_code=409, detail={
+                "error": "Multiple active calls; specify call_id",
+                "active_call_ids": e.call_ids})
+
         if spoken:
             return {"success": True, "message": "Message spoken to call"}
         else:
             raise HTTPException(status_code=404, detail="No active call to speak to")
-    
+
+    @app.post("/play", dependencies=protected)
+    async def play_audio(request: Request, call_id: Optional[str] = None):
+        """
+        Play an uploaded audio file into the active call.
+
+        Send the audio file's bytes as the raw request body (any format
+        libsndfile can decode: WAV, FLAC, OGG; MP3 with libsndfile >= 1.1).
+        The audio is decoded, downmixed to mono, resampled to the call rate,
+        and queued on the same playlist player /speak uses.
+
+        Query params:
+        - call_id: Optional specific call ID (if multiple calls active)
+        """
+        data = await request.body()
+        if not data:
+            raise HTTPException(status_code=400, detail="Audio body is required")
+        max_bytes = assistant.config.play_max_bytes
+        if len(data) > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Audio exceeds PLAY_AUDIO_MAX_BYTES ({max_bytes})")
+
+        from audio_pipeline import decode_audio_to_pcm16
+        sample_rate = assistant.config.sample_rate
+        try:
+            pcm = await asyncio.get_event_loop().run_in_executor(
+                None, decode_audio_to_pcm16, data, sample_rate)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        try:
+            played = await _play_to_call(assistant, pcm, call_id)
+        except AmbiguousActiveCall as e:
+            raise HTTPException(status_code=409, detail={
+                "error": "Multiple active calls; specify call_id",
+                "active_call_ids": e.call_ids})
+        if not played:
+            raise HTTPException(status_code=404, detail="No active call to play to")
+        return {
+            "success": True,
+            "message": "Audio queued for playback",
+            "duration_s": round(len(pcm) / (sample_rate * 2), 2),
+        }
+
     # ==========================================================================
     # Scheduled Calls API
     # ==========================================================================
@@ -1815,9 +2099,10 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
     async def list_scheduled_calls():
         """List all scheduled calls."""
         scheduled = []
-        # execute_at is a datetime, so compare against wall-clock now (not the
-        # event-loop monotonic clock) and format it directly.
-        now = datetime.now()
+        # execute_at is naive LOCAL_TIMEZONE wall-clock (the scheduler's
+        # clock, Config.local_now) — never compare it against the container
+        # clock or remaining_seconds is hours off when the two differ.
+        now = assistant.config.local_now()
 
         for task_id, task in assistant.tool_manager.scheduled_tasks.items():
             if task.task_type == "scheduled_call":
@@ -1845,7 +2130,7 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
         if not task or task.task_type != "scheduled_call":
             raise HTTPException(status_code=404, detail="Scheduled call not found")
 
-        now = datetime.now()
+        now = assistant.config.local_now()
         remaining = max(0, int((task.execute_at - now).total_seconds()))
         metadata = task.metadata or {}
 
@@ -1871,45 +2156,219 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
                  event="call_schedule_cancelled", schedule_id=schedule_id)
         
         return {"success": True, "message": f"Scheduled call {schedule_id} cancelled"}
-    
+
+    # ==========================================================================
+    # Virtual Numbers API (ephemeral inbound extensions)
+    # ==========================================================================
+
+    def _require_virtual_numbers():
+        if not assistant.config.virtual_numbers_enabled:
+            raise RequestRejected(
+                403, "Virtual numbers are disabled (set VIRTUAL_NUMBERS_ENABLED=true)")
+
+    def _virtual_number_response(entry) -> VirtualNumberResponse:
+        return VirtualNumberResponse(
+            id=entry.id,
+            number=entry.number,
+            sip_uri=f"sip:{entry.number}@{assistant.config.sip_domain}",
+            status="claimed" if entry.claimed else "active",
+            purpose=entry.purpose,
+            expires_at=entry.expires_at,
+            created_at=entry.created_at,
+        )
+
+    @app.post("/virtual-numbers", response_model=VirtualNumberResponse,
+              dependencies=protected)
+    async def create_virtual_number(request: VirtualNumberRequest):
+        """
+        Create an ephemeral inbound extension.
+
+        The agent listens for a call dialed to the returned number in the
+        background. When the call arrives it is answered as the normal
+        assistant with `purpose` injected as context (plus the optional custom
+        greeting); when the call ends, the outcome and transcript are POSTed
+        to `callback_url` and the number is cleared. Unused numbers expire
+        after `ttl_s` (an "expired" webhook fires instead).
+
+        Example:
+        ```json
+        {
+            "purpose": "The caller is confirming pizza order #4211 for pickup.",
+            "greeting": "Hi! Calling about your pizza order?",
+            "ttl_s": 1800,
+            "callback_url": "https://n8n.local/webhook/pizza-call"
+        }
+        ```
+        """
+        _require_virtual_numbers()
+        await validate_callback_url(request.callback_url, assistant.config)
+
+        from virtual_numbers import VirtualNumberError
+        try:
+            entry = assistant.virtual_numbers.create(
+                number=request.number,
+                ttl_s=request.ttl_s,
+                purpose=request.purpose,
+                greeting=request.greeting or "",
+                callback_url=request.callback_url or "",
+                include_transcript=request.include_transcript,
+            )
+        except VirtualNumberError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.detail)
+
+        return _virtual_number_response(entry)
+
+    @app.get("/virtual-numbers", response_model=List[VirtualNumberResponse],
+             dependencies=protected)
+    async def list_virtual_numbers():
+        """List active virtual numbers."""
+        _require_virtual_numbers()
+        return [_virtual_number_response(e)
+                for e in assistant.virtual_numbers.list_active()]
+
+    @app.get("/virtual-numbers/{number_id}", response_model=VirtualNumberResponse,
+             dependencies=protected)
+    async def get_virtual_number(number_id: str):
+        """Get one virtual number (404 once consumed/expired/deleted)."""
+        _require_virtual_numbers()
+        entry = assistant.virtual_numbers.get(number_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Virtual number not found")
+        return _virtual_number_response(entry)
+
+    @app.delete("/virtual-numbers/{number_id}", dependencies=protected)
+    async def delete_virtual_number(number_id: str):
+        """Delete a virtual number before it is used (no webhook fires)."""
+        _require_virtual_numbers()
+        if not assistant.virtual_numbers.delete(number_id):
+            raise HTTPException(status_code=404, detail="Virtual number not found")
+        return {"success": True, "message": f"Virtual number {number_id} deleted"}
+
     return app
+
+
+class AmbiguousActiveCall(Exception):
+    """Several calls are active and no call_id was given to pick one.
+
+    Endpoints translate this into a 409 carrying the active call ids."""
+
+    def __init__(self, call_ids: List[str]):
+        self.call_ids = call_ids
+        super().__init__("Multiple active calls; specify call_id")
+
+
+def _active_call_sessions(assistant: 'SIPAIAssistant') -> List[Any]:
+    """All registered call sessions, newest last.
+
+    Prefers the session registry (assistant.sessions); falls back to the
+    single-session attribute for assistants without a registry (test
+    doubles / older shims)."""
+    sessions = getattr(assistant, "sessions", None)
+    if sessions:
+        return list(sessions.values())
+    single = getattr(assistant, "session", None)
+    return [single] if single is not None else []
+
+
+def _session_matches(session: Any, call_id: str) -> bool:
+    """True when ``call_id`` names this session (transcript id — the id the
+    API exposes — or the underlying SIP-level call id)."""
+    if not call_id:
+        return False
+    if getattr(session, "transcript_id", None) == call_id:
+        return True
+    info = getattr(session, "call_info", None)
+    if info is None:
+        return False
+    return (getattr(info, "call_id", None) == call_id
+            or getattr(info, "id", None) == call_id)
+
+
+def _resolve_active_call(assistant: 'SIPAIAssistant', call_id: Optional[str] = None):
+    """The target call's CallInfo, or None when idle / call_id mismatch.
+
+    With several active sessions and no call_id, raises AmbiguousActiveCall
+    so callers can answer 409 with the list of active call ids."""
+    sessions = _active_call_sessions(assistant)
+    if sessions:
+        if call_id:
+            for session in sessions:
+                if _session_matches(session, call_id):
+                    return session.call_info
+            logger.debug(f"No active session matches call_id {call_id}")
+            return None
+        if len(sessions) > 1:
+            raise AmbiguousActiveCall(
+                [getattr(s, "transcript_id", "") or "" for s in sessions])
+        return sessions[0].call_info
+
+    # No session registry entries: legacy single current_call (compat shims
+    # and test doubles that only set assistant.current_call).
+    current_call = getattr(assistant, 'current_call', None)
+
+    if not current_call:
+        logger.debug("No current_call attribute on assistant")
+        return None
+
+    # If call_id specified, verify it matches
+    if call_id:
+        current_call_id = getattr(current_call, 'call_id', None) or getattr(current_call, 'id', None)
+        if current_call_id != call_id:
+            logger.debug(f"Call ID mismatch: {current_call_id} != {call_id}")
+            return None
+
+    return current_call
 
 
 async def _speak_to_call(assistant: 'SIPAIAssistant', message: str, call_id: Optional[str] = None) -> bool:
     """
     Speak a message to an active call.
-    
-    Returns True if message was spoken, False if no active call.
+
+    Returns True if message was spoken, False if no active call. Raises
+    AmbiguousActiveCall when several calls are active and no call_id picks one.
     """
+    current_call = _resolve_active_call(assistant, call_id)
+    if not current_call:
+        return False
     try:
-        # Check if there's an active call
-        current_call = getattr(assistant, 'current_call', None)
-        
-        if not current_call:
-            logger.debug("No current_call attribute on assistant")
-            return False
-        
-        # If call_id specified, verify it matches
-        if call_id:
-            current_call_id = getattr(current_call, 'call_id', None) or getattr(current_call, 'id', None)
-            if current_call_id != call_id:
-                logger.debug(f"Call ID mismatch: {current_call_id} != {call_id}")
-                return False
-        
+
         # Generate TTS
         audio_data = await assistant.audio_pipeline.synthesize(message)
         if not audio_data:
             logger.error("Failed to synthesize speech")
             return False
-        
+
         # Send audio to call (send_audio requires the active CallInfo)
         await assistant.sip_handler.send_audio(current_call, audio_data)
 
         log_event(logger, logging.INFO, f"Spoke message to call: {message[:50]}...",
                  event="api_speak_success")
-        
+
         return True
-        
+
     except Exception as e:
         logger.error(f"Failed to speak to call: {e}", exc_info=True)
+        return False
+
+
+async def _play_to_call(assistant: 'SIPAIAssistant', pcm: bytes, call_id: Optional[str] = None) -> bool:
+    """
+    Play already-decoded PCM audio into an active call.
+
+    Returns True if audio was queued, False if no active call. Raises
+    AmbiguousActiveCall when several calls are active and no call_id picks one.
+    """
+    current_call = _resolve_active_call(assistant, call_id)
+    if not current_call:
+        return False
+    try:
+        await assistant.sip_handler.send_audio(current_call, pcm)
+
+        log_event(logger, logging.INFO,
+                  f"Queued {len(pcm)} bytes of uploaded audio to call",
+                  event="api_play_success")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to play audio to call: {e}", exc_info=True)
         return False

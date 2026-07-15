@@ -65,7 +65,10 @@ def _tts_pcm(text: str, speaches_url: str) -> np.ndarray:
     return _resample(samples, rate, TARGET_RATE)
 
 
-def _write_padded(path: Path, speech: np.ndarray, lead_s: float = 3.0, trail_s: float = 1.0):
+def _write_padded(path: Path, speech: np.ndarray, lead_s: float = 3.0, trail_s: float = 90.0):
+    # trail_s must exceed the longest test call duration: pjsua --auto-play
+    # LOOPS the file, so a short WAV re-asks the question mid-reply, which the
+    # agent (correctly) treats as a barge-in and truncates its answer.
     lead = np.zeros(int(lead_s * TARGET_RATE), dtype=np.int16)
     trail = np.zeros(int(trail_s * TARGET_RATE), dtype=np.int16)
     full = np.concatenate([lead, speech, trail])

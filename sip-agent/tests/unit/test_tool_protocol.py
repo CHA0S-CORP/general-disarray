@@ -76,6 +76,20 @@ async def test_multiple_tool_calls(engine_and_tm):
     assert len(results) == 2
 
 
+async def test_json_value_with_array_survives_marker_regex(engine_and_tm):
+    # MCP tools with nested params receive them as "JSON object as a string";
+    # a JSON array's ']' must not truncate the marker match.
+    engine, tm = engine_and_tm
+    clean, _ = await engine._process_tool_calls(
+        'On it. [TOOL:HA_SET_SCENE:options={"ids": [1, 2]},confirm=true]'
+    )
+    params = tm.calls[0].params
+    assert params["options"] == '{"ids": [1, 2]}'
+    assert params["confirm"] is True
+    assert "[TOOL" not in clean
+    assert clean == "On it."
+
+
 async def test_plain_text_has_no_tool_calls(engine_and_tm):
     engine, tm = engine_and_tm
     clean, results = await engine._process_tool_calls("Just a normal reply.")

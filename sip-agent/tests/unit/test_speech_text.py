@@ -53,3 +53,47 @@ def test_default_phrases_are_unchanged():
     from config import PhrasesConfig
     for phrase in PhrasesConfig().get_all_phrases_for_cache():
         assert sanitize_for_speech(phrase) == phrase
+
+
+# --- farewell detection ------------------------------------------------------
+
+from speech_text import is_farewell  # noqa: E402
+
+
+@pytest.mark.parametrize("text", [
+    "Bye.",
+    "bye bye",
+    "Goodbye!",
+    "Good bye",
+    "Okay, thanks. Bye!",
+    "No thanks, goodbye.",
+    "Thank you very much, bye now.",
+    "Alright, take care!",
+    "That's all, thanks!",
+    "I'm done, thank you.",
+    "gotta go, bye",
+    "Hang up.",
+    "End the call.",
+    "Okay bye, take care.",
+    "That's all right, bye.",           # non-farewell phrase + real farewell
+])
+def test_is_farewell_true(text):
+    assert is_farewell(text) is True
+
+
+@pytest.mark.parametrize("text", [
+    "",
+    "By the way, what's the weather?",
+    "Bye the way",                      # STT slip, but extra non-filler word
+    "Goodbye is a word I like.",
+    "Tell me about the movie The Goodbye Girl.",
+    "Can you say goodbye in French?",
+    "No.",                              # filler only, no farewell
+    "Thanks!",                          # pleasantry only, not a goodbye
+    "I need to go to the store, set a timer first.",
+    "What time is it?",
+    "That's all right.",                # means "that's okay", not goodbye
+    "that is all right",
+])
+def test_is_farewell_false(text):
+    assert is_farewell(text) is False

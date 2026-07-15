@@ -6,3 +6,6 @@ cache/
 data/scheduled_tasks.json
 
 data/workflows.json
+data/virtual_numbers.json
+data/mcp_servers.json
+sip-agent/tests/e2e/reports/

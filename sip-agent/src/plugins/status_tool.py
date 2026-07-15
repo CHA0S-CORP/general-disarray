@@ -8,7 +8,6 @@ User: "Do I have any timers running?"
 LLM: [TOOL:STATUS]
 """
 
-from datetime import datetime
 from typing import Any, Dict
 
 from tool_plugins import BaseTool, ToolResult, ToolStatus
@@ -35,7 +34,8 @@ class StatusTool(BaseTool):
             
         messages = []
         for task in pending:
-            remaining = (task.execute_at - datetime.now()).total_seconds()
+            # execute_at is on the scheduler's LOCAL_TIMEZONE wall clock.
+            remaining = (task.execute_at - self.config.local_now()).total_seconds()
             if remaining > 0:
                 # Format remaining time nicely
                 if remaining < 60:

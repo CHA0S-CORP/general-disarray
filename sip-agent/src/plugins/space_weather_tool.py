@@ -13,7 +13,7 @@ LLM: [TOOL:KP_INDEX]
 import logging
 from typing import Any, Dict, Optional, Tuple
 
-import httpx
+from plugins.helpers import fetch_json
 
 from tool_plugins import BaseTool, ToolResult, ToolStatus
 from logging_utils import log_event
@@ -30,10 +30,7 @@ _DIGIT_WORDS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "
 async def _fetch_json(url: str, params: Optional[Dict[str, Any]] = None,
                       headers: Optional[Dict[str, str]] = None) -> Any:
     """Module-level HTTP helper so tests can monkeypatch it."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(url, params=params, headers=headers)
-        response.raise_for_status()
-        return response.json()
+    return await fetch_json(url, params=params, headers=headers)
 
 
 def _classify(kp: float) -> Tuple[str, str]:

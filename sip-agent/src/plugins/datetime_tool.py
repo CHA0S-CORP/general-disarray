@@ -35,22 +35,37 @@ class DateTimeTool(BaseTool):
         },
         "timezone": {
             "type": "string",
-            "description": "Timezone (e.g., 'US/Pacific', 'US/Eastern', 'UTC')",
+            "description": "Timezone (e.g., 'US/Pacific', 'US/Eastern', 'UTC'); "
+                           "defaults to the configured local timezone",
             "required": False,
             "default": "US/Pacific"
         }
     }
-    
+
+    def __init__(self, assistant):
+        super().__init__(assistant)
+        self._default_tz = (getattr(self.config, "local_timezone", None)
+                            or "US/Pacific") if self.config else "US/Pacific"
+        # Instance-level copy so the advertised schema default matches config.
+        self.parameters = {
+            **self.parameters,
+            "timezone": {**self.parameters["timezone"], "default": self._default_tz},
+        }
+
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
         format_type = (params.get("format") or "datetime").lower()
-        timezone_str = params.get("timezone") or "US/Pacific"
-        
+        timezone_str = params.get("timezone") or self._default_tz
+
         # Get timezone
         try:
             tz = pytz.timezone(timezone_str)
         except pytz.exceptions.UnknownTimeZoneError:
-            tz = pytz.timezone("US/Pacific")
-            timezone_str = "US/Pacific"
+            try:
+                timezone_str = self._default_tz
+                tz = pytz.timezone(timezone_str)
+            except pytz.exceptions.UnknownTimeZoneError:
+                timezone_str = "US/Pacific"
+                tz = pytz.timezone(timezone_str)
             
         now = datetime.now(tz)
         

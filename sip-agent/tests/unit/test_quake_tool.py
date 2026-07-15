@@ -84,7 +84,7 @@ def test_resolve_period(value, expected):
 
 # --- execute() ----------------------------------------------------------------
 
-async def test_happy_path_sorted_top_three_spoken(monkeypatch):
+async def test_default_sort_recent_names_both_rankings(monkeypatch):
     now_ms = int(time.time() * 1000)
     features = [
         _feature(3.1, "10 km N of Barstow, CA", now_ms - 3600_000, -117.0, 34.9),
@@ -101,14 +101,83 @@ async def test_happy_path_sorted_top_three_spoken(monkeypatch):
     assert result.status == ToolStatus.SUCCESS
     assert captured["url"].endswith("2.5_day.geojson")
     assert result.data["count"] == 4
-    mags = [q["mag"] for q in result.data["quakes"]]
-    assert mags == sorted(mags, reverse=True)
+    # Default ranking is newest-first, and the classification fields make the
+    # ranking explicit so the model never has to re-sort the list.
+    times = [q["ago"] for q in result.data["quakes"]]
+    assert result.data["quakes"][0]["place"] == "Fresno, CA", times
+    assert result.data["most_recent"]["place"] == "Fresno, CA"
+    assert result.data["largest"]["place"] == "Ridgecrest, CA"
+    assert result.data["sort"] == "recent"
     assert result.message.startswith("Four quakes in the last day.")
-    assert "four point six" in result.message
-    assert "Ridgecrest, California" in result.message
-    # Only the top three are spoken; the smallest quake stays in data only
-    assert "Fresno" not in result.message
-    assert result.data["quakes"][3]["place"] == "Fresno, CA"
+    assert "The most recent was magnitude two point six near Fresno, California" in result.message
+    assert "The largest was magnitude four point six near Ridgecrest, California" in result.message
+
+
+async def test_sort_biggest_leads_with_largest(monkeypatch):
+    now_ms = int(time.time() * 1000)
+    features = [
+        _feature(2.6, "5 km W of Fresno, CA", now_ms - 600_000, -119.8, 36.7),
+        _feature(4.6, "12 km SE of Ridgecrest, CA", now_ms - 2 * 3600_000, -117.5, 35.6),
+    ]
+    _patch_feed(monkeypatch, features)
+
+    tool = EarthquakeTool(assistant=None)
+    result = await tool.execute({"sort": "biggest"})
+
+    assert result.data["quakes"][0]["place"] == "Ridgecrest, CA"
+    assert "The largest was magnitude four point six" in result.message
+    assert "The most recent was magnitude two point six" in result.message
+
+
+async def test_sort_nearest_with_coords(monkeypatch, config_factory):
+    cfg = config_factory(weather_latitude="36.7", weather_longitude="-119.8")
+    assistant = SimpleNamespace(config=cfg, session=None)
+    now_ms = int(time.time() * 1000)
+    features = [
+        _feature(4.6, "12 km SE of Ridgecrest, CA", now_ms, -117.5, 35.6),
+        _feature(2.6, "5 km W of Fresno, CA", now_ms, -119.8, 36.7),
+    ]
+    _patch_feed(monkeypatch, features)
+
+    tool = EarthquakeTool(assistant)
+    result = await tool.execute({"sort": "nearest"})
+
+    assert result.data["quakes"][0]["place"] == "Fresno, CA"
+    assert result.data["quakes"][0]["distance_km"] <= 5
+    assert "The closest was" in result.message
+    assert "kilometers away" in result.message
+
+
+async def test_sort_nearest_without_coords_falls_back(monkeypatch):
+    now_ms = int(time.time() * 1000)
+    _patch_feed(monkeypatch, [
+        _feature(2.6, "5 km W of Fresno, CA", now_ms, -119.8, 36.7)])
+
+    tool = EarthquakeTool(assistant=None)
+    result = await tool.execute({"sort": "nearest"})
+
+    assert result.status == ToolStatus.SUCCESS
+    assert result.data["sort"] == "recent"
+    assert "note" in result.data
+
+
+async def test_data_list_capped(monkeypatch):
+    now_ms = int(time.time() * 1000)
+    features = [
+        _feature(1.0 + i / 10, f"{i} km N of Spot{i}, CA", now_ms - i * 60_000,
+                 -120.0 + i / 10, 36.0)
+        for i in range(25)
+    ]
+    _patch_feed(monkeypatch, features)
+
+    tool = EarthquakeTool(assistant=None)
+    result = await tool.execute({"min_magnitude": "1.0", "period": "week"})
+
+    assert result.data["count"] == 25
+    assert len(result.data["quakes"]) == 10
+    assert "note_truncated" in result.data
+    # The classification survives the cap.
+    assert result.data["largest"]["mag"] == pytest.approx(3.4)
 
 
 async def test_invalid_params_fall_back_to_defaults(monkeypatch):

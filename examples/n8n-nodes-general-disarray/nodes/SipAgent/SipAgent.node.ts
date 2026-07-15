@@ -12,6 +12,7 @@ import { scheduleProperties, executeSchedule } from './resources/schedule';
 import { speakProperties, executeSpeak } from './resources/speak';
 import { systemProperties, executeSystem } from './resources/system';
 import { toolProperties, executeTool } from './resources/tool';
+import { virtualNumberProperties, executeVirtualNumber } from './resources/virtualNumber';
 
 export class SipAgent implements INodeType {
 	description: INodeTypeDescription = {
@@ -46,6 +47,7 @@ export class SipAgent implements INodeType {
 					{ name: 'Speak', value: 'speak' },
 					{ name: 'System', value: 'system' },
 					{ name: 'Tool', value: 'tool' },
+					{ name: 'Virtual Number', value: 'virtualNumber' },
 				],
 				default: 'call',
 			},
@@ -54,6 +56,7 @@ export class SipAgent implements INodeType {
 			...speakProperties,
 			...systemProperties,
 			...toolProperties,
+			...virtualNumberProperties,
 		],
 	};
 
@@ -81,6 +84,9 @@ export class SipAgent implements INodeType {
 						break;
 					case 'tool':
 						result = await executeTool(this, i, operation);
+						break;
+					case 'virtualNumber':
+						result = await executeVirtualNumber(this, i, operation);
 						break;
 					default:
 						throw new NodeOperationError(

@@ -14,8 +14,8 @@ import logging
 import time
 import wave
 from collections import deque
-from dataclasses import dataclass
-from typing import AsyncGenerator, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, AsyncGenerator, Optional, Tuple
 
 import httpx
 import numpy as np
@@ -33,6 +33,7 @@ except ImportError:
     SCIPY_AVAILABLE = False
 
 from config import Config
+from endpointing import suggest_timeout_ms
 from speech_text import sanitize_for_speech
 from telemetry import create_span, Metrics
 from logging_utils import log_event
@@ -40,6 +41,38 @@ from retry_utils import retry_async, RetryError
 
 
 logger = logging.getLogger(__name__)
+
+
+def decode_audio_to_pcm16(data: bytes, target_rate: int) -> bytes:
+    """Decode an audio file into 16-bit mono PCM at target_rate — the format
+    SIPHandler.send_audio() plays.
+
+    Accepts whatever libsndfile can read (WAV, FLAC, OGG; MP3 with
+    libsndfile >= 1.1). CPU-bound: call via run_in_executor off the event
+    loop. Raises ValueError on undecodable or empty input.
+    """
+    import soundfile as sf
+
+    try:
+        audio, rate = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
+    except Exception as e:
+        raise ValueError(f"could not decode audio: {e}") from e
+    if audio.size == 0:
+        raise ValueError("audio file contains no samples")
+
+    mono = audio.mean(axis=1)
+    if int(rate) != int(target_rate):
+        if SCIPY_AVAILABLE:
+            import math
+            g = math.gcd(int(rate), int(target_rate))
+            mono = scipy.signal.resample_poly(
+                mono, int(target_rate) // g, int(rate) // g)
+        else:
+            new_indices = np.linspace(0, len(mono) - 1,
+                                      int(len(mono) * target_rate / rate))
+            mono = np.interp(new_indices, np.arange(len(mono)), mono)
+
+    return (np.clip(mono, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
 
 
 # ============================================================================
@@ -93,8 +126,17 @@ class FastVoiceActivityDetector:
             
         self.speech_frames = deque(maxlen=50)
         self.silence_frames = 0
+        # Trailing silence (ms) since the last speech chunk. Measured from the
+        # chunks' real durations, NOT frames * chunk_duration_ms: the audio
+        # loop's reads are variable-length (sip_handler.receive_audio returns
+        # up to 100ms at a time), so a frame count says nothing about elapsed
+        # audio time.
+        self.silence_ms = 0.0
         self.is_speaking = False
-        
+        # Cumulative speech (ms) in the current utterance — feeds the
+        # adaptive endpointing timeout (endpointing.suggest_timeout_ms).
+        self.speech_ms = 0.0
+
         self.noise_floor = 200
         self.noise_samples = deque(maxlen=100)
         
@@ -106,12 +148,18 @@ class FastVoiceActivityDetector:
     # phantom barge-ins on a silent line.
     MIN_NOISE_FLOOR = 50.0
 
-    def is_speech(self, audio_chunk: bytes) -> bool:
-        """Check if chunk contains speech with energy pre-filter."""
+    def is_speech(self, audio_chunk: bytes, update_noise: bool = True) -> bool:
+        """Check if chunk contains speech with energy pre-filter.
+
+        ``update_noise=False`` makes the check side-effect-free on the
+        adaptive noise floor: the audio loop calls both has_speech()
+        (barge-in check) and process_audio() on the SAME chunk, and letting
+        both feed noise_samples would double-count every chunk in the floor.
+        """
         samples = np.frombuffer(audio_chunk, dtype=np.int16)
         energy = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
 
-        if not self.is_speaking:
+        if not self.is_speaking and update_noise:
             self.noise_samples.append(energy)
             if len(self.noise_samples) >= 10:
                 self.noise_floor = max(
@@ -135,36 +183,82 @@ class FastVoiceActivityDetector:
                 
         return bool(energy > self.noise_floor * 2)
 
-    def process_audio(self, audio_chunk: bytes) -> Tuple[bool, bool]:
-        """Process audio with faster end-of-utterance detection."""
+    def process_audio(self, audio_chunk: bytes,
+                      silence_timeout_ms: Optional[int] = None) -> Tuple[bool, bool]:
+        """Process audio with faster end-of-utterance detection.
+
+        ``silence_timeout_ms`` overrides the configured fixed timeout for
+        this chunk (adaptive/speculative endpointing); None keeps the
+        configured value (existing behavior).
+        """
         is_speech = self.is_speech(audio_chunk)
-        
+
+        # This chunk's real duration. receive_audio() hands us anything from
+        # one 20ms frame up to 100ms, so both timers must be driven by the
+        # actual byte count; crediting a flat chunk_duration_ms per chunk made
+        # a 100ms read count as 20ms and stretched every configured timeout by
+        # up to 5x (a 750ms hangover became ~3.8s of dead air before STT ran).
+        chunk_ms = len(audio_chunk) / 2 / self.sample_rate * 1000
+
         if is_speech:
             self.speech_frames.append(audio_chunk)
             self.silence_frames = 0
+            self.silence_ms = 0.0
             if not self.is_speaking:
                 # Speech just started - record VAD event
                 Metrics.record_vad_speech_segment()
+                self.speech_ms = 0.0
             self.is_speaking = True
+            self.speech_ms += chunk_ms
         else:
             self.silence_frames += 1
-            
-        silence_ms = self.silence_frames * self.config.chunk_duration_ms
+            self.silence_ms += chunk_ms
+
+        timeout_ms = (silence_timeout_ms if silence_timeout_ms is not None
+                      else self.silence_timeout_ms)
         end_of_utterance = (
-            self.is_speaking and 
-            silence_ms >= self.silence_timeout_ms
+            self.is_speaking and
+            self.silence_ms >= timeout_ms
         )
-        
+
         if end_of_utterance:
             self.is_speaking = False
-            
+
         return is_speech, end_of_utterance
-        
+
     def reset(self):
         """Reset state."""
         self.speech_frames.clear()
         self.silence_frames = 0
+        self.silence_ms = 0.0
         self.is_speaking = False
+        self.speech_ms = 0.0
+
+
+# ============================================================================
+# Per-session audio state
+# ============================================================================
+
+@dataclass
+class SessionAudioState:
+    """All mutable per-call audio state, owned by one CallSession.
+
+    The pipeline itself holds only shared, concurrency-safe resources (HTTP
+    clients, the TTS phrase cache, config); everything a single call mutates
+    per chunk/utterance — the VAD state machine, the utterance buffer, the
+    latency metrics — lives here so two sessions can never corrupt each
+    other. Created via LowLatencyAudioPipeline.new_session_state().
+    """
+
+    vad: FastVoiceActivityDetector
+    buffer: bytearray = field(default_factory=bytearray)
+    metrics: LatencyMetrics = field(default_factory=LatencyMetrics)
+    # Per-session realtime STT connection (a RealtimeWebSocketClient), attached
+    # by LowLatencyAudioPipeline.start_session_stt() in realtime mode and
+    # closed by stop_session_stt() at teardown. None in batch mode, when the
+    # connection cap is reached, or when the connect failed (the session then
+    # falls back to the shared batch client).
+    realtime: Optional[Any] = None
 
 
 # ============================================================================
@@ -713,26 +807,84 @@ class LowLatencyAudioPipeline:
     
     def __init__(self, config: Config):
         self.config = config
-        
-        # Components
-        self.vad = FastVoiceActivityDetector(config)
+
+        # Shared components (concurrency-safe across sessions)
         self.tts = SpeachesTTSClient(config)
-        
-        # STT - use RealtimeSTTManager which handles mode selection
+
+        # STT - use RealtimeSTTManager which handles mode selection. The
+        # manager stays the shared/singleton path (mode probing, batch
+        # fallback); concurrent calls get their own RealtimeWebSocketClient
+        # via start_session_stt(), attached to their SessionAudioState.
+        # Sessions WITHOUT their own connection transcribe through the shared
+        # batch client (_stt_batch_client) — never the manager's single
+        # realtime WebSocket, which cannot be shared across calls.
         self._stt_manager = None  # Initialized in start()
         self._stt_batch_client = None  # Fallback for when realtime unavailable
-        
-        # Audio buffer
-        self.audio_buffer = bytearray()
+        # Live per-session realtime clients (capped at MAX_CONCURRENT_CALLS).
+        self._session_realtime_clients: set = set()
+
         self.max_buffer_size = int(config.max_speech_duration_s * config.sample_rate * 2)
-        
+
         # Realtime mode state
         self._realtime_transcription_callback = None
         self._use_realtime = config.use_realtime_stt
-        
-        # Metrics
-        self.last_metrics = LatencyMetrics()
-        
+
+    def new_session_state(self) -> SessionAudioState:
+        """Fresh per-call audio state (VAD + utterance buffer + metrics).
+
+        Every consumer of process_audio()/has_speech() owns one of these for
+        the duration of its call, so per-utterance state never leaks between
+        concurrent (or successive) calls.
+        """
+        return SessionAudioState(vad=FastVoiceActivityDetector(self.config))
+
+    async def start_session_stt(self, state: SessionAudioState) -> None:
+        """Attach a per-session realtime STT connection (realtime mode only).
+
+        One RealtimeWebSocketClient per live session, capped at
+        MAX_CONCURRENT_CALLS concurrent connections. On any failure (cap
+        reached, connect error) the session simply keeps ``state.realtime``
+        unset and transcribes through the shared batch path — the existing
+        fallback pattern. No-op in batch mode (the default).
+        """
+        if state is None or not (self._stt_manager and self._stt_manager.is_realtime):
+            return
+        cap = max(1, getattr(self.config, "max_concurrent_calls", 1))
+        if len(self._session_realtime_clients) >= cap:
+            logger.warning(
+                "Realtime STT connection cap reached "
+                f"({cap}); session falls back to batch STT")
+            return
+        try:
+            from realtime_client import RealtimeWebSocketClient
+            client = RealtimeWebSocketClient(self.config)
+            await client.initialize()
+            if client.available and getattr(client, "_connected", False):
+                state.realtime = client
+                self._session_realtime_clients.add(client)
+                logger.info("Per-session realtime STT connected")
+            else:
+                await client.close()
+                logger.warning(
+                    "Per-session realtime STT connect failed; "
+                    "session falls back to batch STT")
+        except Exception as e:
+            logger.warning(f"Per-session realtime STT unavailable, "
+                           f"session falls back to batch STT: {e}")
+
+    async def stop_session_stt(self, state: Optional[SessionAudioState]) -> None:
+        """Close and detach a session's realtime STT connection (idempotent —
+        both teardown paths can reach it)."""
+        client = getattr(state, "realtime", None) if state is not None else None
+        if client is None:
+            return
+        state.realtime = None
+        self._session_realtime_clients.discard(client)
+        try:
+            await client.close()
+        except Exception as e:
+            logger.debug(f"Error closing per-session realtime STT: {e}")
+
     @property
     def stt(self):
         """Get the active STT client for compatibility."""
@@ -770,6 +922,17 @@ class LowLatencyAudioPipeline:
             logger.info("Initializing batch STT client")
             self._stt_batch_client = WhisperAPIClient(self.config)
             await self._stt_batch_client.initialize()
+        elif self._stt_manager.is_realtime:
+            # Realtime mode ALSO needs the shared batch client: sessions that
+            # can't get their own realtime connection (cap reached, connect
+            # failure) transcribe their locally buffered audio through it.
+            # They must never share the manager's single realtime WebSocket —
+            # two concurrent calls' audio would interleave in one server-side
+            # buffer and cross-contaminate transcripts.
+            logger.info("Initializing shared batch STT client "
+                        "(fallback for sessions without a realtime connection)")
+            self._stt_batch_client = WhisperAPIClient(self.config)
+            await self._stt_batch_client.initialize()
             
         # Initialize TTS
         await self.tts.initialize()
@@ -794,6 +957,13 @@ class LowLatencyAudioPipeline:
             
     async def stop(self):
         """Cleanup."""
+        # Any per-session realtime connections not yet detached by teardown.
+        for client in list(self._session_realtime_clients):
+            self._session_realtime_clients.discard(client)
+            try:
+                await client.close()
+            except Exception as e:
+                logger.debug(f"Error closing per-session realtime STT: {e}")
         if self._stt_manager:
             await self._stt_manager.close()
         if self._stt_batch_client:
@@ -811,71 +981,114 @@ class LowLatencyAudioPipeline:
         if self._stt_manager and hasattr(self._stt_manager, 'set_transcription_callback'):
             self._stt_manager.set_transcription_callback(callback)
         
-    async def process_audio(self, audio_chunk: bytes) -> Optional[str]:
+    async def process_audio(self, state: SessionAudioState, audio_chunk: bytes,
+                            endpoint_mode: Optional[str] = None) -> Optional[str]:
         """
         Process audio with fast end-of-utterance detection.
-        
+
+        ``state`` is the caller's per-call SessionAudioState (see
+        new_session_state) — this method is stateless over the shared HTTP
+        clients, so concurrent sessions can safely interleave calls.
+
         In realtime mode, audio is also streamed for continuous transcription.
+
+        ``endpoint_mode`` overrides config.endpoint_mode for this call site
+        (None = the configured mode). Speculative's short cutoff is only safe
+        for consumers that also run main.py's hold/merge machinery; paths
+        without it (api.py's choice collection) must opt out.
         """
-        # In realtime mode, push audio for streaming transcription
-        if self._stt_manager and self._stt_manager.is_realtime:
-            await self._stt_manager.push_audio(audio_chunk)
-            
-        is_speech, end_of_utterance = self.vad.process_audio(audio_chunk)
-        
+        # In realtime mode, a session with its own connection (state.realtime)
+        # streams audio there. Sessions WITHOUT one (per-session connect
+        # failed or the connection cap was reached) do not stream at all:
+        # they transcribe their locally buffered audio through the shared
+        # BATCH client in _transcribe_buffer. Pushing them into the shared
+        # realtime manager would interleave concurrent calls' audio in one
+        # server-side buffer and cross-contaminate transcripts.
+        if state.realtime is not None:
+            await state.realtime.push_audio(audio_chunk)
+
+        # Endpointing: choose this chunk's end-of-utterance silence timeout.
+        # fixed -> None (the VAD's configured value, today's behavior).
+        # adaptive -> scale by utterance length. No interim transcript exists
+        # before the commit — the realtime session runs turn_detection=None
+        # and only transcribes after the explicit commit — so adaptive runs
+        # audio-only (partial_text=None).
+        # speculative -> always the short threshold; main.py's audio loop
+        # owns transcript-level completion, hold and merge.
+        mode = endpoint_mode if endpoint_mode is not None else self.config.endpoint_mode
+        silence_timeout_ms = None
+        if mode == "adaptive":
+            silence_timeout_ms = suggest_timeout_ms(
+                None, state.vad.speech_ms,
+                self.config.silence_duration_ms,
+                self.config.endpoint_min_silence_ms,
+                self.config.endpoint_max_silence_ms)
+        elif mode == "speculative":
+            silence_timeout_ms = self.config.endpoint_min_silence_ms
+
+        is_speech, end_of_utterance = state.vad.process_audio(
+            audio_chunk, silence_timeout_ms=silence_timeout_ms)
+
         if is_speech:
-            self.audio_buffer.extend(audio_chunk)
-            
-            if len(self.audio_buffer) > self.max_buffer_size:
+            state.buffer.extend(audio_chunk)
+
+            if len(state.buffer) > self.max_buffer_size:
                 logger.warning("Buffer overflow, forcing transcription")
-                return await self._transcribe_buffer()
-                
-        if end_of_utterance and len(self.audio_buffer) > 0:
-            return await self._transcribe_buffer()
-            
+                return await self._transcribe_buffer(state)
+
+        if end_of_utterance and len(state.buffer) > 0:
+            return await self._transcribe_buffer(state)
+
         return None
-        
-    async def _transcribe_buffer(self) -> str:
+
+    async def _transcribe_buffer(self, state: SessionAudioState) -> str:
         """Transcribe buffered audio via API."""
-        self.last_metrics.speech_end = time.time()
-        
-        audio_data = bytes(self.audio_buffer)
-        self.audio_buffer.clear()
-        self.vad.reset()
+        state.metrics.speech_end = time.time()
+
+        audio_data = bytes(state.buffer)
+        state.buffer.clear()
+        state.vad.reset()
         
         duration_ms = len(audio_data) / (self.config.sample_rate * 2) * 1000
         if duration_ms < self.config.min_speech_duration_ms:
-            # In realtime mode the sub-threshold audio was already streamed to the
-            # server via push_audio(); clear that buffer so it doesn't bleed into
-            # the next turn's transcript. Batch mode has no server-side buffer, so
-            # this is a no-op there.
-            if self._stt_manager and self._stt_manager.is_realtime:
-                await self._stt_manager.clear_audio()
+            # A session with its own realtime connection already streamed the
+            # sub-threshold audio via push_audio(); clear that buffer so it
+            # doesn't bleed into the next turn's transcript. Sessions on the
+            # batch path never streamed anything, so there is nothing to
+            # clear (and touching the shared realtime manager here could wipe
+            # ANOTHER call's buffered utterance).
+            if state.realtime is not None:
+                await state.realtime.clear_audio_buffer()
             return ""
-            
-        self.last_metrics.stt_start = time.time()
+
+        state.metrics.stt_start = time.time()
         
-        # Use the appropriate client
-        if self._stt_manager and self._stt_manager.available:
-            if self._stt_manager.is_realtime:
-                # In realtime mode the audio was already streamed via push_audio();
-                # the local VAD just detected end-of-turn, so commit the buffer and
-                # wait for the transcript deterministically.
-                result = await self._stt_manager.commit_and_wait(
-                    self.config.realtime_commit_timeout_s
-                )
-            else:
-                result = await self._stt_manager.transcribe(audio_data)
+        # Use the appropriate client. Only a session's OWN realtime
+        # connection may use the realtime path: the shared manager's single
+        # WebSocket must never be committed on behalf of one session (it
+        # could contain another concurrent call's audio). Sessions without
+        # their own connection transcribe through the shared batch client.
+        if state.realtime is not None:
+            # The audio was already streamed via push_audio(); the local VAD
+            # just detected end-of-turn, so commit the buffer and wait for
+            # the transcript deterministically.
+            result = await state.realtime.commit_and_wait(
+                self.config.realtime_commit_timeout_s
+            )
+        elif (self._stt_manager and self._stt_manager.available
+                and not self._stt_manager.is_realtime):
+            # Manager in batch mode (its internal fallback): safe to share.
+            result = await self._stt_manager.transcribe(audio_data)
         elif self._stt_batch_client and self._stt_batch_client.available:
             result = await self._stt_batch_client.transcribe(audio_data)
         else:
             logger.error("No STT client available")
             result = ""
-            
-        self.last_metrics.stt_end = time.time()
-        
-        stt_latency = (self.last_metrics.stt_end - self.last_metrics.speech_end) * 1000
-        mode_str = "realtime" if (self._stt_manager and self._stt_manager.is_realtime) else "batch"
+
+        state.metrics.stt_end = time.time()
+
+        stt_latency = (state.metrics.stt_end - state.metrics.speech_end) * 1000
+        mode_str = "realtime" if state.realtime is not None else "batch"
         logger.info(f"STT ({mode_str}): {stt_latency:.0f}ms for {duration_ms:.0f}ms audio")
         
         return result
@@ -898,6 +1111,15 @@ class LowLatencyAudioPipeline:
         """Get pre-cached audio for instant playback."""
         return self.tts.get_cached(text)
         
-    def has_speech(self, audio_chunk: bytes) -> bool:
-        """Quick speech check."""
-        return self.vad.is_speech(audio_chunk)
+    def has_speech(self, state: SessionAudioState, audio_chunk: bytes,
+                   update_noise: bool = False) -> bool:
+        """Quick speech check against the caller's per-call VAD state.
+
+        Side-effect-free by default (``update_noise=False``): main.py's audio
+        loop calls both has_speech() and process_audio() on the SAME chunk,
+        and letting both feed the adaptive noise floor would double-count
+        every chunk. Callers for which this is the ONLY per-chunk check
+        (answering-machine detection — process_audio never runs during the
+        AMD window) must pass ``update_noise=True``, or the floor freezes at
+        a stale value and steady line noise reads as continuous speech."""
+        return state.vad.is_speech(audio_chunk, update_noise=update_noise)

@@ -59,6 +59,9 @@ langgraph>=1.0,<2.0
 # Knowledge base (RAG over data/knowledge): chunking + local CPU embeddings.
 langchain-text-splitters>=1.0,<2.0
 fastembed>=0.7,<1.0
+# MCP client (MCP_ENABLED=true): consume tools from external MCP servers.
+# Optional at runtime — mcp_tools.py degrades to a warning if it is missing.
+mcp>=1.0
 
 # ===================
 # OpenTelemetry (optional - for observability)

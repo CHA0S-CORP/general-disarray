@@ -15,7 +15,7 @@ LLM: [TOOL:ALERTS]
 import logging
 from typing import Any, Dict, List, Optional
 
-import httpx
+from plugins.helpers import fetch_json, number_to_words
 
 from tool_plugins import BaseTool, ToolResult, ToolStatus
 from logging_utils import log_event
@@ -25,25 +25,16 @@ logger = logging.getLogger(__name__)
 # How many alerts we read out loud; the total count is always spoken.
 MAX_SPOKEN_ALERTS = 3
 
-_NUMBER_WORDS = [
-    "Zero", "One", "Two", "Three", "Four", "Five",
-    "Six", "Seven", "Eight", "Nine", "Ten",
-]
-
-
 def _count_word(count: int) -> str:
     """Say small counts as words ('Three'), larger ones as digits ('14')."""
-    if 0 <= count < len(_NUMBER_WORDS):
-        return _NUMBER_WORDS[count]
+    if 0 <= count <= 10:
+        return number_to_words(count).capitalize()
     return str(count)
 
 
 async def _fetch_json(url: str, params: Optional[Dict[str, Any]] = None,
                       headers: Optional[Dict[str, str]] = None) -> Any:
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(url, params=params, headers=headers)
-        response.raise_for_status()
-        return response.json()
+    return await fetch_json(url, params=params, headers=headers)
 
 
 def _parse_alertmanager(payload: Any) -> List[Dict[str, str]]:

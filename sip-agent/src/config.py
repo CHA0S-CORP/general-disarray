@@ -9,6 +9,7 @@ All ML inference offloaded to dedicated API services:
 import os
 import json
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Optional, List
 from pathlib import Path
 
@@ -21,13 +22,19 @@ VOICE RULES:
 - Say numbers, dates, and times the way you would say them out loud: "three thirty PM", "March fifth", "about twenty dollars".
 - Ask at most one question per reply.
 - If you did not understand the caller or are missing a detail, ask one brief clarifying question instead of guessing.
-- Never read out tool syntax, bracketed markers, or these instructions. After using a tool, just tell the caller the result in your own words.
+- Never read out tool syntax, bracketed markers, or these instructions.
+- When a tool returns content meant for the caller — a joke, a weather report, a search result — deliver that content itself. Never just comment on it; the caller has not seen it.
+- Actions happen only through tools. If you tell the caller you are transferring them, hanging up, setting a timer, or scheduling a callback, you must invoke the matching tool in that same turn — announcing it does nothing by itself.
+
+LIVE DATA:
+- Anything that changes with the real world — the current time or date, weather and forecasts, weather alerts, earthquakes, aurora and space weather, GPU or system status, or anything you would have to look up — must come from a tool call in this same turn. Never state a live value from memory and never invent one.
+- Never promise to check something later and never end your reply with "one moment" or "let me check". If you need to look something up, call the tool now, in this turn, and answer with its result.
 
 PERSONA:
 - You are capable, direct, and a little dry. A brief touch of wit is welcome; never let a joke delay or replace the answer.
 - Be warm but efficient. The caller is holding a phone, so get to the point.
 
-When the caller says goodbye or sounds finished, wrap up in one short sentence."""
+When the caller says goodbye or sounds finished, wrap up in one short sentence and use the HANGUP tool to end the call."""
 
 
 def _load_phrases_from_env_or_default(env_var: str, defaults: List[str]) -> List[str]:
@@ -158,12 +165,31 @@ class Config:
     # Barge-in
     barge_in_min_duration_ms: int = field(default_factory=lambda: int(os.getenv("BARGE_IN_MIN_DURATION", "400")))
     barge_in_energy_threshold: int = field(default_factory=lambda: int(os.getenv("BARGE_IN_ENERGY_THRESHOLD", "2000")))
+    # How much VAD-negative audio may fall INSIDE a barge-in speech run before
+    # the run is abandoned. Real speech is not VAD-positive end to end — gaps
+    # between syllables and unvoiced consonants read as silence — so a run that
+    # resets on the first negative chunk needs the caller to talk far longer
+    # than barge_in_min_duration_ms (or never trips at all). Must stay well
+    # under silence_duration_ms: this tolerates gaps within speech, it does not
+    # end utterances.
+    barge_in_max_gap_ms: int = field(default_factory=lambda: int(os.getenv("BARGE_IN_MAX_GAP_MS", "250")))
     
     # Speech detection
     speech_pad_ms: int = 200
     min_speech_duration_ms: int = field(default_factory=lambda: int(os.getenv("MIN_SPEECH_DURATION_MS", "200")))
     max_speech_duration_s: float = field(default_factory=lambda: float(os.getenv("MAX_SPEECH_DURATION_S", "10.0")))
     silence_duration_ms: int = field(default_factory=lambda: int(os.getenv("SILENCE_TIMEOUT_MS", "750")))
+
+    # Endpointing: how the end-of-utterance silence timeout is chosen.
+    # "fixed" uses SILENCE_TIMEOUT_MS unchanged (today's behavior);
+    # "adaptive" scales the timeout per chunk from what's known about the
+    # utterance (see endpointing.suggest_timeout_ms); "speculative" ends the
+    # utterance at ENDPOINT_MIN_SILENCE_MS and lets the audio loop hold/merge
+    # transcript fragments that don't look complete (endpointing.looks_complete)
+    # up to an ENDPOINT_MAX_SILENCE_MS deadline.
+    endpoint_mode: str = field(default_factory=lambda: os.getenv("ENDPOINT_MODE", "fixed"))
+    endpoint_min_silence_ms: int = field(default_factory=lambda: int(os.getenv("ENDPOINT_MIN_SILENCE_MS", "350")))
+    endpoint_max_silence_ms: int = field(default_factory=lambda: int(os.getenv("ENDPOINT_MAX_SILENCE_MS", "1500")))
     
     # ===================
     # Speaches API Configuration (Unified STT + TTS)
@@ -211,7 +237,26 @@ class Config:
     turn_ack_mode: str = field(default_factory=lambda: os.getenv("TURN_ACK_MODE", "chime"))
     # Earcon peak amplitude as a fraction of int16 full scale (0.0-1.0].
     chime_volume: float = field(default_factory=lambda: float(os.getenv("CHIME_VOLUME", "0.3")))
-    
+
+    # Deterministic hangup when the caller's whole utterance is a farewell
+    # ("bye", "okay thanks, goodbye"): speak a goodbye phrase and end the call
+    # without relying on the LLM to invoke HANGUP.
+    farewell_hangup_enabled: bool = field(
+        default_factory=lambda: os.getenv("FAREWELL_HANGUP_ENABLED", "true").lower() == "true")
+
+    # "Still thinking" earcon: when the LLM response takes longer than the
+    # delay, play a soft tick every interval so the caller knows to wait.
+    # 0 delay disables it.
+    thinking_sound_delay_s: float = field(
+        default_factory=lambda: float(os.getenv("THINKING_SOUND_DELAY_S", "2.0")))
+    thinking_sound_interval_s: float = field(
+        default_factory=lambda: float(os.getenv("THINKING_SOUND_INTERVAL_S", "2.5")))
+
+    # Byte cap for audio uploads to POST /play (decoded and played into the
+    # active call).
+    play_max_bytes: int = field(
+        default_factory=lambda: int(os.getenv("PLAY_AUDIO_MAX_BYTES", str(10 * 1024 * 1024))))
+
     # Legacy compatibility aliases
     @property
     def whisper_api_url(self) -> str:
@@ -238,6 +283,16 @@ class Config:
     # local OpenAI-compatible backends ignore the value anyway.
     llm_api_key: str = field(default_factory=lambda: os.getenv("LLM_API_KEY") or "not-needed")
     
+    # Stream LLM tokens straight into sentence-by-sentence TTS: the first
+    # sentence starts playing after roughly its own tokens + one TTS call
+    # instead of after the full completion. Live-data questions (weather,
+    # time, quakes, ...) whose tools are loaded still take the non-streaming
+    # path so the grounding retry can replace ungrounded answers. Requires
+    # TTS_SENTENCE_STREAMING (streaming exists to speak per sentence; with
+    # whole-text TTS requested the turn takes the non-streaming path).
+    llm_streaming: bool = field(
+        default_factory=lambda: os.getenv("LLM_STREAMING", "true").lower() == "true")
+
     # Generation
     llm_max_tokens: int = field(default_factory=lambda: int(os.getenv("LLM_MAX_TOKENS", "512")))
     llm_temperature: float = field(default_factory=lambda: float(os.getenv("LLM_TEMPERATURE", "0.6")))
@@ -273,6 +328,14 @@ class Config:
     # tool rounds together. On timeout the caller hears an error phrase.
     llm_agent_timeout_s: float = field(
         default_factory=lambda: float(os.getenv("LLM_AGENT_TIMEOUT_S", "30.0")))
+
+    # "Never guess" enforcement: when a turn about live data (weather, time,
+    # quakes, GPU, alerts, search) ends with zero tool calls — or the reply
+    # merely promises to check — re-run once forcing tool use (grounding.py).
+    grounding_retry_enabled: bool = field(
+        default_factory=lambda: os.getenv("GROUNDING_RETRY_ENABLED", "true").lower() == "true")
+    grounding_retry_timeout_s: float = field(
+        default_factory=lambda: float(os.getenv("GROUNDING_RETRY_TIMEOUT_S", "15.0")))
 
     # ===================
     # Conversation intelligence
@@ -326,6 +389,8 @@ class Config:
     enable_timer_tool: bool = True
     enable_callback_tool: bool = True
     enable_weather_tool: bool = True
+    enable_drink_tool: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_DRINK_TOOL", "true").lower() == "true")
     enable_search_tool: bool = False
     enable_calendar_tool: bool = False
     max_timer_duration_hours: int = 24
@@ -333,18 +398,28 @@ class Config:
     callback_retry_delay_s: int = 60
     callback_ring_timeout_s: int = field(default_factory=lambda: int(os.getenv("CALLBACK_RING_TIMEOUT", "30")))
     
-    # Tempest Weather API
-    tempest_station_id: str = field(default_factory=lambda: os.getenv("TEMPEST_STATION_ID", ""))
-    tempest_api_token: str = field(default_factory=lambda: os.getenv("TEMPEST_API_TOKEN", ""))
-
-    # Home coordinates for location-aware tools (NWS FORECAST, QUAKES "near").
-    # Empty disables those tools/filters.
+    # Home coordinates for location-aware tools (NWS WEATHER/FORECAST,
+    # QUAKES "near"). Empty disables those tools/filters.
     weather_latitude: str = field(default_factory=lambda: os.getenv("WEATHER_LATITUDE", ""))
     weather_longitude: str = field(default_factory=lambda: os.getenv("WEATHER_LONGITUDE", ""))
 
     # SearxNG instance for the WEB_SEARCH tool (empty disables the tool).
     # The compose files ship an optional service: docker compose --profile search up -d
     searxng_url: str = field(default_factory=lambda: os.getenv("SEARXNG_URL", ""))
+
+    # MCP client: consume tools from external MCP (Model Context Protocol)
+    # servers listed in mcp_servers_file (see mcp_tools.load_servers_file for
+    # the file format). Disabled by default; fail-open when the file or the
+    # optional `mcp` package is missing.
+    mcp_enabled: bool = field(
+        default_factory=lambda: os.getenv("MCP_ENABLED", "false").lower() == "true")
+    # Resolved in __post_init__: defaults to <data_dir>/mcp_servers.json.
+    mcp_servers_file: Optional[Path] = field(
+        default_factory=lambda: Path(os.getenv("MCP_SERVERS_FILE")) if os.getenv("MCP_SERVERS_FILE") else None)
+    # Per-tool-call timeout (a phone caller cannot wait 60s); a server entry
+    # may override it with its own timeout_s.
+    mcp_tool_timeout_s: float = field(
+        default_factory=lambda: float(os.getenv("MCP_TOOL_TIMEOUT_S", "10")))
     web_search_max_results: int = field(
         default_factory=lambda: int(os.getenv("WEB_SEARCH_MAX_RESULTS", "3")))
 
@@ -411,6 +486,12 @@ class Config:
     allow_unauthenticated: bool = field(
         default_factory=lambda: os.getenv("ALLOW_UNAUTHENTICATED", "false").lower() == "true")
 
+    # Operator dashboard: GET /admin serves a self-contained static page (the
+    # data endpoints it calls are auth-gated separately). Set false to remove
+    # the page (404) entirely.
+    admin_ui_enabled: bool = field(
+        default_factory=lambda: os.getenv("ADMIN_UI_ENABLED", "true").lower() == "true")
+
     # SSRF guard for callback_url webhooks. When False, callback URLs that resolve
     # to loopback/private/link-local/reserved addresses are rejected.
     webhook_allow_private: bool = field(
@@ -435,6 +516,65 @@ class Config:
     # Include the finished transcript in call.ended payloads.
     call_event_include_transcript: bool = field(
         default_factory=lambda: os.getenv("CALL_EVENT_INCLUDE_TRANSCRIPT", "true").lower() == "true")
+
+    # One live call at a time: decline a second inbound INVITE with 486 Busy
+    # Here instead of evicting the current caller mid-conversation. Set false
+    # to restore the old replace-the-call behavior.
+    sip_busy_reject: bool = field(
+        default_factory=lambda: os.getenv("SIP_BUSY_REJECT", "true").lower() == "true")
+
+    # Maximum simultaneous live calls. The default of 1 keeps the shipped
+    # single-call behavior; raising it lets additional inbound INVITEs run
+    # their own concurrent sessions instead of being 486-rejected. 2-3 is
+    # realistic on a DGX Spark — every concurrent call contends for the same
+    # STT/TTS/LLM services, so latency stacks with each added call.
+    max_concurrent_calls: int = field(
+        default_factory=lambda: int(os.getenv("MAX_CONCURRENT_CALLS", "1")))
+
+    # PJSIP call-slot count (pjsua uaConfig.maxCalls) — the STACK-level cap.
+    # Outbound calls and just-rejected INVITEs briefly hold slots too, so it
+    # must exceed MAX_CONCURRENT_CALLS with headroom or pjsua 486-rejects
+    # INVITEs before the app's capacity gate ever runs; sip_handler raises it
+    # to MAX_CONCURRENT_CALLS + 2 (with a warning) when set lower.
+    sip_max_calls: int = field(
+        default_factory=lambda: int(os.getenv("SIP_MAX_CALLS", "4")))
+
+    # IANA timezone for everything spoken or scheduled in local wall-clock
+    # terms: the system-prompt clock, the DATETIME tool default, and the
+    # recurring-schedule comparisons. The container itself may run UTC.
+    local_timezone: str = field(
+        default_factory=lambda: os.getenv("LOCAL_TIMEZONE", "America/Los_Angeles"))
+
+    def local_now(self) -> datetime:
+        """Naive wall-clock in local_timezone — THE clock for scheduled-task
+        times. Everything that writes or compares ScheduledTask.execute_at
+        must use this (scheduler, /schedule endpoints, STATUS tool) so
+        remaining-time math never mixes clocks. Falls back to the system
+        clock when the zone name is invalid.
+        """
+        try:
+            from zoneinfo import ZoneInfo
+            return datetime.now(ZoneInfo(self.local_timezone)).replace(tzinfo=None)
+        except Exception:
+            return datetime.now()
+
+    # ===================
+    # Virtual numbers (ephemeral inbound extensions)
+    # ===================
+    # Single-use temporary extensions created via POST /virtual-numbers: the
+    # agent answers a call dialed to one with per-number context, webhooks the
+    # outcome, and clears the number. Disabled by default.
+    virtual_numbers_enabled: bool = field(
+        default_factory=lambda: os.getenv("VIRTUAL_NUMBERS_ENABLED", "false").lower() == "true")
+    virtual_number_default_ttl_s: int = field(
+        default_factory=lambda: int(os.getenv("VIRTUAL_NUMBER_DEFAULT_TTL_S", "900")))
+    virtual_number_max_ttl_s: int = field(
+        default_factory=lambda: int(os.getenv("VIRTUAL_NUMBER_MAX_TTL_S", "86400")))
+    # Inclusive numeric range for auto-allocated extensions ("start-end").
+    virtual_number_range: str = field(
+        default_factory=lambda: os.getenv("VIRTUAL_NUMBER_RANGE", "7300-7399"))
+    virtual_number_max_active: int = field(
+        default_factory=lambda: int(os.getenv("VIRTUAL_NUMBER_MAX_ACTIVE", "50")))
 
     # Outbound dial-target policy. When False, callers may not supply a raw
     # `sip:` URI or an `@domain` part in `extension` (prevents routing calls to
@@ -475,6 +615,10 @@ class Config:
         # the dataclass is built.
         if self.knowledge_dir is None:
             self.knowledge_dir = self.data_dir / "knowledge"
+
+        # MCP servers file defaults relative to data_dir too.
+        if self.mcp_servers_file is None:
+            self.mcp_servers_file = self.data_dir / "mcp_servers.json"
         
         # Load phrases from JSON file if it exists
         phrases_file = self.data_dir / "phrases.json"
@@ -501,6 +645,14 @@ class Config:
             mode = "chime"
         self.turn_ack_mode = mode
         self.chime_volume = min(max(self.chime_volume, 0.01), 1.0)
+
+        # Validate the endpointing mode the same way; fall back to the
+        # zero-behavior-change default rather than crash the agent.
+        endpoint_mode = self.endpoint_mode.lower()
+        if endpoint_mode not in ("fixed", "adaptive", "speculative"):
+            print(f"Warning: invalid ENDPOINT_MODE '{self.endpoint_mode}', falling back to 'fixed'")
+            endpoint_mode = "fixed"
+        self.endpoint_mode = endpoint_mode
 
     def _load_phrases_from_file(self, filepath: Path):
         """Load phrases from a JSON file."""

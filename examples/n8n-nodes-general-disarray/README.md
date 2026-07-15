@@ -58,6 +58,7 @@ In n8n, create a **SIP Agent API** credential:
 | Call | Get Status | `GET /call/{id}` | API always returns 200; `status` may be `"not_found"`. Optional *Error on Not Found* toggle turns that into a node error. |
 | Call | Get Transcript | `GET /call/{id}/transcript` | HTTP 404 if the transcript doesn't exist. |
 | Speak | Say | `POST /speak` | Speaks into the currently active call (query params: `message`, optional `call_id` guard). |
+| Speak | Play Audio | `POST /play` | Plays an audio file from the item's binary data (default field: `data`) into the active call. WAV/FLAC/OGG (MP3 when the agent's libsndfile supports it); the agent resamples to the call rate. Size-capped by `PLAY_AUDIO_MAX_BYTES`. |
 | Tool | Get Many | `GET /tools` | One output item per tool. |
 | Tool | Get | `GET /tools/{name}` | Tool names are uppercase (e.g. `WEATHER`); the server uppercases anyway. |
 | Tool | Execute | `POST /tools/{name}/execute` | JSON params; optional *Speak Result* into the active call. |
@@ -68,6 +69,8 @@ In n8n, create a **SIP Agent API** credential:
 | Schedule | Delete | `DELETE /schedule/{id}` | 404 if unknown. |
 | System | Health | `GET /health` | Optional *Deep* toggle adds `?deep=true` (probes vLLM/Speaches/Redis). |
 | System | Get Queue | `GET /queue` | Outbound call queue status. |
+| Virtual Number | Create | `POST /virtual-numbers` | Ephemeral inbound extension: the agent answers a call dialed to it with the given `purpose` as context (optional custom greeting), webhooks the outcome + transcript to `callback_url`, then clears the number. Single-use; unused numbers expire after the TTL. Requires `VIRTUAL_NUMBERS_ENABLED=true`. |
+| Virtual Number | Get Many / Get / Delete | `GET`/`DELETE /virtual-numbers[/{id}]` | Registry inspection and early removal; Get returns 404 once the number is used or expired. |
 
 ## Reformat for Speech
 

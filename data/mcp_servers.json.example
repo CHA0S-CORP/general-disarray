@@ -1,0 +1,18 @@
+[
+  {
+    "name": "homeassistant",
+    "transport": "http",
+    "url": "http://ha:8123/mcp",
+    "expose": ["turn_on_light", "get_state"],
+    "confirm": ["turn_on_light"],
+    "timeout_s": 10,
+    "env": {}
+  },
+  {
+    "name": "files",
+    "transport": "stdio",
+    "command": "mcp-server-files",
+    "args": ["--root", "/data"],
+    "expose": ["read_file"]
+  }
+]

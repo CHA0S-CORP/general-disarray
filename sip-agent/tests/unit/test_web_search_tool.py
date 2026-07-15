@@ -81,11 +81,21 @@ async def test_search_happy_path(config_factory, monkeypatch):
     assert seen["params"]["format"] == "json"
     # max_results honored
     assert len(result.data["results"]) == 2
-    # HTML stripped from the spoken message; URLs never spoken
+    # message is what the MODEL reads: snippets included, so it has something
+    # to answer from. HTML stripped, and URLs never appear in either text.
     assert "<" not in result.message
     assert "https://" not in result.message
     assert "Burj Khalifa" in result.message
-    assert result.message.startswith("Here is what I found.")
+    assert "The tallest & grandest building." in result.message
+
+    # spoken_message is what the CALLER hears: titles only, no snippets. The
+    # snippets are scraped web prose and are unlistenable read verbatim.
+    spoken = result.to_speech()
+    assert spoken.startswith("Here's what I found:")
+    assert "Burj Khalifa" in spoken
+    assert "The tallest & grandest building." not in spoken
+    assert "https://" not in spoken
+
     # URLs preserved in data
     assert result.data["results"][0]["url"] == "https://example.com/burj"
     assert result.data["query"] == "tallest building"

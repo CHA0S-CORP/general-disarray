@@ -107,10 +107,17 @@ class FakeAssistant:
         self.llm_engine = StubLLMEngine()
         self.scheduled_callbacks = []
         # Import here so `src` is on sys.path (set by the root conftest).
+        from mcp_tools import MCPManager
         from tool_manager import ToolManager
         from transcript_store import TranscriptStore
+        from virtual_numbers import VirtualNumberRegistry
         self.tool_manager = ToolManager(self)
         self.transcripts = TranscriptStore(config)
+        self.virtual_numbers = VirtualNumberRegistry(config)
+        # Like production (main.py): always constructed, disabled by default —
+        # so ToolManager.start() exercises _start_mcp_tools' no-op path in
+        # every baseline test, exactly as a default deployment does.
+        self.mcp_manager = MCPManager(config)
 
     async def schedule_callback(self, delay, message, destination):
         self.scheduled_callbacks.append((delay, message, destination))

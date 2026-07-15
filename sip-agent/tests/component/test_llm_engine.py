@@ -347,3 +347,93 @@ async def test_native_loop_answers_after_the_last_tool_round(assistant, config_f
     # The final completion withholds the tools param so the model must answer.
     assert requests[0]["tools"]
     assert requests[-1]["tools"] is None
+
+
+async def test_virtual_number_context_in_system_prompt(engine):
+    """A virtual number's purpose reaches the system prompt for the call."""
+    prompt = engine._build_system_prompt({
+        "remote_uri": "sip:420@pbx",
+        "duration": 3.0,
+        "virtual_number_context": "The caller is confirming pizza order #4211.",
+    })
+    assert "temporary number" in prompt
+    assert "pizza order #4211" in prompt
+
+    # Absent for normal calls.
+    plain = engine._build_system_prompt({"remote_uri": "sip:420@pbx", "duration": 3.0})
+    assert "temporary number" not in plain
+
+
+# --- grounding retry, classic-native path -------------------------------------
+
+@pytest_asyncio.fixture
+async def native_engine_classic(assistant, config_factory):
+    from mock_vllm import REQUESTS  # noqa: F401 (ensures mock import)
+    cfg = config_factory(
+        speaches_api_url=assistant.config.speaches_api_url,
+        llm_base_url=assistant.config.llm_base_url,
+        llm_model="mock-model",
+        llm_tool_calling="native",
+    )
+    eng = LLMEngine(cfg, assistant.tool_manager)
+    await eng.start()
+    yield eng
+    await eng.stop()
+
+
+async def test_native_grounding_retry_forces_tool(native_engine_classic):
+    import re
+    import mock_vllm
+    before = len(mock_vllm.REQUESTS)
+    reply = await native_engine_classic.generate_response(
+        [{"role": "user", "content": "what time is it"}])
+
+    forced = [r for r in mock_vllm.REQUESTS[before:]
+              if r.get("tool_choice") == "required"]
+    assert len(forced) == 1
+    assert re.search(r"\d{1,2}:\d{2} (AM|PM)", reply), reply
+
+
+async def test_native_grounding_skips_casual_chat(native_engine_classic):
+    import mock_vllm
+    before = len(mock_vllm.REQUESTS)
+    reply = await native_engine_classic.generate_response(
+        [{"role": "user", "content": "hello there"}])
+    assert reply == "Sure, I can help with that."
+    assert not any(r.get("tool_choice") for r in mock_vllm.REQUESTS[before:])
+
+
+# --- grounding retry, text-marker (default) mode ------------------------------
+
+async def test_text_grounding_retry_forces_tool(engine):
+    """A live-data question answered with zero [TOOL:...] markers gets one
+    nudged re-run in the default text mode too."""
+    import re
+    import mock_vllm
+    before = len(mock_vllm.REQUESTS)
+    reply = await engine.generate_response(
+        [{"role": "user", "content": "what time is it"}])
+
+    # First request answered from memory; the second carried the nudge.
+    assert len(mock_vllm.REQUESTS) - before == 2
+    nudged = mock_vllm.REQUESTS[-1]["messages"]
+    assert any(mock_vllm.NUDGE_MARKER in str(m.get("content") or "")
+               for m in nudged if m.get("role") == "system")
+    assert re.search(r"\d{1,2}:\d{2} (AM|PM)", reply), reply
+
+
+async def test_text_grounding_skips_casual_chat(engine):
+    import mock_vllm
+    before = len(mock_vllm.REQUESTS)
+    reply = await engine.generate_response(
+        [{"role": "user", "content": "hello there"}])
+    assert reply == "Sure, I can help with that."
+    assert len(mock_vllm.REQUESTS) - before == 1
+
+
+async def test_system_prompt_time_is_tz_aware(engine):
+    """The prompt clock carries a timezone abbreviation, not the naive UTC clock."""
+    prompt = engine._build_system_prompt()
+    import re
+    m = re.search(r"Current time: .*?(\b[A-Z]{2,5}\b) on", prompt)
+    assert m, prompt.split("Current time:")[-1][:80]

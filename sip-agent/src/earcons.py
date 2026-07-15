@@ -38,3 +38,22 @@ def generate_chime(sample_rate: int = 16000, volume: float = 0.3) -> bytes:
     if peak > 0:
         sig /= peak
     return (sig * volume * 32767.0).astype(np.int16).tobytes()
+
+
+def generate_thinking_tick(sample_rate: int = 16000, volume: float = 0.3) -> bytes:
+    """Single soft low tick (G5), ~0.18 s — the "still working on it" cue.
+
+    Deliberately quieter and lower than the confirmation chime so a caller
+    hears "waiting", not "done": one muted sine blip with a fast decay,
+    played periodically while a slow LLM turn is in flight.
+    """
+    duration_s = 0.18
+    n = int(duration_s * sample_rate)
+    t = np.arange(n) / sample_rate
+    env = np.minimum(t / 0.005, 1.0) * np.exp(-t * 22.0)
+    sig = np.sin(2 * np.pi * 784.0 * t) * env  # G5
+
+    peak = np.abs(sig).max()
+    if peak > 0:
+        sig /= peak
+    return (sig * volume * 0.7 * 32767.0).astype(np.int16).tobytes()

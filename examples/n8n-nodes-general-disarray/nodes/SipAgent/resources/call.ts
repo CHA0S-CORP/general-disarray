@@ -97,6 +97,15 @@ export const callProperties: INodeProperties[] = [
 				description:
 					'Custom call ID (letters, digits, dots, underscores, dashes; max 64 chars). Auto-generated when empty.',
 			},
+			{
+				displayName: 'Caller Name',
+				name: 'callerName',
+				type: 'string',
+				default: '',
+				placeholder: 'Weather Alert',
+				description:
+					'Name shown on the recipient\'s phone instead of the agent\'s extension, e.g. "Weather Alert". Applies to this call only. An internal PBX passes it through to the handset; a PSTN carrier will usually replace it with its own CNAM lookup.',
+			},
 		],
 	},
 
@@ -157,6 +166,9 @@ export async function executeCall(
 		};
 		if (additionalFields.callId) {
 			body.call_id = additionalFields.callId;
+		}
+		if (additionalFields.callerName) {
+			body.caller_name = additionalFields.callerName;
 		}
 		if (additionalFields.reformatForSpeech) {
 			body.reformat_for_speech = true;

@@ -1,4 +1,5 @@
 import type {
+	IAuthenticateGeneric,
 	ICredentialTestRequest,
 	ICredentialType,
 	INodeProperties,
@@ -51,12 +52,30 @@ export class SipAgentApi implements ICredentialType {
 		},
 	];
 
-	// /health is unauthenticated, so this validates connectivity and base URL only,
-	// not token correctness (all authenticated endpoints are mutating POSTs).
+	// Applied to the credential test below. The node's own requests build these
+	// headers by hand in GenericFunctions.ts (it needs the same logic for the raw
+	// binary /play upload), so the two must stay in step. An unset token yields
+	// empty headers, which the agent treats as absent — the supported tokenless mode.
+	authenticate: IAuthenticateGeneric = {
+		type: 'generic',
+		properties: {
+			headers: {
+				'X-API-Key':
+					'={{ $credentials.apiToken && $credentials.headerStyle !== "bearer" ? $credentials.apiToken : "" }}',
+				Authorization:
+					'={{ $credentials.apiToken && $credentials.headerStyle === "bearer" ? "Bearer " + $credentials.apiToken : "" }}',
+			},
+		},
+	};
+
+	// GET /schedule is token-protected but read-only, so it validates the base URL
+	// *and* the token in one shot: 401 on a missing/wrong token, 200 on a correct
+	// one — and 200 on a tokenless agent, which is a supported config. (/health is
+	// unauthenticated, so testing against it goes green even with a blank token.)
 	test: ICredentialTestRequest = {
 		request: {
 			baseURL: '={{$credentials.baseUrl}}',
-			url: '/health',
+			url: '/schedule',
 		},
 	};
 }

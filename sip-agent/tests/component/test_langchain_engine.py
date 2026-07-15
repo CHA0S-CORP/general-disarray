@@ -150,3 +150,102 @@ def test_factory_falls_back_when_deps_missing(assistant, config_factory,
     cfg = config_factory(llm_backend="langgraph")
     eng = llm_engine_mod.create_llm_engine(cfg, assistant.tool_manager)
     assert type(eng) is llm_engine_mod.LLMEngine
+
+async def test_speak_result_content_reaches_caller(native_engine):
+    """A speak_result tool's message (the joke) must be spoken even when the
+    model's final answer only comments on it (the JOKE-tool bug)."""
+    import mock_vllm
+    before = len(mock_vllm.REQUESTS)
+    reply = await native_engine.generate_response(
+        [{"role": "user", "content": "tell me a joke"}])
+
+    rounds = mock_vllm.REQUESTS[before:]
+    tool_msgs = [m for m in rounds[-1]["messages"] if m.get("role") == "tool"]
+    assert tool_msgs, "JOKE tool round never happened"
+    joke = tool_msgs[-1]["content"]
+
+    # The actual joke is prepended before the model's commentary.
+    assert joke in reply
+    assert "Hope that made you smile" in reply
+    assert reply.index(joke) < reply.index("Hope that made you smile")
+
+
+# --- grounding retry (never-guess enforcement) --------------------------------
+
+async def test_grounding_retry_forces_tool_on_fabrication(native_engine):
+    """A live-data question answered with no tool call triggers exactly one
+    forced retry, and the real tool output reaches the caller."""
+    import re
+    import mock_vllm
+    before = len(mock_vllm.REQUESTS)
+    reply = await native_engine.generate_response(
+        [{"role": "user", "content": "what time is it"}])
+
+    rounds = mock_vllm.REQUESTS[before:]
+    forced = [r for r in rounds if r.get("tool_choice") == "required"]
+    assert len(forced) == 1, "expected exactly one forced retry request"
+    # The real DATETIME output was folded into the reply.
+    assert re.search(r"\d{1,2}:\d{2} (AM|PM)", reply), reply
+    assert "three o'clock" not in reply.lower() or re.search(r"\d{1,2}:\d{2}", reply)
+
+
+async def test_grounding_retry_skips_casual_chat(native_engine):
+    import mock_vllm
+    before = len(mock_vllm.REQUESTS)
+    reply = await native_engine.generate_response(
+        [{"role": "user", "content": "hello there"}])
+    assert reply == "Sure, I can help with that."
+    assert not any(r.get("tool_choice") for r in mock_vllm.REQUESTS[before:])
+
+
+async def test_grounding_retry_disabled_by_config(assistant, config_factory,
+                                                  vllm_url, speaches_url):
+    import mock_vllm
+    eng = _make_engine(assistant, config_factory, vllm_url, speaches_url,
+                       llm_tool_calling="native",
+                       GROUNDING_RETRY_ENABLED="false")
+    await eng.start()
+    try:
+        before = len(mock_vllm.REQUESTS)
+        reply = await eng.generate_response(
+            [{"role": "user", "content": "what time is it"}])
+    finally:
+        await eng.stop()
+    assert not any(r.get("tool_choice") for r in mock_vllm.REQUESTS[before:])
+    assert "three o'clock" in reply.lower()
+
+
+async def test_grounding_retry_on_promised_action(native_engine):
+    """'Let me check, one moment' with no tool call also triggers the retry."""
+    import mock_vllm
+    before = len(mock_vllm.REQUESTS)
+    reply = await native_engine.generate_response(
+        [{"role": "user", "content": "how's the gpu doing"}])
+    forced = [r for r in mock_vllm.REQUESTS[before:]
+              if r.get("tool_choice") == "required"]
+    assert len(forced) == 1
+    # DATETIME (the mock's forced tool) output reached the reply either via
+    # compose or the fold safety net.
+    import re
+    assert re.search(r"\d{1,2}:\d{2} (AM|PM)", reply), reply
+
+
+async def test_grounding_retry_nudge_fallback_on_400(native_engine):
+    """A backend rejecting tool_choice=required falls back to a nudge re-run."""
+    import mock_vllm
+    mock_vllm.REJECT_TOOL_CHOICE = True
+    try:
+        before = len(mock_vllm.REQUESTS)
+        reply = await native_engine.generate_response(
+            [{"role": "user", "content": "what time is it"}])
+    finally:
+        mock_vllm.REJECT_TOOL_CHOICE = False
+
+    rounds = mock_vllm.REQUESTS[before:]
+    # A nudge re-run carried the grounding instruction as a system message.
+    nudged = [r for r in rounds if any(
+        mock_vllm.NUDGE_MARKER in str(m.get("content") or "")
+        for m in r.get("messages", []) if m.get("role") == "system")]
+    assert nudged, "nudge fallback request never sent"
+    import re
+    assert re.search(r"\d{1,2}:\d{2} (AM|PM)", reply), reply

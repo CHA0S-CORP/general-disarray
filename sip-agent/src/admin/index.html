@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>General Disarray — Admin</title>
+<style>
+  :root {
+    --bg: #0f1216; --panel: #171c22; --panel2: #1e242c; --border: #2a323c;
+    --text: #d7dde4; --muted: #8a94a0; --accent: #4da3ff; --ok: #38b26f;
+    --warn: #d9a441; --bad: #e05555; --user: #7cc4ff; --asst: #b0e57c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .badges { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .badge {
+    padding: 2px 10px; border-radius: 999px; font-size: 12px;
+    background: var(--panel2); border: 1px solid var(--border); color: var(--muted);
+  }
+  .badge.up { color: var(--ok); border-color: var(--ok); }
+  .badge.down { color: var(--bad); border-color: var(--bad); }
+  .badge.warn { color: var(--warn); border-color: var(--warn); }
+  .spacer { flex: 1; }
+  main {
+    display: grid; gap: 14px; padding: 14px 16px 40px;
+    grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+    max-width: 1500px; margin: 0 auto;
+  }
+  section {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px 14px; min-width: 0;
+  }
+  section h2 {
+    margin: 0 0 10px; font-size: 13px; font-weight: 600;
+    color: var(--muted); text-transform: uppercase; letter-spacing: .06em;
+  }
+  .err { color: var(--bad); font-size: 12px; margin: 6px 0 0; min-height: 1em; white-space: pre-wrap; }
+  .msg { color: var(--ok); font-size: 12px; margin: 6px 0 0; min-height: 1em; }
+  input, textarea, select, button {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 5px; padding: 6px 8px; font: inherit;
+  }
+  input:focus, textarea:focus, select:focus { outline: 1px solid var(--accent); }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.danger { color: var(--bad); }
+  button.danger:hover { border-color: var(--bad); }
+  form .row { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+  form .row > * { flex: 1; min-width: 120px; }
+  form .row > button { flex: 0 0 auto; }
+  textarea { width: 100%; resize: vertical; }
+  .tablewrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; }
+  tr.clickable { cursor: pointer; }
+  tr.clickable:hover td { background: var(--panel2); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+  #livefeed, #viewer, #toolresult {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px; height: 220px; overflow-y: auto; overflow-x: hidden;
+    font-size: 13px; white-space: pre-wrap; word-break: break-word;
+  }
+  #toolresult { height: 140px; }
+  .turn { margin: 2px 0; }
+  .turn .who { font-weight: 600; }
+  .turn.user .who { color: var(--user); }
+  .turn.assistant .who { color: var(--asst); }
+  .turn.event { color: var(--muted); font-style: italic; }
+  #livemeta { margin-bottom: 8px; color: var(--muted); font-size: 13px; }
+  .live-meta { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; margin-bottom: 4px; color: var(--muted); font-size: 13px; }
+  .live-meta b { color: var(--text); font-weight: 600; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; }
+  .dot.on { background: var(--ok); }
+  .wide { grid-column: 1 / -1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>General Disarray</h1>
+  <div class="badges" id="statusstrip">
+    <span class="badge" id="b-agent">agent: …</span>
+    <span class="badge" id="b-vllm">vllm: …</span>
+    <span class="badge" id="b-speaches">speaches: …</span>
+    <span class="badge" id="b-redis">redis: …</span>
+    <span class="badge" id="b-queue">queue: …</span>
+    <span class="badge" id="b-sse"><span class="dot" id="ssedot"></span>events</span>
+  </div>
+  <div class="spacer"></div>
+  <button id="tokenbtn" title="Set the API token sent as X-API-Key">API token</button>
+</header>
+
+<main>
+  <section class="wide">
+    <h2>Live calls</h2>
+    <div id="livemeta">No active call.</div>
+    <div id="livefeed" aria-live="polite"></div>
+    <div style="margin-top:8px; display:flex; gap:8px;">
+      <span class="err" id="live-err"></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Dial</h2>
+    <form id="dialform">
+      <div class="row"><input id="dial-ext" placeholder="Extension (e.g. 1001)" required></div>
+      <div class="row"><textarea id="dial-msg" rows="2" placeholder="Message to speak" required></textarea></div>
+      <div class="row"><button type="submit">Place call</button></div>
+    </form>
+    <div class="msg" id="dial-msg-ok"></div>
+    <div class="err" id="dial-err"></div>
+    <h2 style="margin-top:14px;">Speak into call</h2>
+    <form id="speakform">
+      <div class="row">
+        <input id="speak-msg" placeholder="Text to speak to the active call" required>
+        <button type="submit">Speak</button>
+      </div>
+    </form>
+    <div class="msg" id="speak-ok"></div>
+    <div class="err" id="speak-err"></div>
+  </section>
+
+  <section>
+    <h2>Calls</h2>
+    <div class="tablewrap">
+      <table id="callstable">
+        <thead><tr><th>ID</th><th>Dir</th><th>Remote</th><th>Started</th><th>Turns</th><th>Live</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="err" id="calls-err"></div>
+    <h2 style="margin-top:14px;">Transcript viewer</h2>
+    <div id="viewer">Click a call above to load its transcript.</div>
+  </section>
+
+  <section>
+    <h2>Tools</h2>
+    <div class="tablewrap" style="max-height:180px; overflow-y:auto;">
+      <table id="toolstable">
+        <thead><tr><th>Name</th><th>Description</th><th>Enabled</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="err" id="tools-err"></div>
+    <h2 style="margin-top:14px;">Execute tool</h2>
+    <form id="toolform">
+      <div class="row">
+        <select id="tool-name"></select>
+        <button type="submit">Execute</button>
+      </div>
+      <div class="row"><textarea id="tool-params" rows="3" class="mono" placeholder='JSON params, e.g. {"expression": "2+2"}'>{}</textarea></div>
+    </form>
+    <div class="err" id="tool-err"></div>
+    <div id="toolresult" class="mono"></div>
+  </section>
+
+  <section>
+    <h2>Schedules</h2>
+    <div class="tablewrap">
+      <table id="schedtable">
+        <thead><tr><th>ID</th><th>Ext</th><th>When</th><th>Tool/Msg</th><th>Recurring</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="err" id="sched-err"></div>
+  </section>
+
+  <section>
+    <h2>Virtual numbers</h2>
+    <div class="tablewrap">
+      <table id="vntable">
+        <thead><tr><th>Number</th><th>Status</th><th>Purpose</th><th>Expires</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="err" id="vn-err"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+/* ---------- token + fetch helper -------------------------------------- */
+const TOKEN_KEY = "gd_admin_token";
+let token = localStorage.getItem(TOKEN_KEY) || "";
+
+function askToken(msg) {
+  const t = prompt(msg || "API token (sent as X-API-Key; leave empty if auth is disabled):", token);
+  if (t !== null) { token = t.trim(); localStorage.setItem(TOKEN_KEY, token); }
+  return t !== null;
+}
+document.getElementById("tokenbtn").onclick = () => { askToken(); refreshAll(); restartStream(); };
+
+let promptedOnce = false;
+async function api(path, opts) {
+  opts = opts || {};
+  opts.headers = Object.assign({}, opts.headers || {});
+  if (token) opts.headers["X-API-Key"] = token;
+  const resp = await fetch(path, opts);
+  if (resp.status === 401 && !promptedOnce) {
+    promptedOnce = true;
+    if (askToken("Unauthorized — enter the API token:")) {
+      promptedOnce = false;
+      return api(path, opts);
+    }
+  }
+  return resp;
+}
+async function apiJSON(path, opts) {
+  const resp = await api(path, opts);
+  let body = null;
+  try { body = await resp.json(); } catch (e) { /* non-JSON */ }
+  if (!resp.ok) {
+    const detail = body && (body.detail || body.error) ? (body.detail || body.error) : ("HTTP " + resp.status);
+    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+  }
+  return body;
+}
+function setErr(id, msg) { document.getElementById(id).textContent = msg || ""; }
+function setMsg(id, msg) {
+  const el = document.getElementById(id);
+  el.textContent = msg || "";
+  if (msg) setTimeout(() => { if (el.textContent === msg) el.textContent = ""; }, 5000);
+}
+function esc(s) { const d = document.createElement("div"); d.textContent = s == null ? "" : String(s); return d.innerHTML; }
+function fmtTs(ts) {
+  if (!ts) return "";
+  const d = typeof ts === "number" ? new Date(ts * 1000) : new Date(ts);
+  return isNaN(d) ? String(ts) : d.toLocaleTimeString();
+}
+
+/* ---------- status strip ---------------------------------------------- */
+function setBadge(id, label, state) {
+  const el = document.getElementById(id);
+  el.textContent = label;
+  el.className = "badge " + (state || "");
+}
+async function refreshStatus() {
+  try {
+    const h = await apiJSON("/health?deep=true");
+    setBadge("b-agent", "agent: " + h.status, h.status === "healthy" ? "up" : "warn");
+    const deps = h.dependencies || {};
+    for (const name of ["vllm", "speaches", "redis"]) {
+      const v = deps[name] || "?";
+      const state = v === "up" ? "up" : (v === "disabled" ? "" : "down");
+      setBadge("b-" + name, name + ": " + v, state);
+    }
+  } catch (e) {
+    setBadge("b-agent", "agent: unreachable", "down");
+  }
+  try {
+    const q = await apiJSON("/queue");
+    const depth = q.enabled === false ? "off" : (q.queued != null ? q.queued : "?");
+    setBadge("b-queue", "queue: " + depth, "");
+  } catch (e) { setBadge("b-queue", "queue: ?", "warn"); }
+}
+
+/* ---------- live call -------------------------------------------------- */
+const feed = document.getElementById("livefeed");
+function feedLine(cls, who, text) {
+  const div = document.createElement("div");
+  div.className = "turn " + cls;
+  div.innerHTML = who ? '<span class="who">' + esc(who) + ":</span> " + esc(text) : esc(text);
+  feed.appendChild(div);
+  while (feed.childElementCount > 400) feed.removeChild(feed.firstChild);
+  feed.scrollTop = feed.scrollHeight;
+}
+async function refreshActive() {
+  try {
+    const a = await apiJSON("/calls/active");
+    const meta = document.getElementById("livemeta");
+    const calls = a.calls || [];
+    if (!calls.length) { meta.textContent = "No active call."; setErr("live-err", ""); return; }
+    meta.innerHTML = "";
+    for (const c of calls) {
+      const row = document.createElement("div");
+      row.className = "live-meta";
+      row.innerHTML =
+        "<span><b>" + esc(c.call_id) + "</b></span>" +
+        "<span>caller: <b>" + esc(c.caller || "?") + "</b></span>" +
+        "<span>dir: <b>" + esc(c.direction) + "</b></span>" +
+        "<span>duration: <b>" + Math.round(c.duration_seconds) + "s</b></span>" +
+        "<span>turns: <b>" + c.turns + "</b></span>";
+      const btn = document.createElement("button");
+      btn.className = "danger";
+      btn.textContent = "Hang up";
+      btn.onclick = async () => {
+        if (!confirm("Hang up call " + c.call_id + "?")) return;
+        try {
+          await apiJSON("/calls/active/hangup?call_id=" + encodeURIComponent(c.call_id), { method: "POST" });
+          setErr("live-err", "");
+          feedLine("event", "", "— hangup requested (" + c.call_id + ") —");
+        } catch (e) { setErr("live-err", e.message); }
+      };
+      row.appendChild(btn);
+      meta.appendChild(row);
+    }
+    setErr("live-err", "");
+  } catch (e) { setErr("live-err", e.message); }
+}
+
+/* ---------- SSE via fetch-streaming (EventSource can't send headers) --- */
+let streamAbort = null;
+let backoff = 1000;
+function setStreamState(on) { document.getElementById("ssedot").className = "dot" + (on ? " on" : ""); }
+function handleEvent(ev) {
+  const d = ev.data || {};
+  const tag = "[" + fmtTs(ev.ts) + "] ";
+  // Events carry the call id; label turns with it so interleaved concurrent
+  // calls stay readable in one feed.
+  const cid = ev.call_id && ev.call_id !== "-" ? " [" + ev.call_id + "]" : "";
+  switch (ev.event) {
+    case "call.started": feedLine("event", "", tag + "call started" + cid + " (" + (d.remote || "?") + ", " + (d.direction || "") + ")"); refreshActive(); loadCalls(); break;
+    case "call.ended": feedLine("event", "", tag + "call ended" + cid); refreshActive(); loadCalls(); break;
+    case "user_turn": feedLine("user", "caller" + cid, d.text || ""); break;
+    case "assistant_turn": feedLine("assistant", "assistant" + cid, d.text || ""); break;
+    case "tool_call": feedLine("event", "", tag + "tool " + (d.tool || "?") + cid + (d.success ? " ok" : " FAILED")); break;
+    case "barge_in": feedLine("event", "", tag + "barge-in" + cid); break;
+    default: feedLine("event", "", tag + ev.event + cid);
+  }
+}
+async function streamEvents() {
+  const ctrl = new AbortController();
+  streamAbort = ctrl;
+  try {
+    const headers = { "Accept": "text/event-stream" };
+    if (token) headers["X-API-Key"] = token;
+    const resp = await fetch("/admin/events", { headers, signal: ctrl.signal });
+    if (!resp.ok || !resp.body) throw new Error("HTTP " + resp.status);
+    setStreamState(true);
+    backoff = 1000;
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const frame = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        for (const line of frame.split("\n")) {
+          if (line.startsWith("data:")) {
+            try { handleEvent(JSON.parse(line.slice(5).trim())); } catch (e) { /* skip bad frame */ }
+          }
+        }
+      }
+    }
+  } catch (e) { /* dropped; reconnect below */ }
+  setStreamState(false);
+  if (streamAbort === ctrl) {
+    setTimeout(streamEvents, backoff);
+    backoff = Math.min(backoff * 2, 15000);
+  }
+}
+function restartStream() {
+  if (streamAbort) { const c = streamAbort; streamAbort = null; c.abort(); }
+  backoff = 1000;
+  streamEvents();
+}
+
+/* ---------- dial + speak ----------------------------------------------- */
+document.getElementById("dialform").onsubmit = async (e) => {
+  e.preventDefault();
+  setErr("dial-err", "");
+  try {
+    const r = await apiJSON("/call", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        extension: document.getElementById("dial-ext").value.trim(),
+        message: document.getElementById("dial-msg").value.trim(),
+      }),
+    });
+    setMsg("dial-msg-ok", "Call " + r.call_id + ": " + r.message);
+  } catch (err) { setErr("dial-err", err.message); }
+};
+document.getElementById("speakform").onsubmit = async (e) => {
+  e.preventDefault();
+  setErr("speak-err", "");
+  try {
+    const msg = document.getElementById("speak-msg").value.trim();
+    await apiJSON("/speak?message=" + encodeURIComponent(msg), { method: "POST" });
+    setMsg("speak-ok", "Spoken.");
+    document.getElementById("speak-msg").value = "";
+  } catch (err) { setErr("speak-err", err.message); }
+};
+
+/* ---------- calls table + transcript viewer ---------------------------- */
+async function loadCalls() {
+  try {
+    const calls = await apiJSON("/calls");
+    const tb = document.querySelector("#callstable tbody");
+    tb.innerHTML = "";
+    for (const c of calls) {
+      const tr = document.createElement("tr");
+      tr.className = "clickable";
+      tr.innerHTML = "<td class='mono'>" + esc(c.call_id) + "</td><td>" + esc(c.direction) +
+        "</td><td>" + esc(c.remote_uri) + "</td><td>" + esc(fmtTs(c.started_at)) +
+        "</td><td>" + c.turns + "</td><td>" + (c.live ? "●" : "") + "</td>";
+      tr.onclick = () => loadTranscript(c.call_id);
+      tb.appendChild(tr);
+    }
+    setErr("calls-err", "");
+  } catch (e) { setErr("calls-err", e.message); }
+}
+async function loadTranscript(id) {
+  const v = document.getElementById("viewer");
+  v.textContent = "Loading " + id + "…";
+  try {
+    const t = await apiJSON("/call/" + encodeURIComponent(id) + "/transcript");
+    v.innerHTML = "<div class='turn event'>" + esc(id) + " — " + esc(t.direction) + " " +
+      esc(t.remote_uri || "") + "</div>";
+    for (const turn of (t.turns || [])) {
+      const div = document.createElement("div");
+      div.className = "turn " + (turn.role === "user" ? "user" : "assistant");
+      div.innerHTML = '<span class="who">' + esc(turn.role) + ":</span> " + esc(turn.content);
+      v.appendChild(div);
+    }
+    if (!(t.turns || []).length) v.innerHTML += "<div class='turn event'>(no turns)</div>";
+  } catch (e) { v.textContent = "Error: " + e.message; }
+}
+
+/* ---------- tools ------------------------------------------------------- */
+async function loadTools() {
+  try {
+    const tools = await apiJSON("/tools");
+    const tb = document.querySelector("#toolstable tbody");
+    const sel = document.getElementById("tool-name");
+    tb.innerHTML = ""; sel.innerHTML = "";
+    for (const t of tools) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = "<td class='mono'>" + esc(t.name) + "</td><td style='white-space:normal'>" +
+        esc(t.description) + "</td><td>" + (t.enabled ? "yes" : "no") + "</td>";
+      tb.appendChild(tr);
+      const opt = document.createElement("option");
+      opt.value = t.name; opt.textContent = t.name;
+      sel.appendChild(opt);
+    }
+    setErr("tools-err", "");
+  } catch (e) { setErr("tools-err", e.message); }
+}
+document.getElementById("toolform").onsubmit = async (e) => {
+  e.preventDefault();
+  setErr("tool-err", "");
+  let params;
+  try { params = JSON.parse(document.getElementById("tool-params").value || "{}"); }
+  catch (err) { setErr("tool-err", "Invalid JSON params: " + err.message); return; }
+  const name = document.getElementById("tool-name").value;
+  const out = document.getElementById("toolresult");
+  out.textContent = "Running " + name + "…";
+  try {
+    const r = await apiJSON("/tools/" + encodeURIComponent(name) + "/execute", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ params }),
+    });
+    out.textContent = JSON.stringify(r, null, 2);
+  } catch (err) { out.textContent = ""; setErr("tool-err", err.message); }
+};
+
+/* ---------- schedules ---------------------------------------------------- */
+async function loadSchedules() {
+  try {
+    const items = await apiJSON("/schedule");
+    const tb = document.querySelector("#schedtable tbody");
+    tb.innerHTML = "";
+    for (const s of items) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = "<td class='mono'>" + esc(s.schedule_id) + "</td><td>" + esc(s.extension) +
+        "</td><td>" + esc(s.scheduled_for) + "</td><td style='white-space:normal'>" +
+        esc(s.tool || s.message || "") + "</td><td>" + esc(s.recurring || "") + "</td><td></td>";
+      const btn = document.createElement("button");
+      btn.className = "danger"; btn.textContent = "delete";
+      btn.onclick = async () => {
+        if (!confirm("Delete schedule " + s.schedule_id + "?")) return;
+        try { await apiJSON("/schedule/" + encodeURIComponent(s.schedule_id), { method: "DELETE" }); loadSchedules(); }
+        catch (e) { setErr("sched-err", e.message); }
+      };
+      tr.lastChild.appendChild(btn);
+      tb.appendChild(tr);
+    }
+    setErr("sched-err", "");
+  } catch (e) { setErr("sched-err", e.message); }
+}
+
+/* ---------- virtual numbers ---------------------------------------------- */
+async function loadVirtualNumbers() {
+  try {
+    const items = await apiJSON("/virtual-numbers");
+    const tb = document.querySelector("#vntable tbody");
+    tb.innerHTML = "";
+    for (const v of items) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = "<td class='mono'>" + esc(v.number) + "</td><td>" + esc(v.status) +
+        "</td><td style='white-space:normal'>" + esc(v.purpose) + "</td><td>" +
+        esc(fmtTs(v.expires_at)) + "</td><td></td>";
+      const btn = document.createElement("button");
+      btn.className = "danger"; btn.textContent = "delete";
+      btn.onclick = async () => {
+        if (!confirm("Delete virtual number " + v.number + "?")) return;
+        try { await apiJSON("/virtual-numbers/" + encodeURIComponent(v.id), { method: "DELETE" }); loadVirtualNumbers(); }
+        catch (e) { setErr("vn-err", e.message); }
+      };
+      tr.lastChild.appendChild(btn);
+      tb.appendChild(tr);
+    }
+    setErr("vn-err", "");
+  } catch (e) { setErr("vn-err", e.message); }
+}
+
+/* ---------- boot ---------------------------------------------------------- */
+function refreshAll() {
+  refreshStatus(); refreshActive(); loadCalls(); loadTools(); loadSchedules(); loadVirtualNumbers();
+}
+refreshAll();
+streamEvents();
+setInterval(refreshStatus, 10000);
+setInterval(refreshActive, 5000);
+setInterval(loadCalls, 30000);
+setInterval(loadSchedules, 30000);
+setInterval(loadVirtualNumbers, 30000);
+</script>
+</body>
+</html>

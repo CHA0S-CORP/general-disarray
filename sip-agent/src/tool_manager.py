@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from main import SIPAIAssistant
 
 from config import Config
+from call_session import get_current_session, set_current_session
 from telemetry import create_span, Metrics
 from logging_utils import log_event, format_duration, HANGUP_DELAY_SECONDS
 
@@ -72,12 +73,22 @@ class ScheduledTask:
     target_uri: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     completed: bool = False
+    # The CallSession the task was scheduled from (timers only; captured via
+    # the current-session contextvar at schedule time). A timer belongs to
+    # the call that set it: with several concurrent calls the scheduler's
+    # context is unbound, so firing must target THIS session — and if it has
+    # ended, the announcement expires instead of leaking into another
+    # caller's call. Never persisted (to_dict omits it; timers are in-memory).
+    session: Optional[Any] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.id,
             "task_type": self.task_type,
             "execute_at": self.execute_at.isoformat(),
+            # execute_at is naive LOCAL_TIMEZONE wall-clock; entries without
+            # this marker predate it (container clock) and get migrated on load.
+            "clock": "local",
             "message": self.message,
             "target_uri": self.target_uri,
             "metadata": self.metadata,
@@ -87,6 +98,7 @@ class ScheduledTask:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'ScheduledTask':
         data = dict(data)
+        data.pop("clock", None)
         data["execute_at"] = datetime.fromisoformat(data["execute_at"])
         return cls(**data)
 
@@ -107,10 +119,13 @@ class ToolManager:
         # Track in-flight dispatched task executions so a slow/retrying
         # task does not block other due tasks in the scheduler loop.
         self._running_tasks: set = set()
-        # The assistant supports one live call session (current_call /
-        # _audio_loop_task), so outbound-call tasks (callbacks, scheduled
-        # calls) must run one at a time even though they are dispatched
-        # concurrently; timers are not serialized by this lock.
+        # Scheduler-driven outbound-call tasks (callbacks, scheduled calls)
+        # run one at a time even though they are dispatched concurrently.
+        # This is POLICY, not correctness: the assistant can host several
+        # concurrent call sessions (MAX_CONCURRENT_CALLS), but batch-firing
+        # every due scheduled call at once would stack STT/TTS/LLM load —
+        # so machine-initiated calls stay serialized. Timers are not
+        # serialized by this lock.
         self._outbound_call_lock = asyncio.Lock()
         
         # Load tools
@@ -143,6 +158,7 @@ class ToolManager:
         from plugins.alerts_tool import AlertsTool
         from plugins.container_tool import ContainerControlTool
         from plugins.transfer_tool import TransferTool
+        from plugins.drink_tool import DrinkRecipeTool
 
         # All available tool classes
         tool_classes = [
@@ -162,6 +178,7 @@ class ToolManager:
             CoinTool,
             TriviaTool,
             StoryTool,
+            DrinkRecipeTool,
             # Information
             WebSearchTool,
             NWSForecastTool,
@@ -251,6 +268,8 @@ class ToolManager:
             return False
         if name in ("REMEMBER", "FORGET") and not self.config.caller_memory_enabled:
             return False
+        if name == "DRINK_RECIPE" and not self.config.enable_drink_tool:
+            return False
         # WEB_SEARCH, FORECAST and CONTAINER_CTL self-disable in __init__ when
         # their required config (SearxNG URL / coordinates / allowlist+socket)
         # is missing; the generic `enabled` check below catches them.
@@ -265,19 +284,25 @@ class ToolManager:
             
     def _create_plugin_wrapper(self, plugin_class):
         """Create a wrapper that adapts a plugin tool to the local interface."""
-        assistant = self.assistant
-        
+        return self._wrap_tool_instance(plugin_class(self.assistant))
+
+    def _wrap_tool_instance(self, instance):
+        """Wrap an already-constructed BaseTool instance (plugins, MCP tools)."""
+
         class PluginToolWrapper:
             """Wrapper for plugin-based tools."""
-            
+
             def __init__(wrapper_self):
-                wrapper_self._plugin_instance = plugin_class(assistant)
-                wrapper_self.name = plugin_class.name
-                wrapper_self.description = plugin_class.description
-                wrapper_self.enabled = getattr(plugin_class, 'enabled', True)
-                wrapper_self.parameters = getattr(plugin_class, 'parameters', {})
+                wrapper_self._plugin_instance = instance
+                wrapper_self.name = instance.name
+                wrapper_self.description = instance.description
+                wrapper_self.enabled = getattr(instance, 'enabled', True)
+                wrapper_self.parameters = getattr(instance, 'parameters', {})
                 # Informational tools: result message is spoken in marker mode.
-                wrapper_self.speak_result = getattr(plugin_class, 'speak_result', False)
+                wrapper_self.speak_result = getattr(instance, 'speak_result', False)
+                # Full JSON schema (e.g. an MCP inputSchema): used verbatim by
+                # _build_native_tools instead of synthesizing from `parameters`.
+                wrapper_self.json_schema = getattr(instance, 'json_schema', None)
                 
             async def execute(wrapper_self, params: Dict[str, Any]) -> ToolResult:
                 # Validate params if the plugin has validation
@@ -440,6 +465,29 @@ class ToolManager:
         except Exception as e:
             logger.error(f"Failed to persist scheduled tasks: {e}")
 
+    def _local_now(self) -> datetime:
+        """Naive LOCAL_TIMEZONE wall-clock (see Config.local_now).
+
+        execute_at values are stored naive and mean local wall-clock time
+        (users schedule "07:00" in their timezone); comparing them against a
+        naive UTC now() — which is what a TZ-less container gives — makes
+        recurring schedules fire hours off.
+        """
+        return self.config.local_now()
+
+    def _migrate_legacy_execute_at(self, dt: datetime) -> datetime:
+        """Convert a pre-'clock' persisted execute_at (written with the naive
+        container clock by older versions) to the LOCAL_TIMEZONE wall clock
+        the scheduler now runs on. Assumes the container timezone did not
+        change across the upgrade."""
+        try:
+            from zoneinfo import ZoneInfo
+            system_tz = datetime.now().astimezone().tzinfo
+            return dt.replace(tzinfo=system_tz).astimezone(
+                ZoneInfo(self.config.local_timezone)).replace(tzinfo=None)
+        except Exception:
+            return dt
+
     def _advance_recurring(self, task: ScheduledTask) -> bool:
         """Move a past-due recurring task to its next future occurrence.
 
@@ -448,7 +496,7 @@ class ToolManager:
         pattern = (task.metadata or {}).get("recurring")
         if pattern not in ("daily", "weekdays", "weekends"):
             return False
-        while task.execute_at <= datetime.now():
+        while task.execute_at <= self._local_now():
             nxt = task.execute_at + timedelta(days=1)
             if pattern == "weekdays":
                 while nxt.weekday() >= 5:
@@ -472,14 +520,23 @@ class ToolManager:
             logger.error(f"Failed to read persisted scheduled tasks: {e}")
             return
 
-        now = datetime.now()
-        restored = dropped = 0
+        now = self._local_now()
+        restored = dropped = migrated_count = 0
         for entry in entries:
             try:
                 task = ScheduledTask.from_dict(entry)
             except Exception as e:
                 logger.warning(f"Skipping malformed persisted task: {e}")
                 continue
+            if entry.get("clock") != "local":
+                migrated = self._migrate_legacy_execute_at(task.execute_at)
+                if migrated != task.execute_at:
+                    log_event(logger, logging.INFO,
+                             f"Migrated legacy task {task.id} to local clock: "
+                             f"{task.execute_at.isoformat()} -> {migrated.isoformat()}",
+                             event="task_clock_migrated", task_id=task.id)
+                    task.execute_at = migrated
+                migrated_count += 1
             if task.execute_at <= now:
                 if (task.metadata or {}).get("recurring"):
                     if not self._advance_recurring(task):
@@ -503,11 +560,63 @@ class ToolManager:
             log_event(logger, logging.INFO,
                      f"Restored {restored} scheduled task(s), dropped {dropped}",
                      event="tasks_restored", restored=restored, dropped=dropped)
-        if dropped:
+        if dropped or migrated_count:
+            # Re-persist so legacy entries carry the clock marker from now on
+            # (migration must not re-run against a changed container TZ).
             self._persist_tasks()
+
+    def register_tool_instance(self, instance) -> bool:
+        """Register an already-constructed BaseTool instance (e.g. an MCP tool
+        wrapper) through the same wrapper path as plugins.
+
+        Never overrides an already-registered tool (same rule as plugin
+        autodiscovery). Returns True when the tool was registered.
+        """
+        key = str(instance.name).upper()
+        if key in self.tools:
+            logger.warning(
+                f"Tool name collision: {key} is already registered — "
+                "skipping (never overriding built-ins)")
+            return False
+        try:
+            self.tools[key] = self._wrap_tool_instance(instance)
+        except Exception as e:
+            logger.error(f"Failed to register tool instance {key}: {e}")
+            return False
+        logger.info(f"Loaded tool: {key}")
+        return True
+
+    async def _start_mcp_tools(self):
+        """Connect the assistant's MCPManager (if any) and register its tools.
+
+        Runs inside start() so MCP tools are final before the first call:
+        they then appear in /tools, the system-prompt tools list, and native
+        tool schemas exactly like plugins. Fail-open: any error just means no
+        MCP tools.
+        """
+        manager = getattr(self.assistant, "mcp_manager", None)
+        if manager is None:
+            return
+        try:
+            await manager.start()
+        except Exception as e:
+            logger.error(f"MCP manager failed to start: {e}")
+            return
+        registered = 0
+        for wrapper in getattr(manager, "tool_wrappers", []):
+            if self.register_tool_instance(wrapper):
+                registered += 1
+        if registered > 15:
+            logger.warning(
+                f"{registered} MCP tools registered — this bloats the system "
+                "prompt in text-marker mode; consider trimming the expose "
+                "allowlists")
+        if registered:
+            logger.info(f"Registered {registered} MCP tool(s)")
 
     async def start(self):
         """Start the task runner."""
+        await self._start_mcp_tools()
         self._load_persisted_tasks()
         self._task_runner = asyncio.create_task(self._run_scheduler())
         logger.info("Tool manager started")
@@ -524,6 +633,24 @@ class ToolManager:
         
     async def execute_tool(self, tool_call) -> ToolResult:
         """Execute a tool call with interception."""
+        result = await self._execute_tool_inner(tool_call)
+        # Mirror the outcome onto the admin event bus (name + success only —
+        # params can carry private data). Must never raise into the call path.
+        try:
+            bus = getattr(self.assistant, "events", None)
+            if bus is not None:
+                session = getattr(self.assistant, "session", None)
+                status = getattr(result.status, "value", result.status)
+                bus.publish(
+                    "tool_call",
+                    session.transcript_id if session else "-",
+                    {"tool": tool_call.name.upper(),
+                     "success": str(status).lower() == "success"})
+        except Exception as e:
+            logger.debug(f"Admin tool_call event publish failed: {e}")
+        return result
+
+    async def _execute_tool_inner(self, tool_call) -> ToolResult:
         tool_name = tool_call.name.upper()
         start_time = time.time()
         
@@ -657,14 +784,21 @@ class ToolManager:
     ) -> str:
         """Schedule a task for later execution."""
         task_id = str(uuid.uuid4())[:8]
-        
+
+        # Timers announce into the call that set them: capture the scheduling
+        # task's session (bound by the turn/audio-loop task body) so the
+        # scheduler — whose own context is unbound — can route the
+        # announcement to the right call even with several calls live.
+        session = get_current_session() if task_type == "timer" else None
+
         task = ScheduledTask(
             id=task_id,
             task_type=task_type,
-            execute_at=datetime.now() + timedelta(seconds=delay_seconds),
+            execute_at=self._local_now() + timedelta(seconds=delay_seconds),
             message=message,
             target_uri=target_uri,
-            metadata=metadata or {}
+            metadata=metadata or {},
+            session=session,
         )
         
         self.scheduled_tasks[task_id] = task
@@ -678,7 +812,7 @@ class ToolManager:
         
     def get_pending_tasks(self) -> List[ScheduledTask]:
         """Get all pending (not completed) tasks."""
-        now = datetime.now()
+        now = self._local_now()
         return [
             task for task in self.scheduled_tasks.values()
             if not task.completed and task.execute_at > now
@@ -717,7 +851,7 @@ class ToolManager:
             try:
                 await asyncio.sleep(1)  # Check every second
                 
-                now = datetime.now()
+                now = self._local_now()
                 
                 for task_id, task in list(self.scheduled_tasks.items()):
                     if task.completed:
@@ -767,9 +901,38 @@ class ToolManager:
             logger.error(f"Error executing task {task.id}: {e}")
             
     async def _execute_timer(self, task: ScheduledTask):
-        """Execute a timer - speak the message on current call."""
+        """Execute a timer - speak the message on the call that set it."""
         log_event(logger, logging.INFO, f"Timer fired: {task.message}",
                  event="timer_fired", task_id=task.id, message=task.message)
+
+        if task.session is not None:
+            # The timer was set from inside a call, so it belongs to THAT
+            # call. Bind the session in this (scheduler-spawned, otherwise
+            # unbound) task so everything downstream — assistant.session /
+            # current_call, playback — resolves the originating call even
+            # with several calls live.
+            set_current_session(task.session)
+            registered = any(
+                s is task.session
+                for s in getattr(self.assistant, "sessions", {}).values())
+            call = task.session.call_info if registered else None
+            if call is not None and getattr(call, "is_active", False):
+                if hasattr(self.assistant, '_stream_response'):
+                    await self.assistant._stream_response(call, task.message)
+                else:
+                    await self.assistant._speak(task.message)
+            else:
+                # The originating call ended: the announcement expires.
+                # Never fall back to "the" current call — with another call
+                # live that would speak this caller's reminder into someone
+                # else's conversation.
+                logger.warning(
+                    f"Timer {task.id} expired but its originating call has "
+                    "ended; dropping announcement")
+            return
+
+        # No originating session recorded (e.g. scheduled via the REST API
+        # outside any call): fall back to the sole active call, if any.
         if self.assistant.current_call and self.assistant.current_call.is_active:
             # Use streaming if available for consistent voice
             if hasattr(self.assistant, '_stream_response'):
@@ -997,7 +1160,7 @@ class ToolManager:
         
     def _cleanup_old_tasks(self):
         """Remove completed tasks older than 1 hour."""
-        cutoff = datetime.now() - timedelta(hours=1)
+        cutoff = self._local_now() - timedelta(hours=1)
         to_remove = [
             task_id for task_id, task in self.scheduled_tasks.items()
             if task.completed and task.execute_at < cutoff

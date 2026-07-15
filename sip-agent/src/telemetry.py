@@ -619,6 +619,15 @@ class Metrics:
             histogram.record(ttft_ms, {"llm.model": model})
     
     @classmethod
+    def record_time_to_first_audio(cls, ttfa_ms: float, model: str = "unknown"):
+        histogram = cls._get_or_create_histogram(
+            "sip.call.time_to_first_audio",
+            "Time from turn start (transcription handled) to the first response audio chunk enqueued"
+        )
+        if histogram:
+            histogram.record(ttfa_ms, {"llm.model": model})
+
+    @classmethod
     def record_llm_tokens_per_second(cls, tps: float, model: str = "unknown"):
         histogram = cls._get_or_create_histogram(
             "sip.llm.tokens_per_second",

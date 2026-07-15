@@ -41,6 +41,8 @@ Call flow: PJSIP receives RTP audio → VAD/STT (Speaches) → LLM (vLLM) → to
 - `tool_plugins.py` — `BaseTool` / `ToolResult` / `ToolStatus` base classes plus `PluginLoader`/`ToolRegistry` for filesystem plugin discovery.
 - `api.py` — FastAPI app (`create_api`): outbound calls, tool listing/execution, TTS `/speak`, scheduling CRUD.
 - `call_queue.py` — Redis-backed, concurrency-limited outbound call queue.
+- `grounding.py` — pure detectors behind the "never guess" enforcement: when a live-data question (weather/time/quakes/GPU/alerts/search) ends a turn with zero tool calls — or the reply merely promises to check — both engines re-run once forcing tool use (`GROUNDING_RETRY_ENABLED`, `grounding_retry` log event). Spoken times/schedules use `LOCAL_TIMEZONE` (`config.local_timezone`); a second inbound INVITE during a live call gets 486 Busy (`SIP_BUSY_REJECT`, `sip_handler._busy`).
+- `virtual_numbers.py` — `VirtualNumberRegistry`: ephemeral single-use inbound extensions (`POST /virtual-numbers`). The dialed To-URI is captured in `sip_handler.onIncomingCall` (`CallInfo.local_uri`) and matched in `_on_call_received`; a matched call gets the entry's `purpose` injected into the system prompt (+ optional custom greeting), and on call end the outcome/transcript is webhooked and the number consumed. TTL-swept, persisted to `data/virtual_numbers.json`, gated by `VIRTUAL_NUMBERS_ENABLED`.
 - `retry_utils.py` — retry/backoff helpers for the external API calls (attempts/delays come from `API_RETRY_*` config).
 - `telemetry.py` — OpenTelemetry init + a `Metrics` helper used pervasively for Prometheus metrics. `logging_utils.py` — structured JSON logging via `log_event`.
 
@@ -51,18 +53,18 @@ Call flow: PJSIP receives RTP audio → VAD/STT (Speaches) → LLM (vLLM) → to
 
 Built-in tools live in `sip-agent/src/plugins/`. Each subclasses `BaseTool` and implements `async def execute(self, params) -> ToolResult`:
 
-- **Core**: weather (Tempest), timer, callback, hangup, status, cancel, datetime, calc, joke, simon_says, knowledge (RAG)
-- **Fun**: `random_tools.py` (DICE/COIN), `trivia_tool.py` (game state on `session.tool_state`), `story_tool.py` (one-shot LLM via `llm_engine.summarize_text`)
-- **Information**: `web_search_tool.py` (SearxNG), `nws_weather_tool.py` (FORECAST — api.weather.gov, needs a descriptive User-Agent), `space_weather_tool.py` (KP_INDEX — NOAA SWPC), `quake_tool.py` (QUAKES — USGS feeds)
+- **Core**: weather (NWS current conditions; needs `WEATHER_LATITUDE`/`WEATHER_LONGITUDE`), timer, callback, hangup, status, cancel, datetime, calc, joke, simon_says, knowledge (RAG)
+- **Fun**: `random_tools.py` (DICE/COIN), `trivia_tool.py` (game state on `session.tool_state`), `story_tool.py` (one-shot LLM via `llm_engine.summarize_text`), `drink_tool.py` (DRINK_RECIPE — TheCocktailDB)
+- **Information**: `web_search_tool.py` (SearxNG), `nws_weather_tool.py` (FORECAST — api.weather.gov, needs a descriptive User-Agent), `space_weather_tool.py` (KP_INDEX — NOAA SWPC), `quake_tool.py` (QUAKES — USGS feeds; `sort=recent|biggest|nearest`, result always names `most_recent`/`largest`, data capped at 10). Shared plumbing (JSON fetch, number-to-words, spoken time-ago, home-coordinates gate) lives in `plugins/helpers.py`.
 - **Memory + automation**: `memory_tools.py` (REMEMBER/FORGET over `CallerMemoryStore.add_fact`/`remove_facts`), `workflow_tool.py` (TRIGGER_WORKFLOW — fires webhooks named in `data/workflows.json` via `deliver_webhook`)
 - **Ops**: `gpu_status_tool.py` + `alerts_tool.py` (Prometheus/Alertmanager queries), `container_tool.py` (CONTAINER_CTL — docker Engine API over the socket, allowlist-gated, restart requires `confirm=true`)
 - **Telephony**: `transfer_tool.py` (TRANSFER — blind REFER via `SIPHandler.transfer_call`, which marshals `Call.xfer` onto the PJSIP thread through `_queue_command`)
 
-`BaseTool.speak_result = True` marks informational tools whose result message is spoken verbatim in text-marker mode (`llm_engine._apply_marker_tools` reads it). Tools needing per-call state must use `session.tool_state[...]` — tool instances are singletons across calls.
+`BaseTool.speak_result = True` marks informational tools whose result message is spoken verbatim in text-marker mode (`llm_engine._apply_marker_tools`); in native/langgraph mode `_fold_unspoken_results` prepends the message when the model failed to relay it. Tools needing per-call state must use `session.tool_state[...]` — tool instances are singletons across calls.
 
 ### REST API endpoints (`api.py`)
 
-`/health` (add `?deep=true` to probe vLLM/Speaches/Redis), `/queue`, `POST /call`, `GET /call/{id}`, `GET /call/{id}/transcript`, `/tools`, `/tools/{name}`, `POST /tools/{name}/call`, `POST /tools/{name}/execute`, `POST /webhook/call`, `POST /speak`, and the `/schedule` CRUD set (`POST` / `GET` / `GET {id}` / `DELETE {id}`). Outbound-call requests support an optional `choice` prompt that collects a spoken response — or a DTMF keypress (`ChoiceOption.dtmf`, default 1-based position) — and POSTs it to a `callback_url`. Outgoing webhooks are SSRF-pinned, retried with backoff, and HMAC-signed when `WEBHOOK_SIGNING_SECRET` is set (`deliver_webhook`). Mutating endpoints support bearer/X-API-Key auth (`API_AUTH_TOKEN`) and token-bucket rate limiting (`RATE_LIMIT_RPM`).
+`/health` (add `?deep=true` to probe vLLM/Speaches/Redis), `/queue`, `POST /call`, `GET /call/{id}`, `GET /call/{id}/transcript`, `/tools`, `/tools/{name}`, `POST /tools/{name}/call`, `POST /tools/{name}/execute`, `POST /webhook/call`, `POST /speak`, `POST /play` (raw audio body played into the active call), the `/schedule` CRUD set (`POST` / `GET` / `GET {id}` / `DELETE {id}`), and the `/virtual-numbers` CRUD set (ephemeral single-use inbound extensions; see `virtual_numbers.py`). Outbound-call requests support an optional `choice` prompt that collects a spoken response — or a DTMF keypress (`ChoiceOption.dtmf`, default 1-based position) — and POSTs it to a `callback_url`. Outgoing webhooks are SSRF-pinned, retried with backoff, and HMAC-signed when `WEBHOOK_SIGNING_SECRET` is set (`deliver_webhook`). Mutating endpoints support bearer/X-API-Key auth (`API_AUTH_TOKEN`) and token-bucket rate limiting (`RATE_LIMIT_RPM`).
 
 ## Common commands
 

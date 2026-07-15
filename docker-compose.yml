@@ -35,10 +35,17 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      # DeepGEMM has no SM 12.1 (GB10) support — vLLM >= 0.24 crashes loading
+      # FP8 weights through it ("Unknown SF transformation"); force the
+      # Triton/CUTLASS fallback instead.
+      - VLLM_USE_DEEP_GEMM=0
     ipc: host
     ulimits:
       memlock: -1
       stack: 67108864
+    # Upstream :latest switched its ENTRYPOINT to ["vllm", "serve"]; blank it
+    # so the full command below works on any image vintage.
+    entrypoint: []
     command: >
       vllm serve
       ${LLM_MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507-FP8}
@@ -73,7 +80,11 @@ services:
   # OpenAI-compatible API for both transcription and speech synthesis
   # ============================================================================
   speaches:
-    image: ghcr.io/speaches-ai/speaches:0.9.0-rc.2-cuda-12.6.3
+    # GB10/aarch64: stock image's ctranslate2 wheel is CPU-only, so Whisper ran
+    # on the Grace cores. This local tag layers a CUDA 13 sm_121 CTranslate2
+    # build on top — rebuild with:
+    #   docker build -t ghcr.io/speaches-ai/speaches:gb10-cuda13 docker/speaches-gb10
+    image: ghcr.io/speaches-ai/speaches:gb10-cuda13
     container_name: sip-ai-speaches
     runtime: nvidia
     ipc: host
@@ -84,7 +95,9 @@ services:
       # Options: default, int8, int8_float16, int8_float32, int8_bfloat16, 
       #          int16, float16, bfloat16, float32
       - WHISPER__COMPUTE_TYPE=${WHISPER_COMPUTE_TYPE:-default}
-      - WHISPER__DEVICE=${WHISPER_DEVICE:-cuda}
+      # NOTE: the setting is INFERENCE_DEVICE — WHISPER__DEVICE is silently
+      # ignored by speaches (device fell back to 'auto' = CPU without CUDA).
+      - WHISPER__INFERENCE_DEVICE=${WHISPER_DEVICE:-cuda}
       - WHISPER__INFERENCE_CONFIG__BEAM_SIZE=${WHISPER_BEAM_SIZE:-1}
       - WHISPER__INFERENCE_CONFIG__LANGUAGE=${WHISPER_LANGUAGE:-en}
       - WHISPER__INFERENCE_CONFIG__VAD_FILTER=true
@@ -145,6 +158,7 @@ services:
       - LLM_TOP_P=${LLM_TOP_P:-0.85}
       - LLM_API_KEY=${LLM_API_KEY:-not-needed}
       - LLM_TOOL_CALLING=${LLM_TOOL_CALLING:-text}
+      - LLM_STREAMING=${LLM_STREAMING:-true}
       - LLM_FREQUENCY_PENALTY=${LLM_FREQUENCY_PENALTY:-0.0}
       - LLM_MAX_TOOL_ROUNDS=${LLM_MAX_TOOL_ROUNDS:-5}
       - LLM_AGENT_TIMEOUT_S=${LLM_AGENT_TIMEOUT_S:-30.0}
@@ -162,7 +176,7 @@ services:
       - KNOWLEDGE_AUTO_INJECT=${KNOWLEDGE_AUTO_INJECT:-false}
       - CONVERSATION_SUMMARY_ENABLED=${CONVERSATION_SUMMARY_ENABLED:-true}
       - CONVERSATION_SUMMARY_TIMEOUT_S=${CONVERSATION_SUMMARY_TIMEOUT_S:-20.0}
-      # Location for FORECAST / QUAKES-near (empty disables those tools)
+      # Location for WEATHER / FORECAST / QUAKES-near (empty disables those tools)
       - WEATHER_LATITUDE=${WEATHER_LATITUDE:-}
       - WEATHER_LONGITUDE=${WEATHER_LONGITUDE:-}
       # WEB_SEARCH via SearxNG (start it with: docker compose --profile search up -d)
@@ -175,11 +189,20 @@ services:
       # also requires the docker socket mount below)
       - CONTAINER_CTL_ALLOWLIST=${CONTAINER_CTL_ALLOWLIST:-}
       - ENABLE_TRANSFER_TOOL=${ENABLE_TRANSFER_TOOL:-true}
+      # DRINK_RECIPE tool (TheCocktailDB lookups)
+      - ENABLE_DRINK_TOOL=${ENABLE_DRINK_TOOL:-true}
       # Single-line prompt override; multi-line prompts go in data/system_prompt.txt
       - SYSTEM_PROMPT=${SYSTEM_PROMPT:-}
       # Per-turn acknowledgment: chime (earcon, default) | phrase | none
       - TURN_ACK_MODE=${TURN_ACK_MODE:-chime}
       - CHIME_VOLUME=${CHIME_VOLUME:-0.3}
+      # Deterministic hangup when the caller's utterance is purely a farewell
+      - FAREWELL_HANGUP_ENABLED=${FAREWELL_HANGUP_ENABLED:-true}
+      # "Still thinking" tick while a slow LLM turn is in flight (0 delay disables)
+      - THINKING_SOUND_DELAY_S=${THINKING_SOUND_DELAY_S:-2.0}
+      - THINKING_SOUND_INTERVAL_S=${THINKING_SOUND_INTERVAL_S:-2.5}
+      # Byte cap for POST /play audio uploads
+      - PLAY_AUDIO_MAX_BYTES=${PLAY_AUDIO_MAX_BYTES:-10485760}
       - MAX_CONVERSATION_TURNS=${MAX_CONVERSATION_TURNS:-10}
       # Speaches API settings (unified STT + TTS)
       - SPEACHES_API_URL=http://speaches:8001
@@ -189,7 +212,16 @@ services:
       - MIN_SPEECH_DURATION_MS=${MIN_SPEECH_DURATION_MS:-200}
       - MAX_SPEECH_DURATION_S=${MAX_SPEECH_DURATION_S:-8.0}
       - SILENCE_TIMEOUT_MS=${SILENCE_TIMEOUT_MS:-750}
+      # Endpointing: fixed | adaptive | speculative (see ENDPOINT_MODE docs)
+      - ENDPOINT_MODE=${ENDPOINT_MODE:-fixed}
+      - ENDPOINT_MIN_SILENCE_MS=${ENDPOINT_MIN_SILENCE_MS:-350}
+      - ENDPOINT_MAX_SILENCE_MS=${ENDPOINT_MAX_SILENCE_MS:-1500}
       - BARGE_IN_MIN_DURATION=${BARGE_IN_MIN_DURATION:-400}
+      # Gap (ms) of VAD-negative audio tolerated INSIDE a barge-in speech run.
+      # Real speech is not VAD-positive end to end (syllable gaps, unvoiced
+      # consonants); without this the run resets on the first negative chunk
+      # and the caller has to talk far longer than BARGE_IN_MIN_DURATION.
+      - BARGE_IN_MAX_GAP_MS=${BARGE_IN_MAX_GAP_MS:-250}
       - STT_MODE=${STT_MODE:-batch}
       - REALTIME_COMMIT_TIMEOUT_S=${REALTIME_COMMIT_TIMEOUT_S:-5.0}
       # TTS settings (Kokoro via Speaches - auto-downloaded on first use)
@@ -206,12 +238,25 @@ services:
       - SIP_REGISTRAR=${SIP_REGISTRAR:-}
       # General
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # Wall-clock: container TZ (logs, naive clocks) + the agent's spoken/
+      # scheduled timezone (system-prompt clock, DATETIME default, recurring schedules)
+      - TZ=${TZ:-America/Los_Angeles}
+      - LOCAL_TIMEZONE=${LOCAL_TIMEZONE:-America/Los_Angeles}
+      # Reliability: busy-reject over-capacity inbound calls; forced-tool retry
+      # when the model answers live-data questions without calling a tool.
+      # MAX_CONCURRENT_CALLS=1 keeps the classic one-live-call behavior; 2-3 is
+      # realistic on a DGX Spark (concurrent calls share STT/TTS/LLM, so
+      # latency stacks with each added call). SIP_MAX_CALLS is the PJSIP
+      # stack-level slot count — keep it above MAX_CONCURRENT_CALLS (the
+      # agent auto-raises it to MAX_CONCURRENT_CALLS + 2 if set lower).
+      - SIP_BUSY_REJECT=${SIP_BUSY_REJECT:-true}
+      - MAX_CONCURRENT_CALLS=${MAX_CONCURRENT_CALLS:-1}
+      - SIP_MAX_CALLS=${SIP_MAX_CALLS:-4}
+      - GROUNDING_RETRY_ENABLED=${GROUNDING_RETRY_ENABLED:-true}
+      - GROUNDING_RETRY_TIMEOUT_S=${GROUNDING_RETRY_TIMEOUT_S:-15.0}
       # Tools
       - CALLBACK_RING_TIMEOUT=${CALLBACK_RING_TIMEOUT:-30}
       - ENABLE_PLUGIN_AUTODISCOVERY=${ENABLE_PLUGIN_AUTODISCOVERY:-true}
-      # Tempest Weather API (optional)
-      - TEMPEST_STATION_ID=${TEMPEST_STATION_ID:-}
-      - TEMPEST_API_TOKEN=${TEMPEST_API_TOKEN:-}
       # API settings. The container always listens on 8080; API_PORT selects
       # only the HOST-side port it is published on (see ports: below).
       - API_PORT=8080
@@ -228,6 +273,8 @@ services:
       - API_BIND_ADDRESS=${API_BIND_ADDRESS:-127.0.0.1}
       - API_AUTH_TOKEN=${API_AUTH_TOKEN:-}
       - ALLOW_UNAUTHENTICATED=${ALLOW_UNAUTHENTICATED:-false}
+      # Operator dashboard page at GET /admin (data endpoints stay auth-gated)
+      - ADMIN_UI_ENABLED=${ADMIN_UI_ENABLED:-true}
       - WEBHOOK_ALLOW_PRIVATE=${WEBHOOK_ALLOW_PRIVATE:-false}
       - WEBHOOK_REQUIRE_HTTPS=${WEBHOOK_REQUIRE_HTTPS:-false}
       - WEBHOOK_SIGNING_SECRET=${WEBHOOK_SIGNING_SECRET:-}
@@ -236,6 +283,16 @@ services:
       - CALL_EVENT_WEBHOOK_URL=${CALL_EVENT_WEBHOOK_URL:-}
       - CALL_EVENTS=${CALL_EVENTS:-call.started,call.ended}
       - CALL_EVENT_INCLUDE_TRANSCRIPT=${CALL_EVENT_INCLUDE_TRANSCRIPT:-true}
+      # Virtual numbers: ephemeral single-use inbound extensions (POST /virtual-numbers)
+      - VIRTUAL_NUMBERS_ENABLED=${VIRTUAL_NUMBERS_ENABLED:-false}
+      - VIRTUAL_NUMBER_DEFAULT_TTL_S=${VIRTUAL_NUMBER_DEFAULT_TTL_S:-900}
+      - VIRTUAL_NUMBER_MAX_TTL_S=${VIRTUAL_NUMBER_MAX_TTL_S:-86400}
+      - VIRTUAL_NUMBER_RANGE=${VIRTUAL_NUMBER_RANGE:-7300-7399}
+      - VIRTUAL_NUMBER_MAX_ACTIVE=${VIRTUAL_NUMBER_MAX_ACTIVE:-50}
+      # MCP client: tools from external MCP servers (see data/mcp_servers.json.example)
+      - MCP_ENABLED=${MCP_ENABLED:-false}
+      - MCP_SERVERS_FILE=${MCP_SERVERS_FILE:-data/mcp_servers.json}
+      - MCP_TOOL_TIMEOUT_S=${MCP_TOOL_TIMEOUT_S:-10}
       - OUTBOUND_ALLOW_SIP_URI=${OUTBOUND_ALLOW_SIP_URI:-false}
       - OUTBOUND_EXTENSION_PATTERN=${OUTBOUND_EXTENSION_PATTERN:-}
       - AMD_ENABLED=${AMD_ENABLED:-false}

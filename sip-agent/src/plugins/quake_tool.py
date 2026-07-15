@@ -19,8 +19,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-import httpx
-
+from plugins.helpers import fetch_json, home_coordinates, number_to_words, spoken_time_ago
 from tool_plugins import BaseTool, ToolResult, ToolStatus
 from logging_utils import log_event
 
@@ -33,6 +32,11 @@ VALID_PERIODS = ("hour", "day", "week")
 NEAR_RADIUS_KM = 500.0
 EARTH_RADIUS_KM = 6371.0
 MAX_SPOKEN_QUAKES = 3
+# Cap the structured payload: the model only needs the top of the ranking,
+# and a 1.0/week feed has thousands of entries — an unbounded list balloons
+# the agent context past its turn timeout.
+MAX_DATA_QUAKES = 10
+VALID_SORTS = ("recent", "biggest", "nearest")
 
 # USGS "place" strings often lead with a distance, e.g. "12 km SE of Ridgecrest, CA"
 _PLACE_PREFIX_RE = re.compile(r"^\s*\d+(?:\.\d+)?\s*km\s+[NSEW]{1,3}\s+of\s+",
@@ -40,12 +44,6 @@ _PLACE_PREFIX_RE = re.compile(r"^\s*\d+(?:\.\d+)?\s*km\s+[NSEW]{1,3}\s+of\s+",
 
 # Spoken forms of the feed magnitude thresholds
 _THRESHOLD_SPOKEN = {"1.0": "one", "2.5": "two point five", "4.5": "four point five"}
-
-_ONES = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
-         "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
-         "sixteen", "seventeen", "eighteen", "nineteen"]
-_TENS = {2: "twenty", 3: "thirty", 4: "forty", 5: "fifty", 6: "sixty",
-         7: "seventy", 8: "eighty", 9: "ninety"}
 
 # Expand trailing state abbreviations so TTS says "California", not "C A"
 _STATE_NAMES = {
@@ -65,15 +63,7 @@ _STATE_NAMES = {
 }
 
 
-def _num_word(n: int) -> str:
-    """Spell out a small integer for speech ('3' -> 'three'); large numbers stay digits."""
-    n = int(n)
-    if 0 <= n < 20:
-        return _ONES[n]
-    if n < 100:
-        tens, ones = divmod(n, 10)
-        return _TENS[tens] + ("" if ones == 0 else " " + _ONES[ones])
-    return str(n)
+_num_word = number_to_words
 
 
 def _spoken_magnitude(mag: float) -> str:
@@ -81,7 +71,7 @@ def _spoken_magnitude(mag: float) -> str:
     whole_str, frac_str = f"{abs(float(mag)):.1f}".split(".")
     words = _num_word(int(whole_str))
     if frac_str != "0":
-        words += f" point {_ONES[int(frac_str)]}"
+        words += f" point {number_to_words(int(frac_str))}"
     return ("minus " + words) if float(mag) < 0 else words
 
 
@@ -112,22 +102,7 @@ def _spoken_place(place: str) -> str:
     return place
 
 
-def _ago(epoch_ms: float, now_s: float) -> str:
-    """Spoken relative time for an epoch-milliseconds timestamp."""
-    seconds = max(0.0, now_s - float(epoch_ms) / 1000.0)
-    if seconds < 300:
-        return "just now"
-    if seconds < 3600:
-        minutes = max(1, round(seconds / 60))
-        unit = "minute" if minutes == 1 else "minutes"
-        return f"about {_num_word(minutes)} {unit} ago"
-    if seconds < 86400:
-        hours = max(1, round(seconds / 3600))
-        unit = "hour" if hours == 1 else "hours"
-        return f"about {_num_word(hours)} {unit} ago"
-    days = max(1, round(seconds / 86400))
-    unit = "day" if days == 1 else "days"
-    return f"about {_num_word(days)} {unit} ago"
+_ago = spoken_time_ago
 
 
 def _resolve_feed(value: Any) -> str:
@@ -145,10 +120,7 @@ def _resolve_period(value: Any) -> str:
 async def _fetch_json(url: str, params: Optional[Dict[str, Any]] = None,
                       headers: Optional[Dict[str, str]] = None) -> Any:
     """Fetch and decode JSON (module-level so tests can monkeypatch it)."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(url, params=params, headers=headers)
-        response.raise_for_status()
-        return response.json()
+    return await fetch_json(url, params=params, headers=headers)
 
 
 class EarthquakeTool(BaseTool):
@@ -156,7 +128,9 @@ class EarthquakeTool(BaseTool):
 
     name = "QUAKES"
     description = ("Get recent earthquakes from the US Geological Survey, "
-                   "optionally only those near the local area")
+                   "sorted and classified — the result always names the most "
+                   "recent and the largest explicitly; optionally only those "
+                   "near the local area")
     enabled = True
     speak_result = True  # informational: message is spoken in marker mode
 
@@ -179,21 +153,26 @@ class EarthquakeTool(BaseTool):
             "required": False,
             "default": False,
         },
+        "sort": {
+            "type": "string",
+            "description": "Ranking to report: 'recent' (newest first, default), "
+                           "'biggest' (largest first), or 'nearest' (closest "
+                           "first; needs the configured location)",
+            "required": False,
+            "default": "recent",
+        },
     }
 
     def _configured_coords(self) -> Optional[Tuple[float, float]]:
         """Configured latitude/longitude, or None when unset/unparseable."""
-        if not self.config:
-            return None
-        try:
-            return (float(self.config.weather_latitude),
-                    float(self.config.weather_longitude))
-        except (TypeError, ValueError):
-            return None
+        return home_coordinates(self.config)
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
         feed = _resolve_feed(params.get("min_magnitude", "2.5"))
         period = _resolve_period(params.get("period", "day"))
+        sort = str(params.get("sort") or "recent").strip().lower()
+        if sort not in VALID_SORTS:
+            sort = "recent"
         near = params.get("near", False)
         if isinstance(near, str):
             near = near.strip().lower() in ("true", "yes", "1")
@@ -223,31 +202,63 @@ class EarthquakeTool(BaseTool):
 
         note = None
         near_applied = False
+        home = self._configured_coords()
         if near:
-            coords = self._configured_coords()
-            if coords is None:
+            if home is None:
                 # Degrade gracefully: report everything and note the skipped filter
                 note = "near filter ignored: WEATHER_LATITUDE/WEATHER_LONGITUDE not configured"
                 logger.info("QUAKES near filter requested but coordinates not configured")
             else:
                 near_applied = True
                 quakes = [q for q in quakes
-                          if _haversine_km(coords[0], coords[1],
+                          if _haversine_km(home[0], home[1],
                                            q["lat"], q["lon"]) <= NEAR_RADIUS_KM]
 
-        quakes.sort(key=lambda q: q["mag"], reverse=True)
         now_s = time.time()
         for q in quakes:
             q["ago"] = _ago(q["time_ms"], now_s) if q["time_ms"] is not None else "recently"
+            if home is not None:
+                q["distance_km"] = round(_haversine_km(home[0], home[1],
+                                                       q["lat"], q["lon"]))
+
+        # Rank per the requested sort; 'nearest' needs coordinates.
+        if sort == "nearest" and home is None:
+            sort = "recent"
+            note = note or "nearest sort ignored: location not configured"
+        if sort == "biggest":
+            quakes.sort(key=lambda q: q["mag"], reverse=True)
+        elif sort == "nearest":
+            quakes.sort(key=lambda q: q.get("distance_km", 1e9))
+        else:  # recent
+            quakes.sort(key=lambda q: q["time_ms"] or 0, reverse=True)
+
+        def _entry(q: Dict[str, Any]) -> Dict[str, Any]:
+            entry = {"mag": q["mag"], "place": q["place"], "ago": q["ago"],
+                     "lat": q["lat"], "lon": q["lon"]}
+            if "distance_km" in q:
+                entry["distance_km"] = q["distance_km"]
+            return entry
+
+        # Explicit classification so the model never has to re-rank the list:
+        # most_recent and largest are always named, and `quakes` is capped —
+        # the full feed can be thousands of entries and would balloon the
+        # LLM context past the turn timeout.
+        most_recent = max(quakes, key=lambda q: q["time_ms"] or 0, default=None)
+        largest = max(quakes, key=lambda q: q["mag"], default=None)
 
         data: Dict[str, Any] = {
             "count": len(quakes),
             "period": period,
             "min_magnitude": feed,
             "near": near_applied,
-            "quakes": [{"mag": q["mag"], "place": q["place"], "ago": q["ago"],
-                        "lat": q["lat"], "lon": q["lon"]} for q in quakes],
+            "sort": sort,
+            "most_recent": _entry(most_recent) if most_recent else None,
+            "largest": _entry(largest) if largest else None,
+            "quakes": [_entry(q) for q in quakes[:MAX_DATA_QUAKES]],
         }
+        if len(quakes) > MAX_DATA_QUAKES:
+            data["note_truncated"] = (f"list capped at {MAX_DATA_QUAKES} of "
+                                      f"{len(quakes)} (sorted by {sort})")
         if note:
             data["note"] = note
 
@@ -263,22 +274,36 @@ class EarthquakeTool(BaseTool):
 
         count = len(quakes)
         noun = "quake" if count == 1 else "quakes"
-        descriptions = [
-            f"magnitude {_spoken_magnitude(q['mag'])} near {_spoken_place(q['place'])}, {q['ago']}"
-            for q in quakes[:MAX_SPOKEN_QUAKES]
-        ]
+
+        def _describe(q: Dict[str, Any]) -> str:
+            text = (f"magnitude {_spoken_magnitude(q['mag'])} near "
+                    f"{_spoken_place(q['place'])}, {q['ago']}")
+            if sort == "nearest" and "distance_km" in q:
+                text += f", about {q['distance_km']} kilometers away"
+            return text
 
         sentences = [f"{_num_word(count).capitalize()} {noun} in the last {period}{near_suffix}."]
         if count == 1:
-            sentences.append(descriptions[0][0].upper() + descriptions[0][1:] + ".")
+            desc = _describe(quakes[0])
+            sentences.append(desc[0].upper() + desc[1:] + ".")
         else:
-            sentences.append(f"The largest was {descriptions[0]}.")
-            if len(descriptions) > 1:
-                sentences.append("Also " + ", and ".join(descriptions[1:]) + ".")
+            lead = {"recent": "The most recent was",
+                    "biggest": "The largest was",
+                    "nearest": "The closest was"}[sort]
+            sentences.append(f"{lead} {_describe(quakes[0])}.")
+            # One cross-ranking fact so "most recent" and "largest" are both
+            # always available to the caller in a single tool round.
+            if sort != "biggest" and largest is not None and largest is not quakes[0]:
+                sentences.append(f"The largest was {_describe(largest)}.")
+            elif sort == "biggest" and most_recent is not None and most_recent is not quakes[0]:
+                sentences.append(f"The most recent was {_describe(most_recent)}.")
+            elif len(quakes) > 1:
+                sentences.append("Next: " + _describe(quakes[1]) + ".")
         message = " ".join(sentences)
 
         log_event(logger, logging.INFO,
-                  f"QUAKES: {count} quakes ({feed}/{period}, near={near_applied})",
+                  f"QUAKES: {count} quakes ({feed}/{period}, sort={sort}, "
+                  f"near={near_applied})",
                   event="quake_fetch")
 
         return ToolResult(status=ToolStatus.SUCCESS, message=message, data=data)

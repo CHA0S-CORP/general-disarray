@@ -19,12 +19,14 @@ spoken error phrase — never a crash, never a mock response.
 """
 
 import asyncio
+import contextvars
 import logging
 import time
 from typing import Any, Dict, List, Optional
 
 try:
-    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+    from langchain_core.messages import (AIMessage, HumanMessage,
+                                         SystemMessage, ToolMessage)
     from langchain_core.tools import StructuredTool
     from langchain_openai import ChatOpenAI
     from langgraph.errors import GraphRecursionError
@@ -34,12 +36,21 @@ try:
 except ImportError:
     LANGCHAIN_AVAILABLE = False
 
+import grounding
 from config import Config
-from llm_engine import LLMEngine, ToolCall
+from llm_engine import LLMEngine, ToolCall, TurnContext
 from logging_utils import log_event
 from telemetry import create_span, Metrics
 
 logger = logging.getLogger(__name__)
+
+# The turn's TurnContext, visible to the LangChain tool closures. The bound
+# StructuredTools are built once at start() and executed deep inside
+# langgraph's ainvoke, so the per-turn context can't be threaded through
+# their signatures; a contextvar propagates it along the ainvoke task tree
+# instead (each concurrent turn sees only its own context).
+_TURN_CTX: "contextvars.ContextVar[Optional[TurnContext]]" = (
+    contextvars.ContextVar("langchain_turn_ctx", default=None))
 
 _PARAM_TYPES = {
     "string": str,
@@ -59,6 +70,11 @@ class LangChainEngine(LLMEngine):
                 "langchain-openai and langgraph")
         super().__init__(config, tool_manager)
         self._agent = None
+        self._chat = None
+        self._lc_tools: List[Any] = []
+        # Whether the backend accepts tool_choice="required"; probed once,
+        # cached so a vLLM that rejects it costs a single failed request.
+        self._tool_choice_supported = True
 
     async def start(self):
         # Keeps self.client (AsyncOpenAI) alive for the shared utility paths
@@ -83,6 +99,10 @@ class LangChainEngine(LLMEngine):
         tools = (self._build_lc_tools()
                  if self.config.llm_tool_calling.lower() == "native" else [])
         self._agent = create_react_agent(chat, tools)
+        # Kept for the grounding retry (one forced tool round outside the
+        # graph — see _grounding_retry).
+        self._chat = chat
+        self._lc_tools = tools
         logger.info(
             f"LangGraph agent ready ({len(tools)} bound tools, "
             f"max {self.config.llm_max_tool_rounds} tool rounds)")
@@ -114,6 +134,9 @@ class LangChainEngine(LLMEngine):
                 try:
                     result = await self.tool_manager.execute_tool(
                         ToolCall(name=_tool_name, params=params, raw=""))
+                    ctx = _TURN_CTX.get()
+                    if ctx is not None:
+                        self._collect_spoken_result(ctx, _tool_name, result)
                     return getattr(result, "message", "") or "Done."
                 except Exception as e:
                     logger.error(f"Agent tool execution error ({_tool_name}): {e}")
@@ -154,6 +177,12 @@ class LangChainEngine(LLMEngine):
             return " ".join(p for p in parts if p)
         return ""
 
+    def _streaming_supported(self) -> bool:
+        # The LangGraph agent loop is out of scope for token streaming;
+        # stream_response falls back to the default generate_response replay
+        # path (sentence events from the completed agent turn).
+        return False
+
     async def generate_response(
         self,
         conversation_history: List[Dict[str, str]],
@@ -166,6 +195,24 @@ class LangChainEngine(LLMEngine):
             return await super().generate_response(
                 conversation_history, call_context)
 
+        # Per-turn tool bookkeeping; also published to the LC tool closures
+        # via the contextvar for the duration of this turn (reset on exit so
+        # a stale context can never leak into a later turn).
+        ctx = TurnContext()
+        ctx_token = _TURN_CTX.set(ctx)
+        try:
+            return await self._agent_generate(
+                conversation_history, call_context, ctx)
+        finally:
+            _TURN_CTX.reset(ctx_token)
+
+    async def _agent_generate(
+        self,
+        conversation_history: List[Dict[str, str]],
+        call_context: Optional[Dict[str, Any]],
+        ctx: TurnContext,
+    ) -> str:
+        """The agentic turn body (see generate_response, which owns ctx)."""
         messages: List[Any] = [
             SystemMessage(content=self._build_system_prompt(call_context))]
         # Same windowing rule as the classic engine (see _history_window):
@@ -222,12 +269,118 @@ class LangChainEngine(LLMEngine):
 
             final = out_messages[-1] if out_messages else None
             content = self._extract_text(final) if final is not None else ""
-            # gpt-oss and friends can legitimately return empty content.
+
+            # "Never guess": a live-data question answered with zero tool
+            # calls (or a reply that merely promises to check) gets ONE
+            # forced-tool retry. Casual chat never triggers (grounding.py).
+            #
+            # A turn that DID call a tool still needs this when it signs off on
+            # a promise: calling a tool is not the same as answering. The wrong
+            # tool can be called, or the right one can come back empty, and the
+            # model then defers — "Let me get that for you right away" — which
+            # at end of turn is just dead air. Gating the retry on
+            # tool_rounds == 0 let exactly that through.
+            if self._lc_tools and self.config.grounding_retry_enabled:
+                last_user = next(
+                    (m.content for m in reversed(messages)
+                     if isinstance(m, HumanMessage)), "")
+                if tool_rounds == 0:
+                    category = grounding.grounding_category(
+                        str(last_user), content)
+                elif grounding.trailing_promise(content):
+                    category = "PROMISED_ACTION"
+                else:
+                    category = None
+                if category and self._category_tools_available(category):
+                    retried = await self._grounding_retry(messages, category, ctx)
+                    if retried:
+                        content = retried
+
+            # gpt-oss and friends can legitimately return empty content. The
+            # grounding retry may still have fetched real data (recorded on
+            # ctx.spoken_results) — speak that instead of the error phrase.
             if not content or not content.strip():
                 logger.warning("Agent returned empty content")
                 Metrics.record_llm_error(self.config.llm_model, "empty_response")
-                return self._fallback_error()
+                return (self._fold_unspoken_results("", ctx)
+                        or self._fallback_error())
 
         # Marker safety net + informational-tool append, shared with the
         # classic engine (also covers text mode, where this IS the tool path).
-        return await self._apply_marker_tools(content.strip())
+        response_text = await self._apply_marker_tools(content.strip(), ctx)
+        # Guarantee speak_result tool output (jokes, weather, search results)
+        # actually reaches the caller even when the model only comments on it.
+        return self._fold_unspoken_results(response_text, ctx)
+
+    async def _grounding_retry(self, messages: List[Any], category: str,
+                               ctx: TurnContext) -> Optional[str]:
+        """One forced-tool round outside the graph, then a plain compose call.
+
+        bind_tools(tool_choice="required") makes the model pick a tool; the
+        calls are dispatched through tool_manager (populating
+        ctx.spoken_results, so _fold_unspoken_results speaks the real data
+        even if the compose step fails). A backend that rejects
+        tool_choice="required" (HTTP 400) is remembered and the retry falls
+        back to re-running the agent with an explicit grounding instruction.
+        """
+        start_time = time.time()
+        outcome = "error"
+        result_text: Optional[str] = None
+        try:
+            result_text, outcome = await asyncio.wait_for(
+                self._grounding_retry_inner(messages, ctx),
+                timeout=self.config.grounding_retry_timeout_s)
+        except asyncio.TimeoutError:
+            outcome = "timeout"
+        except Exception as e:
+            logger.error(f"Grounding retry error: {e}")
+            outcome = "error"
+        log_event(logger, logging.INFO,
+                  f"Grounding retry ({category}): {outcome}",
+                  event="grounding_retry", category=category, outcome=outcome,
+                  latency_ms=round((time.time() - start_time) * 1000))
+        return result_text
+
+    async def _grounding_retry_inner(self, messages: List[Any],
+                                     ctx: TurnContext):
+        """Returns (result_text | None, outcome)."""
+        if self._tool_choice_supported:
+            try:
+                forced = await self._chat.bind_tools(
+                    self._lc_tools, tool_choice="required").ainvoke(messages)
+            except Exception as e:
+                # vLLM without guided-decoding tool_choice answers 400; any
+                # BadRequest here means "not supported" — remember and fall
+                # back to the nudge path below.
+                if "400" not in str(e) and "BadRequest" not in type(e).__name__:
+                    raise
+                logger.warning(f"tool_choice=required rejected by backend: {e}")
+                self._tool_choice_supported = False
+            else:
+                tool_calls = getattr(forced, "tool_calls", None) or []
+                if not tool_calls:
+                    return None, "no_tool_call"
+                tool_messages = []
+                for tc in tool_calls:
+                    params = {k: v for k, v in (tc.get("args") or {}).items()
+                              if v is not None}
+                    result = await self.tool_manager.execute_tool(
+                        ToolCall(name=tc["name"], params=params, raw=""))
+                    self._collect_spoken_result(ctx, tc["name"], result)
+                    tool_messages.append(ToolMessage(
+                        content=getattr(result, "message", "") or "Done.",
+                        tool_call_id=tc.get("id") or "forced_0"))
+                # Compose with no tools bound — cannot recurse. Even an empty
+                # compose is fine: _fold_unspoken_results speaks the data.
+                composed = await self._chat.ainvoke(
+                    messages + [forced, *tool_messages])
+                return (self._extract_text(composed) or "").strip() or None, "tool_used"
+
+        # Fallback: strong instruction re-run through the normal agent.
+        nudge = SystemMessage(content=grounding.NUDGE)
+        result = await self._agent.ainvoke(
+            {"messages": messages + [nudge]},
+            config={"recursion_limit": 5})
+        out = result.get("messages", []) if isinstance(result, dict) else []
+        text = self._extract_text(out[-1]) if out else ""
+        return (text or "").strip() or None, "forced_unsupported_nudge"

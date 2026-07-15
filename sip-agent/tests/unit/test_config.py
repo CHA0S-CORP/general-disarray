@@ -67,6 +67,21 @@ def test_turn_ack_mode(config, config_factory):
     assert config_factory(turn_ack_mode="kazoo").turn_ack_mode == "chime"  # invalid -> fallback
 
 
+def test_endpoint_mode(config, config_factory):
+    assert config.endpoint_mode == "fixed"
+    assert config_factory(endpoint_mode="adaptive").endpoint_mode == "adaptive"
+    assert config_factory(endpoint_mode="SPECULATIVE").endpoint_mode == "speculative"
+    assert config_factory(endpoint_mode="psychic").endpoint_mode == "fixed"  # invalid -> fallback
+
+
+def test_endpoint_silence_bounds(config, config_factory):
+    assert config.endpoint_min_silence_ms == 350
+    assert config.endpoint_max_silence_ms == 1500
+    cfg = config_factory(endpoint_min_silence_ms="250", endpoint_max_silence_ms="2000")
+    assert cfg.endpoint_min_silence_ms == 250
+    assert cfg.endpoint_max_silence_ms == 2000
+
+
 def test_chime_volume(config, config_factory):
     assert config.chime_volume == 0.3
     assert config_factory(chime_volume="0.15").chime_volume == 0.15

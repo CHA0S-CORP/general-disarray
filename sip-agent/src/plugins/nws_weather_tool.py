@@ -2,8 +2,8 @@
 NWS Forecast Tool Plugin
 ========================
 Official US National Weather Service forecast for the configured coordinates
-(WEATHER_LATITUDE / WEATHER_LONGITUDE). Distinct from the Tempest WEATHER tool,
-which reports live station conditions - this one is the outlook.
+(WEATHER_LATITUDE / WEATHER_LONGITUDE). Distinct from the WEATHER tool, which
+reports current conditions from the nearest NWS station - this one is the outlook.
 
 Usage in conversation:
 User: "What's the forecast for tomorrow?"
@@ -16,7 +16,7 @@ LLM: [TOOL:FORECAST:when=week]
 import logging
 from typing import Any, Dict, List, Optional
 
-import httpx
+from plugins.helpers import fetch_json
 
 from tool_plugins import BaseTool, ToolResult, ToolStatus
 from logging_utils import log_event
@@ -42,10 +42,10 @@ _SUBSET_KEYS = (
 
 async def _fetch_json(url: str, params: Optional[Dict[str, Any]] = None,
                       headers: Optional[Dict[str, str]] = None) -> Any:
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(url, params=params, headers=headers)
-        response.raise_for_status()
-        return response.json()
+    # follow_redirects: NWS 301-redirects /points/ URLs to its canonical
+    # coordinate form (e.g. more than 4 decimal places).
+    return await fetch_json(url, params=params, headers=headers,
+                            follow_redirects=True)
 
 
 def _select_period(periods: List[Dict[str, Any]], when: str) -> Dict[str, Any]:

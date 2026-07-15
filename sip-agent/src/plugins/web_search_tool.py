@@ -18,7 +18,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional
 
-import httpx
+from plugins.helpers import fetch_json
 
 from tool_plugins import BaseTool, ToolResult, ToolStatus
 from logging_utils import log_event
@@ -26,14 +26,14 @@ from logging_utils import log_event
 logger = logging.getLogger(__name__)
 
 SNIPPET_MAX_CHARS = 200
+# Spoken titles are a list read down a phone line — keep each one short enough
+# that three of them still land as one sentence.
+TITLE_MAX_CHARS = 70
 
 
 async def _fetch_json(url: str, params: Optional[Dict[str, Any]] = None,
                       headers: Optional[Dict[str, str]] = None) -> Any:
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(url, params=params, headers=headers)
-        response.raise_for_status()
-        return response.json()
+    return await fetch_json(url, params=params, headers=headers)
 
 
 def _strip_html(text: str) -> str:
@@ -54,6 +54,46 @@ def _truncate_snippet(text: str, max_chars: int = SNIPPET_MAX_CHARS) -> str:
     if space > 0:
         cut = cut[:space]
     return cut.rstrip(" ,;:.") + "..."
+
+
+def _spoken_title(title: str) -> str:
+    """Reduce a scraped page title to something a TTS voice can say.
+
+    Search-result titles are written for search engines, not ears: they carry
+    bullets and pipes as separators ("Events | Things To Do · San Diego"), a
+    trailing site name after a dash, and decorative punctuation that TTS either
+    reads aloud or stumbles over. Keep the leading segment — the part that
+    names the thing — and drop the rest.
+    """
+    if not title:
+        return ""
+    # Split on the usual title separators and keep the first meaningful piece.
+    # Titles often OPEN with a separator ("· Film Screening: Love Birds · ..."),
+    # so take the first NON-EMPTY segment, not merely the first one.
+    parts = [p.strip()
+             for p in re.split(r"\s*[|·•‧–—]\s*|\s+-\s+", title.strip())]
+    head = next((p for p in parts if p), "")
+    # Strip anything that isn't speech: stray brackets, quotes, trailing punct.
+    head = re.sub(r"[\[\](){}\"“”<>*#]+", " ", head)
+    head = " ".join(head.split()).rstrip(" ,;:.-")
+    # An over-long title is an article headline, not a name — cut it at a word
+    # boundary rather than making the caller sit through it.
+    if len(head) > TITLE_MAX_CHARS:
+        cut = head[:TITLE_MAX_CHARS]
+        space = cut.rfind(" ")
+        head = (cut[:space] if space > 0 else cut).rstrip(" ,;:.-")
+    return head
+
+
+def _join_naturally(items: List[str]) -> str:
+    """Join for the ear: "a", "a and b", "a, b, and c"."""
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
 
 
 class WebSearchTool(BaseTool):
@@ -124,17 +164,31 @@ class WebSearchTool(BaseTool):
                 data={"query": query, "results": []},
             )
 
-        # Spoken summary never includes URLs; those live in data only.
-        spoken_parts = []
+        # What the MODEL reads: titles + snippets, so it has something to
+        # actually answer the question from. Never URLs — nothing should tempt
+        # it into reading one aloud.
+        model_parts = []
         for r in results:
             if r["snippet"]:
-                spoken_parts.append(f"{r['title']}: {r['snippet']}")
+                model_parts.append(f"{r['title']}: {r['snippet']}")
             else:
-                spoken_parts.append(r["title"])
-        message = "Here is what I found. " + ". ".join(spoken_parts) + "."
+                model_parts.append(r["title"])
+        message = "Search results for '{}':\n{}".format(
+            query, "\n".join(f"- {p}" for p in model_parts))
+
+        # What the CALLER hears, if this ever gets spoken instead of summarized.
+        # Snippets are scraped web text — bullets, SEO boilerplate, sentence
+        # fragments — and reading them verbatim down a phone line produced a
+        # minute of unlistenable junk. Titles only, and only a few.
+        spoken_titles = [_spoken_title(r["title"]) for r in results[:3]]
+        spoken_titles = [t for t in spoken_titles if t]
+        spoken = ("Here's what I found: " + _join_naturally(spoken_titles) + "."
+                  if spoken_titles else
+                  f"I found some results for {query}, but nothing I can read out.")
 
         return ToolResult(
             status=ToolStatus.SUCCESS,
             message=message,
+            spoken_message=spoken,
             data={"query": query, "results": results},
         )

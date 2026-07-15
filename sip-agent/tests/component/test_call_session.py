@@ -76,6 +76,76 @@ async def test_teardown_persists_transcript(real_assistant):
     assert a.session is None
 
 
+# --- Session registry --------------------------------------------------------
+
+async def test_registry_insert_and_explicit_teardown(real_assistant):
+    a = real_assistant
+    assert a.sessions == {}
+    assert a.session is None
+
+    s1 = a._begin_session(_call("sip:1001@host"), "inbound", "sip:1001@host")
+    assert list(a.sessions.values()) == [s1]
+    assert a.session is s1
+
+    # Explicit-session teardown removes exactly that entry.
+    await a._teardown_session(s1)
+    assert a.sessions == {}
+    assert a.session is None
+
+
+async def test_session_property_ambiguous_with_multiple_sessions(real_assistant):
+    """With more than one registered session the compat property is
+    ambiguous and returns None (04b lifts the cap; today this never happens
+    in production)."""
+    a = real_assistant
+    s1 = a._begin_session(_call("sip:1001@host"), "inbound", "sip:1001@host")
+    s2 = a._begin_session(_call("sip:1002@host"), "inbound", "sip:1002@host")
+    assert len(a.sessions) == 2
+    assert a.session is None  # ambiguous -> None
+
+    # Tearing down one leaves the other unambiguous — and untouched.
+    await a._teardown_session(s1)
+    assert list(a.sessions.values()) == [s2]
+    assert a.session is s2
+    await a._teardown_session(s2)
+    assert a.sessions == {}
+
+
+async def test_teardown_without_argument_clears_all_sessions(real_assistant):
+    a = real_assistant
+    a._begin_session(_call("sip:1001@host"), "inbound", "sip:1001@host")
+    a._begin_session(_call("sip:1002@host"), "inbound", "sip:1002@host")
+    await a._teardown_session()
+    assert a.sessions == {}
+    assert a.session is None
+
+
+async def test_detach_session_removes_only_identity_match(real_assistant):
+    """make_outbound_call's finally-block semantics: detaching a session
+    that was already replaced must not clobber the replacement's entry."""
+    a = real_assistant
+    s1 = a._begin_session(_call("sip:1001@host"), "inbound", "sip:1001@host")
+    await a._teardown_session(s1)
+    s2 = a._begin_session(_call("sip:1002@host"), "inbound", "sip:1002@host")
+
+    a._detach_session(s1)  # stale detach: s1 is long gone
+    assert list(a.sessions.values()) == [s2]
+    a._detach_session(s2)
+    assert a.sessions == {}
+
+
+async def test_begin_session_creates_per_session_audio_state(real_assistant):
+    a = real_assistant
+    s1 = a._begin_session(_call("sip:1001@host"), "inbound", "sip:1001@host")
+    await a._teardown_session(s1)
+    s2 = a._begin_session(_call("sip:1002@host"), "inbound", "sip:1002@host")
+
+    assert s1.audio_state is not None and s2.audio_state is not None
+    assert s1.audio_state is not s2.audio_state
+    assert s1.audio_state.vad is not s2.audio_state.vad
+    await a._teardown_session(s2)
+
+
 # --- Call-lifecycle event webhooks ------------------------------------------
 
 @pytest.fixture
