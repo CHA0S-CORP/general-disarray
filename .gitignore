@@ -9,4 +9,10 @@ data/workflows.json
 data/virtual_numbers.json
 data/mcp_servers.json
 data/personas.json
+
+# Ship one example knowledge doc (indexed by RAG, exercised by the e2e
+# KNOWLEDGE test); keep any other user-dropped documents ignored.
+!data/knowledge/
+data/knowledge/*
+!data/knowledge/example-house-notes.md
 sip-agent/tests/e2e/reports/
