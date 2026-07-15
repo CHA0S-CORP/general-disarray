@@ -80,6 +80,34 @@ async def test_set_with_novel_description_is_not_redirected(tmp_path, config_fac
     assert a.session.persona == "a sleepy, mumbling night-shift clerk"
 
 
+async def test_multiword_profile_wins_over_incidental_adjective(tmp_path, config_factory):
+    """The model's paraphrase brushes an incidental adjective that's also a
+    profile name ('...Pig Latin...cheerful tone'). The specific multi-word
+    profile must win, not bail on the ambiguity — this was the live bug where
+    Pig Latin never loaded and the vague description was used instead."""
+    a = make_assistant(tmp_path, config_factory)
+    a.persona_store.save("Pig Latin", "Reply ONLY in Pig Latin.")
+    a.persona_store.save("Cheerful", "Be upbeat.")
+
+    result = await PersonaTool(a).execute({
+        "action": "set",
+        "text": "a bouncy voice that speaks in Pig Latin with a cheerful tone",
+    })
+    assert a.session.persona == "Reply ONLY in Pig Latin."
+    assert "Pig Latin" in result.message
+
+
+async def test_two_incidental_adjectives_stay_a_novel_set(tmp_path, config_factory):
+    """Two single-word profile-name adjectives with no specific winner is a
+    genuine novel description — set as-is, don't hijack it."""
+    a = make_assistant(tmp_path, config_factory)
+    a.persona_store.save("Calm", "Be calm.")
+    a.persona_store.save("Witty", "Be witty.")
+
+    await PersonaTool(a).execute({"action": "set", "text": "a calm, witty expert"})
+    assert a.session.persona == "a calm, witty expert"
+
+
 async def test_set_redirect_is_word_boundary_safe(tmp_path, config_factory):
     """A saved name must match as a whole word, not inside another word."""
     a = make_assistant(tmp_path, config_factory)
@@ -119,6 +147,28 @@ async def test_save_then_load_roundtrip(tmp_path, config_factory):
     loaded = await PersonaTool(a).execute({"action": "load", "name": "game show"})
     assert loaded.status == ToolStatus.SUCCESS
     assert a.session.persona == "an excitable game show host"
+
+
+async def test_set_with_name_saves_and_applies(tmp_path, config_factory):
+    """The model conflates set and save: "save a style named X, the style is Y"
+    comes in as set(text=Y, name=X). That must save Y under X AND apply it —
+    not get hijacked by the set->load redirect."""
+    a = make_assistant(tmp_path, config_factory)
+    # Pirate is a saved profile; the text names it, which would otherwise
+    # redirect. The name param must win (this is a save, not a reference).
+    a.persona_store.save("Pirate", "seed pirate")
+
+    result = await PersonaTool(a).execute({
+        "action": "set",
+        "text": "talk like a pirate, say ahoy and call me matey",
+        "name": "Space Captain",
+    })
+    assert result.status == ToolStatus.SUCCESS
+    # Saved under the new name...
+    assert a.persona_store.load("space captain") == \
+        "talk like a pirate, say ahoy and call me matey"
+    # ...and applied to the call now.
+    assert a.session.persona == "talk like a pirate, say ahoy and call me matey"
 
 
 async def test_save_uses_current_persona_when_no_text(tmp_path, config_factory):
