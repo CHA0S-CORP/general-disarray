@@ -814,6 +814,18 @@ class LLMEngine:
             now = datetime.now()
         prompt += f"\n\nCurrent time: {now.strftime('%I:%M %p %Z on %A, %B %d, %Y')}"
         
+        # Caller-chosen demeanor for this call, layered over the base prompt.
+        # Placed right after the base persona and before the call facts so it
+        # colors the whole reply, but it can only shape TONE — the base prompt's
+        # rules (grounding, tool use, safety) still stand.
+        if call_context:
+            persona = call_context.get("persona")
+            if persona:
+                prompt += (
+                    "\n\nFor this call, adopt the following demeanor and speaking"
+                    " style. It changes HOW you speak, not what you're allowed to"
+                    " do — keep following all instructions above:\n" + persona)
+
         # Add call context
         if call_context:
             prompt += f"\n\nCall information:"

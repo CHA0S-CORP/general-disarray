@@ -8,4 +8,5 @@ data/scheduled_tasks.json
 data/workflows.json
 data/virtual_numbers.json
 data/mcp_servers.json
+data/personas.json
 sip-agent/tests/e2e/reports/

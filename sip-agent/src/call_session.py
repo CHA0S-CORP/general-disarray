@@ -107,6 +107,11 @@ class CallSession:
     # Loaded at call start and refreshed each turn, so mid-call REMEMBERs and
     # a just-finished extraction from the previous call become visible.
     caller_memory_prompt: str = ""
+    # Active demeanor/behavior instruction for THIS call, layered on top of the
+    # base system prompt (see llm_engine._build_system_prompt). Empty = the
+    # default demeanor. Set/cleared live by the PERSONA tool; never persisted
+    # with the session — saved profiles live in the PersonaStore.
+    persona: str = ""
     # True once the post-call memory update has been dispatched (teardown and
     # the audio-loop tail can both reach the update site).
     memory_update_started: bool = False

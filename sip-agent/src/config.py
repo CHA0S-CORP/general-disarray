@@ -353,6 +353,14 @@ class Config:
     caller_memory_timeout_s: float = field(
         default_factory=lambda: float(os.getenv("CALLER_MEMORY_TIMEOUT_S", "30.0")))
 
+    # Persona/demeanor tool: let the caller set the agent's speaking style for a
+    # call and save/recall named profiles. Profiles persist in persona_file
+    # (resolved in __post_init__ to <data_dir>/personas.json).
+    enable_persona_tool: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_PERSONA_TOOL", "true").lower() == "true")
+    persona_file: Optional[Path] = field(
+        default_factory=lambda: Path(os.getenv("PERSONA_FILE")) if os.getenv("PERSONA_FILE") else None)
+
     # Knowledge base (RAG): index text/markdown files from knowledge_dir and
     # expose retrieval as the KNOWLEDGE tool. No-ops when the directory is
     # empty or the embedding dependencies are missing.
@@ -619,6 +627,10 @@ class Config:
         # MCP servers file defaults relative to data_dir too.
         if self.mcp_servers_file is None:
             self.mcp_servers_file = self.data_dir / "mcp_servers.json"
+
+        # Persona profiles file defaults relative to data_dir too.
+        if self.persona_file is None:
+            self.persona_file = self.data_dir / "personas.json"
         
         # Load phrases from JSON file if it exists
         phrases_file = self.data_dir / "phrases.json"

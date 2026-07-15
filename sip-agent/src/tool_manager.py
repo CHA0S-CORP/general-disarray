@@ -153,6 +153,7 @@ class ToolManager:
         from plugins.space_weather_tool import KpIndexTool
         from plugins.quake_tool import EarthquakeTool
         from plugins.memory_tools import RememberTool, ForgetTool
+        from plugins.persona_tool import PersonaTool
         from plugins.workflow_tool import TriggerWorkflowTool
         from plugins.gpu_status_tool import GpuStatusTool
         from plugins.alerts_tool import AlertsTool
@@ -187,6 +188,7 @@ class ToolManager:
             # Memory + automation
             RememberTool,
             ForgetTool,
+            PersonaTool,
             TriggerWorkflowTool,
             # Ops (self-gated: need the observability stack / docker socket)
             GpuStatusTool,
@@ -267,6 +269,8 @@ class ToolManager:
         if name == "TRANSFER" and not self.config.enable_transfer_tool:
             return False
         if name in ("REMEMBER", "FORGET") and not self.config.caller_memory_enabled:
+            return False
+        if name == "PERSONA" and not self.config.enable_persona_tool:
             return False
         if name == "DRINK_RECIPE" and not self.config.enable_drink_tool:
             return False

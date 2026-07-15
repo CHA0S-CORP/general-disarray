@@ -349,6 +349,20 @@ async def test_native_loop_answers_after_the_last_tool_round(assistant, config_f
     assert requests[-1]["tools"] is None
 
 
+async def test_persona_in_system_prompt(engine):
+    """A per-call demeanor reaches the system prompt, and is absent otherwise."""
+    prompt = engine._build_system_prompt({
+        "remote_uri": "sip:420@pbx",
+        "duration": 3.0,
+        "persona": "Speak like a terse, formal butler.",
+    })
+    assert "demeanor" in prompt.lower()
+    assert "terse, formal butler" in prompt
+
+    plain = engine._build_system_prompt({"remote_uri": "sip:420@pbx", "duration": 3.0})
+    assert "terse, formal butler" not in plain
+
+
 async def test_virtual_number_context_in_system_prompt(engine):
     """A virtual number's purpose reaches the system prompt for the call."""
     prompt = engine._build_system_prompt({

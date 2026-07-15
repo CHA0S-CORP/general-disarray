@@ -26,6 +26,7 @@ from admin_events import EventBus
 from call_session import (CallSession, TurnLedger, spoken_text,
                           set_current_session, get_current_session)
 from caller_memory import CallerMemoryStore, caller_id_from_uri
+from persona_store import PersonaStore
 from virtual_numbers import VirtualNumberRegistry, extension_from_uri
 from earcons import generate_chime, generate_thinking_tick
 from knowledge_base import KnowledgeBase
@@ -165,6 +166,10 @@ class SIPAIAssistant:
         self.caller_memory = CallerMemoryStore(config)
         self.knowledge_base = KnowledgeBase(config)
         self.virtual_numbers = VirtualNumberRegistry(config)
+        # Named demeanor profiles (data/personas.json), for the PERSONA tool's
+        # save/load. The active persona lives on the CallSession; this is just
+        # persistence. Fail-open.
+        self.persona_store = PersonaStore(config)
         # MCP client (external tool servers). Connected inside
         # ToolManager.start() so MCP tools register through the same
         # wrapper path as plugins. No-op unless MCP_ENABLED.
@@ -1282,6 +1287,8 @@ class SIPAIAssistant:
                     self.caller_memory.format_for_prompt(session.caller_id))
             except Exception as e:
                 logger.warning(f"Could not refresh caller memory: {e}")
+        if session.persona:
+            call_context["persona"] = session.persona
         if session.caller_memory_prompt:
             call_context["caller_memory"] = session.caller_memory_prompt
         if session.virtual_number and session.virtual_number.purpose:

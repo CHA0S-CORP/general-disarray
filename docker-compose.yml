@@ -165,6 +165,9 @@ services:
       - MESSAGE_REFORMAT_TIMEOUT_S=${MESSAGE_REFORMAT_TIMEOUT_S:-20.0}
       # Conversation intelligence: caller memory / knowledge base / summary
       - CALLER_MEMORY_ENABLED=${CALLER_MEMORY_ENABLED:-true}
+      # Persona/demeanor tool: caller sets the agent's speaking style for a
+      # call and saves/recalls named profiles (data/personas.json).
+      - ENABLE_PERSONA_TOOL=${ENABLE_PERSONA_TOOL:-true}
       - CALLER_MEMORY_MAX_FACTS=${CALLER_MEMORY_MAX_FACTS:-15}
       - CALLER_MEMORY_MAX_CHARS=${CALLER_MEMORY_MAX_CHARS:-1500}
       - CALLER_MEMORY_TIMEOUT_S=${CALLER_MEMORY_TIMEOUT_S:-30.0}
