@@ -14,7 +14,7 @@ LLM: [TOOL:DRINK_RECIPE]
 import logging
 from typing import Any, Dict, List, Optional
 
-from plugins.helpers import fetch_json
+from plugins.helpers import fetch_json, expand_units_for_speech
 from tool_plugins import BaseTool, ToolResult, ToolStatus
 from logging_utils import log_event
 
@@ -71,7 +71,10 @@ def _spoken_recipe(recipe: Dict[str, Any]) -> str:
     if recipe["instructions"]:
         instructions = recipe["instructions"].replace("\r", " ").replace("\n", " ")
         parts.append(instructions if instructions.endswith(".") else instructions + ".")
-    return " ".join(parts)
+    # Expand measurement abbreviations ("2 oz" -> "2 ounces") so TTS speaks
+    # them naturally instead of "oh zee". Applied to the whole paragraph:
+    # measures appear in both the ingredient list and the instructions.
+    return expand_units_for_speech(" ".join(parts))
 
 
 class DrinkRecipeTool(BaseTool):

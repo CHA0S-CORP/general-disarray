@@ -35,6 +35,8 @@ gen_audio.FIXTURES.update({
     # sometimes improvises a joke/question itself instead of calling the tool.
     "fun_joke_tech.wav": "Call your joke tool with category tech, and tell me the joke it returns.",
     "fun_trivia_tool.wav": "Please use your trivia tool to ask me a trivia question.",
+    "fun_story_robot.wav": "Please use your story tool to tell me a very short story about a robot.",
+    "fun_drink_margarita.wav": "Use your drink recipe tool to tell me how to make a margarita.",
 })
 
 pytestmark = pytest.mark.e2e
@@ -194,3 +196,53 @@ def test_trivia_over_call(single_play_wav, place_inbound_call, assert_spoke,
     assert any(t.strip() for t in _texts_for(events, "assistant_response")), (
         "no assistant_response logged for trivia"
     )
+
+
+def test_story_over_call(single_play_wav, place_inbound_call, assert_spoke,
+                         agent_events, event_names):
+    """STORY: an explicit story request routes through the STORY tool (a
+    one-shot LLM generation). Content is free-form, so Layer 1 (tool_call) plus
+    a substantive spoken reply are the assertions."""
+    fn = single_play_wav("fun_story_robot.wav")
+    captured, started_at = place_inbound_call(fn, duration=CALL_DURATION)
+
+    assert_spoke(captured)
+
+    events = agent_events(started_at)
+    names = event_names(events)
+    assert "user_speech" in names, f"STT never fired; saw {sorted(set(names))}"
+
+    tools = _tools_called(events)
+    assert "STORY" in tools, f"STORY tool never fired; tool_calls={tools}"
+
+    assert any(t.strip() for t in _texts_for(events, "assistant_response")), (
+        "no assistant_response logged for the story"
+    )
+
+
+def test_drink_recipe_over_call(single_play_wav, place_inbound_call, assert_spoke,
+                                transcribe, agent_events, event_names):
+    """DRINK_RECIPE: a named-cocktail request routes through the tool
+    (TheCocktailDB). Layer 1 gates on the tool_call; a margarita's core
+    ingredient (tequila / lime) is a soft Layer-2 content check."""
+    fn = single_play_wav("fun_drink_margarita.wav")
+    captured, started_at = place_inbound_call(fn, duration=CALL_DURATION)
+
+    assert_spoke(captured)
+
+    events = agent_events(started_at)
+    names = event_names(events)
+    assert "user_speech" in names, f"STT never fired; saw {sorted(set(names))}"
+
+    tools = _tools_called(events)
+    assert "DRINK_RECIPE" in tools, f"DRINK_RECIPE tool never fired; tool_calls={tools}"
+
+    reply = " ".join(_texts_for(events, "assistant_response")).lower()
+    transcript = transcribe(captured).lower()
+    haystack = f"{reply} || {transcript}"
+    # Soft: a margarita recipe should name tequila or lime. Don't fail the tool
+    # coverage on live-API content drift — xfail if the tool ran but the
+    # ingredient didn't surface.
+    if not any(w in haystack for w in ("tequila", "lime", "triple sec", "cointreau")):
+        import pytest as _pytest
+        _pytest.xfail(f"DRINK_RECIPE ran but no core ingredient spoken; reply={reply!r}")
