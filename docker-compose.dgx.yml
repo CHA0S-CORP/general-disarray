@@ -375,8 +375,8 @@ services:
       - N8N_CUSTOM_EXTENSIONS=/custom-nodes
     volumes:
       - n8n_data:/home/node/.n8n
-      # Custom SIP Agent nodes — built by examples/n8n-nodes-general-disarray/build.sh
-      - ./examples/n8n-nodes-general-disarray/dist:/custom-nodes/n8n-nodes-general-disarray:ro
+      # Custom SIP Agent nodes — from the examples/n8n-nodes submodule (CHA0S-CORP/n8n-nodes); build with examples/n8n-nodes/packages/n8n-nodes-general-disarray/build.sh
+      - ./examples/n8n-nodes/packages/n8n-nodes-general-disarray/dist:/custom-nodes/n8n-nodes-general-disarray:ro
 
 volumes:
   n8n_data:
