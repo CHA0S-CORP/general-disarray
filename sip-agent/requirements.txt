@@ -64,7 +64,7 @@ langchain-text-splitters>=1.0,<2.0
 fastembed>=0.7,<1.0
 # MCP client (MCP_ENABLED=true): consume tools from external MCP servers.
 # Optional at runtime — mcp_tools.py degrades to a warning if it is missing.
-mcp>=1.0
+mcp>=1.0,<2   # 2.x renamed McpError/streamablehttp_client/FastMCP (breaking)
 
 # ===================
 # OpenTelemetry (optional - for observability)
