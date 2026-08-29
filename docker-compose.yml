@@ -26,46 +26,312 @@ services:
     restart: unless-stopped
 
   # ============================================================================
-  # vLLM Server - Serves the LLM
+  # LLM Server - Ling-3.0-flash-int4 on SGLang (replaced vLLM 2026-08-07)
+  #
+  # Was: vllm/vllm-openai:latest serving Qwen/Qwen3-30B-A3B-Instruct-2507-FP8
+  #      at --gpu-memory-utilization 0.50 (~60 GiB).
+  # Now: 124B total / 5.1B active, ~90 GiB. The service is still named `vllm`
+  #      and still answers on http://vllm:8000 so sip-agent's LLM_BASE_URL and
+  #      `depends_on: vllm` keep working unchanged. Only the engine changed.
+  #
+  # Runtime is SGLang, NOT vLLM: this is a BailingMoeV3 / bailing_hybrid model
+  # that released vLLM builds do not register.
+  #
+  # THE IMAGE IS BUILT LOCALLY, from ~/code-llm/ling-fp4:
+  #     docker build -t sglang-ling-fp4:local ~/code-llm/ling-fp4/
+  # (The "fp4" in the tag is historical - the image is a patched SGLang, not a
+  # checkpoint. See ~/code-llm/ling-fp4/README.md for the full story.) The int4
+  # checkpoint here does not need that image's FP4 loader patch, but it does
+  # benefit from its ling3 structural-tag patch, which is what makes
+  # tool_choice="required" grammar-constrained instead of a free-for-all.
+  #
+  # THE THREE FLAGS BELOW ARE LOAD-BEARING - do not drop them:
+  #   --disable-shared-experts-fusion  correctness
+  #   --moe-runner-backend=triton      correctness
+  #   --default-chat-template-kwargs   latency
+  # Each is explained at its line. Verified working 2026-08-07.
   # ============================================================================
   vllm:
-    image: vllm/vllm-openai:latest
+    image: sglang-ling-fp4:local        # built from ~/code-llm/ling-fp4 - see above
     container_name: sip-ai-vllm
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
-      # DeepGEMM has no SM 12.1 (GB10) support — vLLM >= 0.24 crashes loading
-      # FP8 weights through it ("Unknown SF transformation"); force the
-      # Triton/CUTLASS fallback instead.
-      - VLLM_USE_DEEP_GEMM=0
     ipc: host
+    shm_size: "32gb"                    # SGLang wants a large /dev/shm
     ulimits:
       memlock: -1
       stack: 67108864
-    # Upstream :latest switched its ENTRYPOINT to ["vllm", "serve"]; blank it
-    # so the full command below works on any image vintage.
+    # This image's ENTRYPOINT is not a server, so spell out the full command.
     entrypoint: []
-    command: >
-      vllm serve
-      ${LLM_MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507-FP8}
-      --port 8000
-      --gpu-memory-utilization 0.50
-      --max-model-len 8192
-      --trust-remote-code
-      ${VLLM_TOOL_ARGS---enable-auto-tool-choice --tool-call-parser hermes}
+    # LIST form, not the folded "command: >" string form. Compose splits the
+    # string form with shell-like rules and strips the inner double quotes from
+    # the JSON below, turning {"enable_thinking":false} into
+    # {enable_thinking:false} - which json.loads rejects, so the server refuses
+    # to start. Keep this a list.
+    command:
+      - python3
+      - -m
+      - sglang.launch_server
+      - --model-path=${LLM_MODEL_PATH:-inclusionAI/Ling-3.0-flash-int4}
+      - --served-model-name=${LLM_MODEL:-ling-3.0-flash}
+      - --host=0.0.0.0
+      - --port=8000
+      - --tp=1
+      - --mem-fraction-static=${LLM_MEM_FRACTION:-0.74}
+      - --context-length=${MAX_MODEL_LEN:-65536}
+      # ---- quantisation-specific block: currently int4 --------------------
+      # FP4 was put on this URL on 2026-08-08 and reverted the same day. It
+      # passed every synthetic test (tool calls 8/8 on bare requests, code echo
+      # ~3%, 40% faster decode) but produced degenerate output under real
+      # OpenCode traffic. int4 has never done that in any test here.
+      #
+      # TO TRY FP4 AGAIN: set LLM_MODEL_PATH=inclusionAI/Ling-3.0-flash-fp4 in
+      # .env and swap this block for:
+      #     - --moe-runner-backend=flashinfer_mxfp4
+      #     - --flashinfer-mxfp4-moe-precision=default
+      #     - --disable-shared-experts-fusion
+      #     - --enable-fp32-lm-head
+      #     - --fp8-gemm-backend=cutlass
+      # (all five required; the last three are from the vendor's model card).
+      # FP4 also relies on a hand-added generation_config.json in the HF cache
+      # setting temperature 0.2 - see ling-fp4/README.md in ~/code-llm.
+      # Soak it against real traffic before trusting it, not just probes.
+      # MARLIN TESTED AND REJECTED 2026-08-09. The original token soup was
+      # caused by shared-experts fusion, not by Marlin, so Marlin was retested
+      # with --disable-shared-experts-fusion: output was fine and acceptance was
+      # healthy (2.37-2.82), but decode measured 9.0 tok/s vs triton's 26.3.
+      # Marlin is simply not optimised for sm_121 here - same story as its 172 s
+      # CUDA graph capture on FP4 (vs 5 s for flashinfer). Do not retry.
+      - --moe-runner-backend=triton
+      - --disable-shared-experts-fusion
+      # FlashKDA prefill TESTED 2026-08-09: no gain (8.4/14.4/25.5/78.1s vs
+      # triton's 7.3/14.8/25.3/77.9s at 15K/23K/32K/59K). The KDA layers are
+      # not the prefill bottleneck.
+      # Prefill scaling measures O(n^1.64) -> O(n^1.83) as context grows,
+      # i.e. the 7 quadratic MLA layers dominate at long context. But no
+      # better MLA kernel is available here: trtllm_mla dies with
+      # "TllmGenFmhaRunner ... Unsupported architecture" on sm_121, and
+      # flashinfer attention ties triton.
+      #
+      # KEEPER: bigger prefill chunks. Same total attention FLOPs, but fewer
+      # passes and better GEMM shapes. Measured cold-prefill wait, 8K chunks
+      # -> 32K chunks, confirmed over two runs:
+      #     15K ctx   7.3s -> 5.8s   (-21%)
+      #     24K ctx  14.8s -> 11.9s  (-20%)
+      #     32K ctx  25.3s -> 15.8s  (-38%)
+      #     59K ctx  77.9s -> 74.5s  (-4%, quadratic MLA dominates there)
+      # Costs 0.4% of the KV pool (881,891 -> 878,702 tokens) and zero
+      # request slots. Decode unchanged at 20.7 tok/s, correctness clean.
+      # NOTE an earlier note in this file says 16384/32768 was 'tried and
+      # reverted' as neutral - that test ran with NEXTN active, which
+      # distorted it. Retested cleanly without NEXTN, it is a real win.
+      - --chunked-prefill-size=32768
+      - --max-prefill-tokens=65536
+      # KDA kernel sweep 2026-08-09: 35 of 42 layers are KDA linear-attention,
+      # so this is where the decode compute actually is. Baseline (triton):
+      # median 20.7 tok/s.
+      # NOTE: --linear-attn-backend accepts {triton,cutedsl,flashinfer,flashkda,
+      # nvidia_kda,ptx_kda} but KDA *decode* only supports triton/cutedsl/
+      # flashinfer - ptx_kda crashes the scheduler at startup with
+      # "Unsupported KDA decode backend". flashkda is prefill-only.
+      # KDA BACKEND SWEEP DONE 2026-08-09 - triton (the default) wins, so no
+      # --linear-attn-backend flag is set. Measured medians, server metric:
+      #   triton (default)            20.7   <- keep
+      #   cutedsl                     19.8   (but 49 req slots vs 32)
+      #   flashinfer decode + triton  20.7   (tie, extra flag for nothing)
+      #   ptx_kda / nvidia_kda        crash: decode supports only
+      #                               triton/cutedsl/flashinfer
+      #   flashkda                    prefill-only
+      # Correctness was clean (0/6 junk, 4/4 tools) on every variant.
+      # torch.compile TESTED AND REJECTED 2026-08-09: compiled for 10+ min
+      # emitting 152 'ttir analysis hit an op we do not know how to analyze:
+      # tt.elementwise_inline_asm' failures (so it cannot even trace the
+      # triton kernels this model relies on), and drove host MemAvailable to
+      # 3 GiB - memwatch.sh killed it to protect the box. Do not enable.
+      # KERNEL SWEEP COMPLETE 2026-08-09 - every alternative ties or loses to
+      # SGLang's auto-selected defaults, so NO backend flags are set beyond
+      # --moe-runner-backend=triton (which is a correctness requirement, not
+      # a speed choice). Medians from SGLang's own gen-throughput metric:
+      #
+      #   defaults (triton everywhere)      20.7-20.8   <- ceiling
+      #   flashinfer MLA attention          20.7-20.8   tie (n=93)
+      #   flashinfer mamba backend          20.7-20.8   tie
+      #   KDA flashinfer decode             20.7        tie
+      #   KDA cutedsl                       19.8        worse (49 slots though)
+      #   marlin MoE runner                  9.0        much worse
+      #   NEXTN speculative decoding        11.0        SUPERSEDED - see below
+      #   NEXTN + longer chain               7.1        SUPERSEDED - see below
+      #   KDA ptx_kda / nvidia_kda          crash (decode unsupported)
+      #   torch.compile                     OOM, watchdog killed it
+      #
+      # The two NEXTN rows above were remeasured 2026-08-17 and do not hold; the
+      # rest of the sweep still stands. "~20.8 tok/s is this box's ceiling for
+      # int4" was wrong: with NEXTN configured properly it is 33.8. See the
+      # NEXTN block below.
+      # SPECULATIVE TUNING, revised 2026-08-17. The 2026-08-09 note here said
+      # SGLang's auto-chosen chain (steps=3/topk=1/draft=4) was already best and
+      # to "leave the speculative parameters on auto". Half right: longer chains
+      # ARE worse (a full steps/draft sweep confirms steps=5/draft=6 is the worst
+      # arm tested), but auto is not the peak and the parameters must not be left
+      # unset. Measured, SGLang's own gen-throughput metric, mem-fraction 0.88:
+      #   steps1/draft2   32.66 tok/s   6 slots   accept len 1.79  rate 0.80
+      #   steps2/draft3   33.77 tok/s   5 slots   accept len 2.24  rate 0.62  <-
+      #   steps3/draft4   32.54 tok/s   2 slots   accept len 2.50  rate 0.50
+      #   steps4/draft5   29.86 tok/s   3 slots   accept len 2.55  rate 0.39
+      #   steps5/draft6   25.94 tok/s   4 slots   accept len 2.50  rate 0.30
+      # Past draft=3 accept LENGTH still rises while accept RATE collapses: the
+      # extra draft tokens get computed and thrown away. That is the mechanism
+      # behind the old steps5/draft6 observation, and it is real.
+      # The draft budget is the ONLY lever that pays. Also swept 2026-08-17 on
+      # top of steps2/draft3, one knob per arm, all within ~3% BELOW baseline
+      # and all three identical to each other on accept len/rate (i.e. they do
+      # not move the decode path at all):
+      #   baseline                          33.60 tok/s  ttft 0.194s
+      #   --speculative-attention-mode=decode  32.73     ttft 0.196s
+      #   --num-continuous-decode-steps=2      32.59     ttft 0.190s
+      #   --scheduler-recv-interval=4          32.60     ttft 0.195s
+      # Do not bother with these. (--num-continuous-decode-steps did NOT hurt
+      # TTFT despite its docs - it just buys nothing.)
+      # Speculative decoding via the checkpoint's built-in MTP layer. config
+      # has num_nextn_predict_layers=1 and the weights carry 43 layers (0-42)
+      # against num_hidden_layers=42, so layer 42 IS the draft layer. This is
+      # the vendor model card's "recommended low-latency recipe". Decode is the
+      # bottleneck for agent use here (int4 on the triton MoE runner is
+      # ~14-18 tok/s), and MTP is the one lever that attacks it without
+      # changing quantisation.
+      # NEXTN / MTP SPECULATIVE DECODING: REJECTED 2026-08-09, OVERTURNED
+      # 2026-08-17. It is worth 1.63x on single-stream decode.
+      #
+      #   no spec           20.67 tok/s   13 slots
+      #   steps2/draft3     33.77 tok/s    5 slots   accept len 2.24
+      #
+      # both by SGLang's own gen-throughput line, same image, same box.
+      #
+      # WHY THE 2026-08-09 VERDICT WAS WRONG. Its reasoning was "this box is
+      # compute-bound on the MoE, not memory-bound; speculation wins on
+      # memory-bound decode". Neither half survives measurement:
+      #   - Not compute-bound on the MoE. Summing the safetensors and scaling
+      #     routed experts by num_experts_per_tok/num_experts = 8/512, int4
+      #     touches 7.49 GB per decoded token, of which ATTENTION is ~60% and
+      #     the 8 live experts only ~13%. At 273 GB/s that allows 36.4 tok/s
+      #     and we measure ~20 - about 50% MBU.
+      #   - The missing half is per-step overhead, and that is the regime
+      #     speculation wins hardest in. Driving the live server:
+      #       bs=1 20.2 | bs=2 46.4 (23.2/stream) | bs=4 90.2 (22.5/stream)
+      #     A step carrying 4 tokens costs about what a step carrying 1 costs,
+      #     so verifying k draft tokens is nearly free. Accept len 2.4-2.9
+      #     should have yielded ~2.5x, and now does.
+      # The old run almost certainly passed a bare --speculative-algorithm=NEXTN
+      # and let the other three parameters default. Unset
+      # --speculative-num-draft-tokens reaches allocation_sizing.py:26 as None
+      # (max(spec_steps*spec_topk, spec_tokens)); a sibling bench script doing
+      # exactly that died there with TypeError. PIN ALL FOUR PARAMETERS.
+      #
+      # STILL TRUE from the old note: the "26.3 tok/s" claim that predated it
+      # was a client-side artifact. Speculative decoding delivers tokens in
+      # bursts, so tokens/(total - ttft) over-states the rate. Judge only by
+      # SGLang's own "gen throughput" log line.
+      #
+      # COSTS, and they are real:
+      #   - Request slots 13 -> 5. KDA linear-attention state is 37.46 MB/req
+      #     and the hybrid cache is sized against the draft budget. Fine for
+      #     one phone call plus OpenCode; not fine for many concurrent callers.
+      #     (Slot counts move +/-1 with load-time memory state.)
+      #   - Needs --mem-fraction-static 0.85 -> 0.88. At 0.85 the server dies
+      #     at startup with "Not enough GPU memory for hybrid (mamba/linear-
+      #     attention) state cache. Computed max_mamba_cache_size=-6". 0.88 is
+      #     still under the ~0.92 ceiling docker-compose.ablate.yml warns about.
+      #     The no-spec baseline at 0.88 is 20.67, so mem-fraction alone does
+      #     not move bs=1 decode.
+      #   - NOT validated on tool-calling or long agent turns; accept len 2.24
+      #     comes from a prose prompt. And LING_ABLATE_LAYERS=28:42 is half-open
+      #     so the draft layer 42 is OUTSIDE it - an un-ablated draft proposing
+      #     against an ablated target. Acceptance in refusal-adjacent territory
+      #     is unmeasured. That interaction did not exist in 2026-08-09.
+      #
+      # Full analysis and sweep table: ling-fp4/README.md, "Speculative decoding
+      # (NEXTN) on int4". To enable, uncomment ALL FOUR and raise mem-fraction:
+      # - --speculative-algorithm=NEXTN
+      # - --speculative-num-steps=2
+      # - --speculative-eagle-topk=1
+      # - --speculative-num-draft-tokens=3
+      # (superseded: see the chunked-prefill KEEPER note below)
+      # Longest-prefix-match beats fcfs when several agent sessions share the
+      # box: it schedules to maximise radix cache reuse, and cache hits are the
+      # difference between a 0.5 s turn and a 33 s one.
+      - --schedule-policy=lpm
+      # Let one session's prefill share a batch with another's decode instead
+      # of alternating, so a long prefill does not stall other sessions.
+      - --enable-mixed-chunk
+      # Concurrency: max_running_requests was capped at 16 by the mamba state
+      # cache (max_mamba_cache_size=80, 5 slots per request), not by KV. 35 of
+      # this model's 42 layers are KDA linear-attention, so that recurrent
+      # state is large - 5.54 GB ssm_state + 0.19 GB conv_state. bfloat16
+      # halves it, which roughly doubles the request cap and hands the freed
+      # memory back to the KV pool.
+      - --mamba-ssm-dtype=bfloat16
+      # Single-quoted so YAML treats the JSON as a scalar, not a flow mapping.
+      - '--default-chat-template-kwargs={"enable_thinking": false}'
+      - --reasoning-parser=ling3
+      - --tool-call-parser=ling3
+      - --chat-template=/opt/ling/chat_template.jinja
+      - --trust-remote-code
+    # ^ Why each of the non-obvious flags:
+    #
+    #   --moe-runner-backend triton
+    #       Default 'auto' picks CompressedTensorsWNA16MarlinMoEMethod
+    #       (GPTQ-Marlin), which loads without complaint on GB10 (sm_121) and
+    #       then emits pure token soup - greedy "what is 2+2" returns
+    #       " practically practically practically...".
+    #
+    #   --disable-shared-experts-fusion
+    #       Same token-soup symptom from a different cause. This checkpoint
+    #       leaves shared experts UNQUANTIZED (config.json `ignore` list) while
+    #       routed experts are int4. SGLang fuses the shared expert into the
+    #       routed-expert tensor by default and the int4 path has no handler
+    #       for that mixed case, so it silently corrupts the weights.
+    #
+    #   --default-chat-template-kwargs {"enable_thinking":false}
+    #       THIS IS THE ONE THAT MAKES IT USABLE ON A PHONE CALL. Ling is a
+    #       thinking model, on by default. sip-agent is a generic OpenAI client
+    #       and never sends chat_template_kwargs, so without this every turn
+    #       generates reasoning tokens first - which are never spoken. Measured
+    #       time to first *spoken* token, 728-token system prompt + 3 tools:
+    #           thinking on : 1441 ms chit-chat, 3.66 s through a tool round
+    #           thinking off:  173 ms chit-chat, 1.56 s through a tool round
+    #       A per-request chat_template_kwargs still overrides this if some
+    #       caller genuinely wants the reasoning path.
+    #
+    # NOTE: $VLLM_TOOL_ARGS, $VLLM_MAX_NUM_SEQS, $VLLM_MAX_NUM_BATCHED_TOKENS
+    # and $VLLM_KV_CACHE_DTYPE are vLLM-only and are deliberately NOT passed
+    # here; SGLang would reject them. They are commented out in .env.
     ports:
       # Host-side publish is parameterized so the stack can coexist with other
       # services on the box; in-cluster traffic uses http://vllm:8000 regardless.
       - "${VLLM_PORT:-8000}:8000"
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
+      # Chat template with the tool-call placeholders replaced by a concrete
+      # example; the stock one teaches the model to emit literal
+      # "{arg-value-1}" and "...". See ~/code-llm/ling-fp4/README.md.
+      - ./docker/ling/chat_template.jinja:/opt/ling/chat_template.jinja:ro
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      # This image has no curl; use python3 like the rest of the SGLang stack.
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 300s
+      # Was 300s for the 30B. Ling needs ~7 min (weights ~200s + Marlin/graph
+      # capture). sip-agent gates on `condition: service_healthy`, so a
+      # start_period shorter than the real load time would fail the stack.
+      start_period: 2400s
+    # If this ever runs away, make the OOM killer pick it before the desktop.
+    # On GB10 the GPU allocates from the same 119 GiB as the OS, and driver
+    # allocations are not charged to the process RSS, so the global OOM killer
+    # cannot otherwise see the offender.
+    oom_score_adj: 1000
     deploy:
       resources:
         reservations:
@@ -74,6 +340,489 @@ services:
               count: all
               capabilities: [gpu]
     restart: unless-stopped
+
+  # ============================================================================
+  # LLM warmup - one-shot, exits immediately.
+  #
+  # The first request to a freshly started SGLang pays JIT/autotune cost for the
+  # long-prompt-with-tools kernel shapes. Measured with the real ~3.3K-token,
+  # 29-tool sip-agent turn: 35.6 s cold vs ~1-2 s warm. sip-agent's
+  # LLM_AGENT_TIMEOUT_S is 30, so WITHOUT this the first caller after a restart
+  # or reboot times out and gets nothing.
+  #
+  # Uses the SGLang image only because it is already on the box and has python3
+  # - it runs a ~2 KB script, not a model. Failures are ignored by design; a
+  # warmup must never keep the stack down.
+  # ============================================================================
+  llm-warmup:
+    image: sglang-ling-fp4:local
+    container_name: sip-ai-llm-warmup
+    restart: "no"
+    depends_on:
+      vllm:
+        condition: service_healthy
+    environment:
+      - LLM_WARMUP_URL=http://vllm:8000/v1
+      - LLM_MODEL=${LLM_MODEL:-ling-3.0-flash}
+    entrypoint: ["python3", "/opt/ling/warmup.py"]
+    volumes:
+      - ./docker/ling/warmup.py:/opt/ling/warmup.py:ro
+
+  # ============================================================================
+  # Open WebUI - browser chat front-end for the same Ling the phone bot uses.
+  #
+  # Cloned from ~/llm-sc-1 on 2026-08-08. Its data volume was copied across, so
+  # existing chats/users/settings carry over (llm-sc-1_open-webui ->
+  # general-disarray_open-webui). Stop the llm-sc-1 one before starting this;
+  # they both want host port 8080 and both would write their own copy of the DB.
+  #
+  # Rewired for this stack rather than copied verbatim - in llm-sc-1 the STT,
+  # TTS and image endpoints point at services that do not exist here. Here:
+  #   LLM    -> vllm      (Ling-3.0-flash, same network, no host gateway needed)
+  #   search -> searxng   (already in this stack)
+  #   STT/TTS-> speaches  (already in this stack: Whisper + Kokoro)
+  # Image generation is intentionally absent - there is no imagegen service in
+  # this stack, and starting one would want GPU memory Ling is holding.
+  #
+  # !! SHARES THE LLM WITH LIVE PHONE CALLS !! A long prompt pasted here blocks
+  # the call path: measured, a 244K-token request kept a trivial request queued
+  # for 679 s while sip-agent's LLM_AGENT_TIMEOUT_S is 30. Keep documents small
+  # or expect dropped calls. See ~/code-llm/ling-fp4/README.md.
+  # ============================================================================
+  # Apache Tika - document text extraction (PDF, DOCX, PPTX...) for RAG.
+  # The cloned config has CONTENT_EXTRACTION_ENGINE=tika, so without this
+  # service every document upload fails to extract. CPU-only, no GPU.
+  tika:
+    image: apache/tika:3.1.0.0
+    container_name: tika
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9998:9998"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "bash", "-c", "(echo > /dev/tcp/localhost/9998) 2>/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    depends_on:
+      vllm:
+        condition: service_healthy
+      searxng:
+        condition: service_started
+      tika:
+        condition: service_started
+    ports:
+      # Default 3000: sip-agent already publishes host :${API_PORT:-8080}.
+      - "${OPEN_WEBUI_PORT:-3000}:8080"
+    # The embedding server (code-llm-embed, :8002) lives in the SEPARATE
+    # `code-llm` compose project, so its container name does not resolve on
+    # this project's network. Reach it through the host's published port.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - open-webui:/app/backend/data
+      # Reranker/embedding models are already in the host cache; without this
+      # the container re-downloads them on first RAG use.
+      - ~/.cache/huggingface:/hf-cache
+    environment:
+      # =====================================================================
+      # CONFIG PARITY WITH ~/llm-sc-1 (restored 2026-08-09)
+      #
+      # This service was cloned from llm-sc-1 on 2026-08-08 but only the LLM /
+      # search / voice wiring came across - the auth, hardening, RAG and UI
+      # settings did not. They are restored here. Anything that pointed at a
+      # service llm-sc-1 has and this stack does not (imagegen/FLUX, chatterbox
+      # TTS, open-terminal) is deliberately still absent; everything else now
+      # matches, with this stack's endpoints substituted.
+      #
+      # ENABLE_PERSISTENT_CONFIG=False is what makes the rest of this block
+      # actually apply. With it True (the default) Open WebUI persists config in
+      # webui.db on first boot and the stored value wins forever after, so edits
+      # here would be silently ignored on an existing volume - which is exactly
+      # why this instance drifted. The trade: Admin Settings changes made in the
+      # UI no longer survive a restart. Change settings HERE, not in the UI.
+      # =====================================================================
+
+      # ---- General -----------------------------------------------------------
+      - WEBUI_NAME=Cha0s AI
+      - WEBUI_DESCRIPTION=An AI assistant for hackers, built with open-source models and tools.
+      - WEBUI_THEME=dark
+      - "RESPONSE_WATERMARK=— Cha0s AI"
+      - WEBUI_URL=${WEBUI_URL:-https://cha0s.ai}
+      - WEBUI_PORT=8080
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
+      # WEBHOOK_URL is deliberately NOT set, though llm-sc-1 sets it to
+      # https://cha0s.ai/webhook. It is meant to point at an external notifier
+      # (Slack/Discord/n8n); Open WebUI has no /webhook route of its own, so
+      # that value made it POST to itself and log a 405 traceback on every
+      # notification event. Verified here 2026-08-09 before removing it. Point
+      # it at http://n8n:5678/webhook/<id> if outbound notifications are wanted.
+      - ENABLE_PERSISTENT_CONFIG=False
+      - ENABLE_REALTIME_CHAT_SAVE=True
+      - ENABLE_TELEMETRY=False
+      - LOG_LEVEL=info
+      - GLOBAL_LOG_LEVEL=info
+      - ENABLE_AUDIT_STDOUT=True
+      - AUDIT_LOG_LEVEL=REQUEST_RESPONSE
+
+      # ---- Auth: Entra ID SSO only -------------------------------------------
+      # cha0s.ai is internet-reachable (Cloudflare -> this box), so the previous
+      # state - password login on, open signup - let anyone who found the
+      # hostname create an account. All five existing users in webui.db are
+      # already linked to the `microsoft` OAuth provider, including the admin,
+      # so turning the password form off does not lock anyone out.
+      # IF SSO EVER BREAKS: set ENABLE_LOGIN_FORM/ENABLE_PASSWORD_AUTH back to
+      # true here and `docker compose up -d open-webui` to get the form back.
+      - ENABLE_LOGIN_FORM=false
+      - ENABLE_PASSWORD_AUTH=false
+      - ENABLE_SIGNUP=False
+      - DEFAULT_USER_ROLE=user
+      - MICROSOFT_CLIENT_ID=${MICROSOFT_CLIENT_ID}
+      - MICROSOFT_CLIENT_SECRET=${MICROSOFT_CLIENT_SECRET}
+      - MICROSOFT_CLIENT_TENANT_ID=${MICROSOFT_CLIENT_TENANT_ID}
+      - OPENID_PROVIDER_URL=https://login.microsoftonline.com/${MICROSOFT_CLIENT_TENANT_ID}/v2.0/.well-known/openid-configuration
+      - MICROSOFT_OAUTH_SCOPE=openid email profile offline_access
+      - ENABLE_OAUTH_SIGNUP=true
+      # Entra app roles -> Open WebUI roles
+      - ENABLE_OAUTH_ROLE_MANAGEMENT=true
+      - OAUTH_ROLES_CLAIM=roles
+      - OAUTH_ADMIN_ROLES=admin
+      - OAUTH_ALLOWED_ROLES=user,admin
+      # Entra groups -> Open WebUI groups
+      - ENABLE_OAUTH_GROUP_MANAGEMENT=true
+      - OAUTH_GROUP_CLAIM=groups
+      - ENABLE_OAUTH_GROUP_CREATION=true
+      - OAUTH_GROUP_DEFAULT_SHARE=members
+
+      # ---- Security: cookies, CORS, tokens -----------------------------------
+      # Secure=True is correct now that the entry point is HTTPS at cha0s.ai. It
+      # does mean a browser hitting http://10.42.252.10:8080 directly will not
+      # store the session cookie, so LAN logins must go through the public name.
+      - WEBUI_SESSION_COOKIE_SECURE=True
+      - WEBUI_AUTH_COOKIE_SECURE=True
+      - WEBUI_SESSION_COOKIE_SAME_SITE=lax
+      - JWT_EXPIRES_IN=1h
+      # llm-sc-1 listed the LAN origin without a port, which can never match a
+      # browser request to :8080; the port is added here.
+      - CORS_ALLOW_ORIGIN=https://cha0s.ai;http://10.42.252.10:8080
+      - BYPASS_MODEL_ACCESS_CONTROL=False
+      - ENABLE_API_KEYS=True
+
+      # ---- LLM: the same Ling container the phone bot uses -------------------
+      # llm-sc-1 pointed at its own gemma4 vLLM on :8888; here it is this
+      # stack's SGLang/Ling on the compose network.
+      - ENABLE_OPENAI_API=True
+      - ENABLE_OLLAMA_API=False
+      - OPENAI_API_BASE_URL=http://vllm:8000/v1
+      - OPENAI_API_KEY=not-needed
+      - AIOHTTP_CLIENT_TIMEOUT=600
+      # llm-sc-1's three model knobs all named gemma-4-26b, which does not exist
+      # in this stack. ling-3.0-flash is the only served model here.
+      - DEFAULT_MODELS=${LLM_MODEL:-ling-3.0-flash}
+      - DEFAULT_PINNED_MODELS=${LLM_MODEL:-ling-3.0-flash}
+      - TASK_MODEL_EXTERNAL=${LLM_MODEL:-ling-3.0-flash}
+      - ENABLE_CHANNELS=True
+      - ENABLE_EVALUATION_ARENA_MODELS=False
+      - ENABLE_EVALUATION_ARENA_USER_CHALLENGES=False
+      - ENABLE_CHAT_RESPONSE_BASE64_IMAGE_URL_CONVERSION=True
+      - ENABLE_CHAT_RESPONSE_BASE64_AUDIO_URL_CONVERSION=True
+
+      # ---- Workspace sharing permissions -------------------------------------
+      - USER_PERMISSIONS_WORKSPACE_MODELS_ALLOW_SHARING=True
+      - USER_PERMISSIONS_WORKSPACE_KNOWLEDGE_ALLOW_SHARING=True
+      - USER_PERMISSIONS_WORKSPACE_PROMPTS_ALLOW_SHARING=True
+      - USER_PERMISSIONS_WORKSPACE_SKILLS_ALLOW_SHARING=True
+      - USER_PERMISSIONS_WORKSPACE_TOOLS_ALLOW_SHARING=True
+
+      # ---- Web search: searxng in this stack ---------------------------------
+      # Result count / concurrency stay at this stack's tuned values (llm-sc-1
+      # used 15 results and no concurrency settings); 0 concurrency serialised
+      # the search step.
+      - ENABLE_WEB_SEARCH=True
+      - WEB_SEARCH_ENGINE=searxng
+      - SEARXNG_QUERY_URL=http://searxng:8080/search?q=<query>&format=json
+      - SEARXNG_LANGUAGE=en
+      - WEB_SEARCH_RESULT_COUNT=30
+      - WEB_SEARCH_CONCURRENT_REQUESTS=10
+      - BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL=False
+      - WEB_FETCH_MAX_CONTENT_LENGTH=50000
+      # Page fetching: 30 results is only useful if the pages are fetched in
+      # parallel and slow sites time out instead of blocking the batch.
+      - WEB_LOADER_CONCURRENT_REQUESTS=15
+      - WEB_LOADER_TIMEOUT=20
+      - ENABLE_WEB_LOADER_SSL_VERIFICATION=True
+      - ENABLE_RAG_LOCAL_WEB_FETCH=True
+
+      # ---- RAG / retrieval ---------------------------------------------------
+      # Chunking and RAG_SYSTEM_CONTEXT come from llm-sc-1. top_k stays at this
+      # stack's wider 20/10 rather than llm-sc-1's 5 - with hybrid search and a
+      # reranker in front, a narrow top_k was the real limiter on how much of a
+      # 30-site web search ever reached the model.
+      - RAG_SYSTEM_CONTEXT=True
+      - CHUNK_SIZE=1500
+      - CHUNK_OVERLAP=200
+      - ENABLE_RAG_HYBRID_SEARCH=True
+      - RAG_TOP_K=20
+      - RAG_TOP_K_RERANKER=10
+      - RAG_RELEVANCE_THRESHOLD=0.0
+      - RAG_RERANKING_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
+
+      # ---- Embeddings: Qwen3-Embedding-4B @ 1024-d (added 2026-08-11) --------
+      # Was the built-in sentence-transformers engine running
+      # sentence-transformers/all-MiniLM-L6-v2 (384-d) on the Grace cores
+      # inside this container. Now offloaded to the GPU-backed vLLM pooling
+      # server in the `code-llm` project (container code-llm-embed, host
+      # :8002, served as `qwen3-embed`). That server pins output width to 1024
+      # via --pooler-config, which matters here because Open WebUI's
+      # generate_openai_batch_embeddings posts only {input, model} and never
+      # sends a `dimensions` field - the width has to be a server-side default.
+      #
+      # !! DIMENSION CHANGE: 384 -> 1024 !! Every collection already in
+      # /app/backend/data/vector_db was written by MiniLM and is now both the
+      # wrong width AND the wrong vector space. Old documents must be
+      # re-uploaded/re-indexed; new ones are fine. Nothing re-embeds itself.
+      #
+      # NOT set deliberately: RAG_EMBEDDING_QUERY_PREFIX /
+      # RAG_EMBEDDING_CONTENT_PREFIX. Qwen3-Embedding does support instruction
+      # prefixes, but Open WebUI ships them as an extra JSON field named by
+      # RAG_EMBEDDING_PREFIX_FIELD_NAME, which vLLM's embeddings endpoint does
+      # not accept. Leaving them unset costs a little retrieval quality and
+      # keeps the requests valid.
+      - RAG_EMBEDDING_ENGINE=openai
+      - RAG_EMBEDDING_MODEL=qwen3-embed
+      - RAG_OPENAI_API_BASE_URL=http://host.docker.internal:8002/v1
+      - RAG_OPENAI_API_KEY=not-needed
+      # Default is 1 - one HTTP round trip per chunk, which makes indexing a
+      # large document painfully serial. 16 matches the server's --max-num-seqs.
+      - RAG_EMBEDDING_BATCH_SIZE=16
+
+      # ---- Document extraction ----------------------------------------------
+      - CONTENT_EXTRACTION_ENGINE=tika
+      - TIKA_SERVER_URL=http://tika:9998
+      - PDF_EXTRACT_IMAGES=True
+
+      # ---- Voice: speaches in this stack -------------------------------------
+      # llm-sc-1 used a separate faster-whisper-server and chatterbox TTS; both
+      # roles are filled by `speaches` here.
+      - AUDIO_STT_ENGINE=openai
+      - AUDIO_STT_OPENAI_API_BASE_URL=http://speaches:8001/v1
+      - AUDIO_STT_OPENAI_API_KEY=not-needed
+      - AUDIO_STT_MODEL=${WHISPER_MODEL:-Systran/faster-distil-whisper-small.en}
+      - AUDIO_TTS_ENGINE=openai
+      - AUDIO_TTS_OPENAI_API_BASE_URL=http://speaches:8001/v1
+      - AUDIO_TTS_OPENAI_API_KEY=not-needed
+      - AUDIO_TTS_MODEL=${TTS_MODEL:-speaches-ai/Kokoro-82M-v1.0-ONNX}
+      - AUDIO_TTS_VOICE=${TTS_VOICE:-af_heart}
+
+      # ---- RAG model cache ---------------------------------------------------
+      - HF_HOME=/hf-cache
+      - SENTENCE_TRANSFORMERS_HOME=/hf-cache
+
+      # ---- Prompt suggestions (verbatim from llm-sc-1) ------------------------
+      # NOTE: the three "Generate an image of ..." entries near the end came from
+      # llm-sc-1, which had a FLUX imagegen service. This stack has none, so
+      # those suggestions will not produce an image.
+      - |
+        DEFAULT_PROMPT_SUGGESTIONS=[
+          {"title": ["Explain how", "buffer overflows work"], "content": "Explain how buffer overflow vulnerabilities work, including stack-based and heap-based variants, and how modern mitigations like ASLR and stack canaries defend against them."},
+          {"title": ["Write a Python", "port scanner"], "content": "Write a Python script that performs a TCP port scan on a given target IP address, supporting configurable port ranges and timeouts."},
+          {"title": ["Explain the difference between", "symmetric and asymmetric encryption"], "content": "Explain the difference between symmetric and asymmetric encryption, with examples of common algorithms and when to use each."},
+          {"title": ["Generate a", "reverse shell cheat sheet"], "content": "Generate a reverse shell cheat sheet covering bash, Python, PHP, Netcat, and PowerShell payloads."},
+          {"title": ["Explain how", "SQL injection works"], "content": "Explain how SQL injection attacks work, including union-based, blind, and time-based techniques, with examples and prevention strategies."},
+          {"title": ["Write a Bash script to", "enumerate a Linux system"], "content": "Write a Bash script that performs basic Linux enumeration: users, network config, running services, SUID binaries, cron jobs, and writable directories."},
+          {"title": ["Explain how", "JWT tokens can be exploited"], "content": "Explain common JWT vulnerabilities including none algorithm attacks, secret brute-forcing, and key confusion attacks."},
+          {"title": ["Help me write", "a custom Nmap NSE script"], "content": "Help me write a custom Nmap NSE script that checks for a specific vulnerability or service misconfiguration."},
+          {"title": ["Explain how", "Docker container escapes work"], "content": "Explain common Docker container escape techniques and how to harden containers against them."},
+          {"title": ["Explain the", "MITRE ATT&CK framework"], "content": "Explain the MITRE ATT&CK framework, its tactics and techniques, and how red teams and blue teams use it in practice."},
+          {"title": ["Help me set up", "a home lab for pentesting"], "content": "Help me plan a home lab setup for practicing penetration testing, including recommended VMs, vulnerable applications, and network architecture."},
+          {"title": ["Write a", "XSS payload collection"], "content": "Create a collection of XSS payloads for different contexts: HTML, JavaScript, attribute injection, and DOM-based scenarios, with explanations."},
+          {"title": ["Explain how", "Kerberos authentication works"], "content": "Explain how Kerberos authentication works in Active Directory, including TGT, TGS, and common attacks like Kerberoasting and Golden Ticket."},
+          {"title": ["Write a Python script to", "crack password hashes"], "content": "Write a Python script that performs dictionary attacks against common hash types (MD5, SHA-256, bcrypt) for authorized security testing."},
+          {"title": ["Explain how", "SSRF vulnerabilities work"], "content": "Explain Server-Side Request Forgery (SSRF) vulnerabilities, common exploitation techniques, and how to access cloud metadata endpoints."},
+          {"title": ["Help me write", "a Burp Suite extension"], "content": "Help me write a Burp Suite extension in Python that automates detection of a specific vulnerability class."},
+          {"title": ["Explain the", "OAuth 2.0 attack surface"], "content": "Explain common OAuth 2.0 vulnerabilities including redirect URI manipulation, token leakage, and CSRF attacks on the authorization flow."},
+          {"title": ["Write a", "Wireshark display filter cheat sheet"], "content": "Create a comprehensive Wireshark display filter cheat sheet for analyzing network traffic during incident response."},
+          {"title": ["Explain how", "privilege escalation works on Linux"], "content": "Explain common Linux privilege escalation techniques: SUID abuse, kernel exploits, cron jobs, PATH hijacking, and capability misconfigurations."},
+          {"title": ["Write a Python", "web scraper with stealth features"], "content": "Write a Python web scraper that rotates user agents, handles rate limiting, and uses session management to avoid detection."},
+          {"title": ["Explain how", "ARP spoofing works"], "content": "Explain ARP spoofing attacks, how they enable man-in-the-middle positioning on a LAN, and how to detect and prevent them."},
+          {"title": ["Help me write", "YARA rules for malware detection"], "content": "Help me write YARA rules to detect common malware patterns, including string matching, byte patterns, and condition logic."},
+          {"title": ["Explain how", "ransomware encryption works"], "content": "Explain the technical mechanisms behind ransomware encryption, including hybrid encryption schemes and key management used by threat actors."},
+          {"title": ["Write a", "Dockerfile for a CTF environment"], "content": "Write a Dockerfile that sets up a CTF challenge environment with common tools like pwntools, GDB with pwndbg, and radare2."},
+          {"title": ["Explain how", "DNS tunneling works"], "content": "Explain DNS tunneling techniques for data exfiltration, how tools like dnscat2 and iodine work, and detection strategies."},
+          {"title": ["Write a Python", "network packet sniffer"], "content": "Write a Python packet sniffer using raw sockets or scapy that captures and analyzes network traffic with protocol parsing."},
+          {"title": ["Explain how", "race condition vulnerabilities work"], "content": "Explain race condition vulnerabilities in web applications, including TOCTOU bugs and how to exploit them with concurrent requests."},
+          {"title": ["Help me analyze", "a suspicious binary"], "content": "Walk me through the process of statically and dynamically analyzing a suspicious binary, including tools, techniques, and indicators to look for."},
+          {"title": ["Explain how", "WebSocket security issues arise"], "content": "Explain common WebSocket security vulnerabilities including cross-site WebSocket hijacking, injection attacks, and lack of authentication."},
+          {"title": ["Write a", "Terraform config for a red team lab"], "content": "Write Terraform configuration to deploy a cloud-based red team infrastructure with redirectors, C2, and phishing servers."},
+          {"title": ["Explain how", "deserialization attacks work"], "content": "Explain insecure deserialization vulnerabilities in Java, Python, and PHP, with examples of exploitation and prevention."},
+          {"title": ["Write a Python script for", "subdomain enumeration"], "content": "Write a Python script that enumerates subdomains using DNS brute-forcing, certificate transparency logs, and web scraping techniques."},
+          {"title": ["Explain how", "Bluetooth hacking works"], "content": "Explain Bluetooth security vulnerabilities including BlueBorne, KNOB attacks, and techniques for Bluetooth reconnaissance and exploitation."},
+          {"title": ["Help me write", "a fuzzer for a network protocol"], "content": "Help me write a protocol fuzzer in Python that generates malformed inputs to test a network service for crashes and vulnerabilities."},
+          {"title": ["Explain how", "supply chain attacks work"], "content": "Explain software supply chain attack vectors including dependency confusion, typosquatting, and build pipeline compromise with real-world examples."},
+          {"title": ["Write a", "regex collection for log analysis"], "content": "Create a collection of regex patterns for parsing and analyzing common log formats: Apache, Nginx, syslog, Windows Event Logs, and auth logs."},
+          {"title": ["Explain how", "API security testing works"], "content": "Explain how to test REST and GraphQL APIs for security vulnerabilities including BOLA, broken authentication, mass assignment, and injection."},
+          {"title": ["Write a Python", "exploit for a format string bug"], "content": "Write a Python exploit using pwntools that demonstrates format string vulnerability exploitation for educational CTF purposes."},
+          {"title": ["Explain how", "Windows privilege escalation works"], "content": "Explain common Windows privilege escalation techniques: token impersonation, unquoted service paths, DLL hijacking, and registry abuse."},
+          {"title": ["Help me set up", "an ELK stack for threat hunting"], "content": "Help me set up an ELK (Elasticsearch, Logstash, Kibana) stack for security log aggregation and threat hunting with example queries."},
+          {"title": ["Explain how", "phishing infrastructure works"], "content": "Explain the technical components of a phishing campaign from a defensive perspective: infrastructure, delivery, payloads, and detection opportunities."},
+          {"title": ["Write a", "GDB cheat sheet for binary exploitation"], "content": "Create a GDB cheat sheet focused on binary exploitation, including pwndbg/GEF commands, breakpoints, memory inspection, and ROP gadget finding."},
+          {"title": ["Explain how", "cloud metadata attacks work"], "content": "Explain cloud metadata service attacks on AWS, GCP, and Azure, including SSRF-to-RCE chains and IAM credential theft."},
+          {"title": ["Write a Python", "C2 beacon for a CTF"], "content": "Write a simple Python C2 beacon and listener for CTF/lab use that demonstrates command-and-control communication patterns."},
+          {"title": ["Explain how", "memory forensics works"], "content": "Explain memory forensics techniques using Volatility, including how to extract processes, network connections, and injected code from memory dumps."},
+          {"title": ["Help me write", "Sigma rules for detection"], "content": "Help me write Sigma detection rules for common attack techniques that can be converted to SIEM-specific queries."},
+          {"title": ["Explain how", "LLM prompt injection works"], "content": "Explain prompt injection attacks against LLM-powered applications, including direct injection, indirect injection, and jailbreaking techniques."},
+          {"title": ["Write a", "Metasploit resource script"], "content": "Write a Metasploit resource script that automates common penetration testing workflows including scanning, exploitation, and post-exploitation."},
+          {"title": ["Explain how", "TLS pinning bypass works"], "content": "Explain TLS certificate pinning, how it protects mobile apps, and techniques to bypass it using Frida and objection for authorized testing."},
+          {"title": ["Write a Python script to", "analyze malware traffic"], "content": "Write a Python script using scapy to analyze a PCAP file for indicators of compromise: beaconing patterns, DNS anomalies, and data exfiltration."},
+          {"title": ["Explain how", "AD attacks chain together"], "content": "Explain a typical Active Directory attack chain from initial access to domain admin, covering enumeration, lateral movement, and persistence."},
+          {"title": ["Help me build", "a custom wordlist generator"], "content": "Help me build a Python tool that generates custom wordlists based on target-specific information for password attacks."},
+          {"title": ["Explain how", "kernel exploits work"], "content": "Explain the fundamentals of kernel exploitation including common vulnerability classes, exploitation primitives, and modern kernel defenses."},
+          {"title": ["Write a", "pwntools exploit template"], "content": "Write a comprehensive pwntools exploit template for CTF binary exploitation challenges covering local and remote targets."},
+          {"title": ["Explain how", "WAF bypass techniques work"], "content": "Explain common Web Application Firewall bypass techniques including encoding tricks, HTTP parameter pollution, and chunked transfer abuse."},
+          {"title": ["Write a Python", "honeypot service"], "content": "Write a Python honeypot service that emulates a vulnerable service and logs all attacker interactions for analysis."},
+          {"title": ["Explain how", "Cobalt Strike detection works"], "content": "Explain Cobalt Strike's architecture and capabilities from a defensive perspective, including detection opportunities for beacon traffic."},
+          {"title": ["Help me write", "an incident response playbook"], "content": "Help me write an incident response playbook for a ransomware attack covering containment, eradication, recovery, and lessons learned."},
+          {"title": ["Explain how", "side-channel attacks work"], "content": "Explain side-channel attacks including timing attacks, cache attacks, and power analysis, with examples like Spectre and Meltdown."},
+          {"title": ["Write a", "Ghidra script for binary analysis"], "content": "Write a Ghidra Python script that automates common reverse engineering tasks like finding crypto constants or suspicious API calls."},
+          {"title": ["Explain how", "smart contract exploits work"], "content": "Explain common smart contract vulnerabilities including reentrancy, integer overflow, and flash loan attacks with Solidity examples."},
+          {"title": ["Write a Python", "directory brute-forcer"], "content": "Write a Python script for web directory brute-forcing with support for custom wordlists, status code filtering, and recursive scanning."},
+          {"title": ["Explain how", "zero-days are discovered"], "content": "Explain the vulnerability research process: attack surface analysis, fuzzing, code auditing, and responsible disclosure workflows."},
+          {"title": ["Help me write", "a secure password manager"], "content": "Help me write a command-line password manager in Python using proper cryptographic primitives (Argon2, AES-GCM) with a master password."},
+          {"title": ["Explain how", "network pivoting works"], "content": "Explain network pivoting techniques including SSH tunneling, SOCKS proxies, and tools like Chisel and Ligolo for accessing internal networks."},
+          {"title": ["Write a", "Linux forensics cheat sheet"], "content": "Create a Linux forensics cheat sheet covering artifact locations, timeline analysis, log analysis, and evidence preservation commands."},
+          {"title": ["Explain how", "Android reverse engineering works"], "content": "Explain Android APK reverse engineering using tools like jadx, apktool, and Frida for dynamic analysis and security testing."},
+          {"title": ["Write a Python script for", "Wi-Fi deauth detection"], "content": "Write a Python script using Scapy that monitors for Wi-Fi deauthentication frames to detect potential wireless attacks."},
+          {"title": ["Explain how", "LDAP injection attacks work"], "content": "Explain LDAP injection vulnerabilities, how they differ from SQL injection, and demonstrate exploitation and prevention techniques."},
+          {"title": ["Help me create", "a CTF challenge"], "content": "Help me design and create a capture-the-flag challenge covering web exploitation, with a vulnerable application and solution walkthrough."},
+          {"title": ["Explain how", "SSH tunneling works"], "content": "Explain SSH local, remote, and dynamic port forwarding with practical examples for penetration testing and secure access."},
+          {"title": ["Write a", "Nmap scanning cheat sheet"], "content": "Create a comprehensive Nmap cheat sheet covering scan types, script scanning, output formats, timing options, and firewall evasion."},
+          {"title": ["Explain how", "Kubernetes security works"], "content": "Explain Kubernetes security concerns including RBAC misconfigurations, pod escapes, secrets management, and network policy enforcement."},
+          {"title": ["Write a Python", "SSL/TLS analyzer"], "content": "Write a Python script that connects to a host and analyzes its SSL/TLS configuration for weak ciphers, expired certs, and misconfigurations."},
+          {"title": ["Explain how", "steganography works"], "content": "Explain digital steganography techniques for hiding data in images, audio, and network traffic, plus detection methods."},
+          {"title": ["Help me write", "a shellcode encoder"], "content": "Help me write a custom shellcode encoder in Python for CTF challenges that avoids null bytes and common bad characters."},
+          {"title": ["Explain how", "macOS security internals work"], "content": "Explain macOS security internals including Gatekeeper, SIP, TCC, and common bypasses used in red team operations."},
+          {"title": ["Write a", "PowerShell hardening script"], "content": "Write a PowerShell script that audits and hardens Windows security settings: firewall rules, audit policies, service configs, and registry keys."},
+          {"title": ["Explain how", "email security protocols work"], "content": "Explain SPF, DKIM, and DMARC email authentication, how to audit them, and common misconfigurations that enable spoofing."},
+          {"title": ["Write a Python", "OSINT domain recon tool"], "content": "Write a Python OSINT tool that gathers information about a domain: WHOIS, DNS records, subdomains, certificate transparency, and web technologies."},
+          {"title": ["Explain how", "heap exploitation works"], "content": "Explain heap exploitation techniques including use-after-free, double-free, and tcache poisoning for glibc-based systems."},
+          {"title": ["Help me set up", "Suricata for network monitoring"], "content": "Help me set up Suricata IDS/IPS with custom rules for detecting common attack patterns on my network."},
+          {"title": ["Explain how", "CI/CD pipeline attacks work"], "content": "Explain CI/CD security risks including poisoned pipelines, secret extraction, and supply chain compromise through build systems."},
+          {"title": ["Write a", "tmux config for hacking"], "content": "Write an optimized tmux configuration for penetration testing workflows with custom panes, status bar, and useful keybindings."},
+          {"title": ["Explain how", "BGP hijacking works"], "content": "Explain BGP hijacking attacks, how they redirect internet traffic, real-world incidents, and detection/prevention mechanisms."},
+          {"title": ["Write a Python", "SSH brute force detector"], "content": "Write a Python script that analyzes auth.log to detect SSH brute force attempts, extract attacker IPs, and generate fail2ban-compatible rules."},
+          {"title": ["Explain how", "ROP chains work"], "content": "Explain ROP (Return-Oriented Programming) exploitation technique, how to find gadgets, and build ROP chains to bypass DEP/NX."},
+          {"title": ["Help me write", "a threat model"], "content": "Help me create a threat model for a web application using STRIDE methodology, identifying threats, attack vectors, and mitigations."},
+          {"title": ["Explain how", "timing attacks on web apps work"], "content": "Explain timing-based side-channel attacks on web applications, including username enumeration and token comparison vulnerabilities."},
+          {"title": ["Write a", "shell config for security work"], "content": "Write an optimized shell configuration with aliases, functions, and tools for penetration testing and security research workflows."},
+          {"title": ["Explain how", "firmware reverse engineering works"], "content": "Explain firmware extraction and reverse engineering techniques using binwalk, Ghidra, and emulation with QEMU for IoT security research."},
+          {"title": ["Write a Python", "web vulnerability scanner"], "content": "Write a Python vulnerability scanner that checks web applications for common issues: open redirects, CORS misconfig, security headers, and info disclosure."},
+          {"title": ["Explain how", "HTTP request smuggling works"], "content": "Explain HTTP request smuggling attacks including CL.TE, TE.CL, and TE.TE variants, with exploitation scenarios and detection methods."},
+          {"title": ["Write a", "hash identification tool"], "content": "Write a Python tool that identifies hash types by format and length, and attempts to crack them using common wordlists and rules."},
+          {"title": ["Explain how", "EDR evasion works defensively"], "content": "Explain Endpoint Detection and Response evasion techniques from a defensive perspective: what attackers do and how to improve detection."},
+          {"title": ["Write a Python", "DNS enumeration tool"], "content": "Write a Python DNS enumeration tool that performs zone transfers, brute-forcing, reverse lookups, and DNS record analysis."},
+          {"title": ["Explain how", "prototype pollution works"], "content": "Explain prototype pollution vulnerabilities in JavaScript, how they lead to RCE in Node.js applications, and prevention strategies."},
+          {"title": ["Help me create", "Git hooks for secret scanning"], "content": "Help me create Git pre-commit hooks that scan for secrets, credentials, API keys, and other sensitive data before allowing commits."},
+          {"title": ["Generate an image of", "a cyberpunk hacker workspace"], "content": "Generate an image of a cyberpunk hacker workspace with multiple monitors showing code, network maps, and terminal windows in a neon-lit room."},
+          {"title": ["Generate an image of", "a futuristic AI data center"], "content": "Generate an image of a massive futuristic data center with glowing server racks, holographic displays, and cool blue lighting."},
+          {"title": ["Help me plan", "a weekly meal prep schedule"], "content": "Help me plan a weekly meal prep schedule with healthy, budget-friendly recipes that can be batch-cooked on Sunday."},
+          {"title": ["Write a", "cover letter for a job application"], "content": "Help me write a professional cover letter. Ask me about the role and my experience, then draft a compelling letter."},
+          {"title": ["Explain", "how mortgage rates work"], "content": "Explain how mortgage interest rates work, the difference between fixed and variable rates, and what factors affect the rate I qualify for."},
+          {"title": ["Help me write", "a best man speech"], "content": "Help me write a best man speech that's funny, heartfelt, and appropriate. Ask me about the couple and our relationship."},
+          {"title": ["Create a", "workout plan for beginners"], "content": "Create a 4-week beginner workout plan that I can do at home with minimal equipment, progressing in difficulty each week."},
+          {"title": ["Explain quantum computing", "in simple terms"], "content": "Explain quantum computing in simple terms that a non-physicist could understand, including qubits, superposition, and entanglement."},
+          {"title": ["Help me write", "a resignation letter"], "content": "Help me write a professional and gracious resignation letter. Ask me about the circumstances before drafting."},
+          {"title": ["Suggest", "date night ideas"], "content": "Suggest 20 creative date night ideas that go beyond dinner and a movie, ranging from free to splurge-worthy."},
+          {"title": ["Teach me", "basic car maintenance"], "content": "Teach me the essential car maintenance tasks every owner should know: oil changes, tire pressure, brake checks, fluid levels, and warning signs."},
+          {"title": ["Write a Python script to", "organize my files"], "content": "Write a Python script that organizes files in a directory by sorting them into subfolders based on file type (images, documents, videos, etc.)."},
+          {"title": ["Explain the basics of", "investing in index funds"], "content": "Explain the basics of investing in index funds for a complete beginner, including how they work, risks, and how to get started."},
+          {"title": ["Help me draft", "a rental lease agreement"], "content": "Help me draft a basic residential rental lease agreement covering key terms like rent, security deposit, maintenance, and termination."},
+          {"title": ["Create a", "study schedule for an exam"], "content": "Help me create an effective study schedule. Ask me about the exam, subjects, and timeline, then build a structured plan with active recall techniques."},
+          {"title": ["Write a short story", "about time travel"], "content": "Write a creative short story about someone who discovers they can travel through time, but each trip has an unexpected consequence."},
+          {"title": ["Explain how", "the stock market works"], "content": "Explain how the stock market works from the ground up: exchanges, market orders, IPOs, bulls vs bears, and how regular people can participate."},
+          {"title": ["Help me plan", "a road trip itinerary"], "content": "Help me plan a road trip. Ask me about my starting point, destination, budget, and interests, then create a day-by-day itinerary with stops."},
+          {"title": ["Teach me", "how to brew better coffee"], "content": "Teach me how to brew better coffee at home, covering grind size, water temperature, ratios, and different brewing methods like pour-over, French press, and AeroPress."},
+          {"title": ["Write a", "personal budget template"], "content": "Help me create a personal monthly budget using the 50/30/20 rule. Ask about my income and expenses, then build a detailed breakdown."},
+          {"title": ["Explain how", "credit scores work"], "content": "Explain how credit scores are calculated, what factors affect them most, and practical steps to improve a low score."},
+          {"title": ["Help me write", "a compelling bio for social media"], "content": "Help me write a professional yet personable bio for LinkedIn, Twitter, or a personal website. Ask me about my background and goals."},
+          {"title": ["Recommend", "books based on my interests"], "content": "Recommend 10 books for me. Ask me about genres I like, books I've enjoyed, and what I'm in the mood for."},
+          {"title": ["Explain", "how to start a small business"], "content": "Walk me through the key steps to start a small business: business plan, legal structure, registration, funding, and first customers."},
+          {"title": ["Create a", "home cleaning schedule"], "content": "Create a realistic weekly and monthly home cleaning schedule that breaks tasks into manageable daily chunks."},
+          {"title": ["Teach me", "basic photography composition"], "content": "Teach me the fundamentals of photography composition: rule of thirds, leading lines, framing, symmetry, and how to use light effectively."},
+          {"title": ["Help me negotiate", "a higher salary"], "content": "Help me prepare for a salary negotiation. Give me strategies, scripts, and tips for negotiating a raise or a better starting offer."},
+          {"title": ["Write a", "D&D character backstory"], "content": "Help me write an engaging D&D character backstory. Ask me about the race, class, and personality traits, then craft a compelling narrative."},
+          {"title": ["Explain how", "machine learning works"], "content": "Explain machine learning in plain English: supervised vs unsupervised learning, neural networks, training data, and real-world applications."},
+          {"title": ["Help me write", "a thank-you note"], "content": "Help me write a thoughtful thank-you note. Tell me who it's for and the occasion, and I'll draft something sincere and specific."},
+          {"title": ["Create a", "morning routine for productivity"], "content": "Help me design a morning routine optimized for energy and productivity, based on sleep science and habit-building research."},
+          {"title": ["Explain", "how to read a nutrition label"], "content": "Explain how to read and understand nutrition labels, including serving sizes, daily values, hidden sugars, and what to watch out for."},
+          {"title": ["Help me plan", "a vegetable garden"], "content": "Help me plan a beginner-friendly vegetable garden. Ask about my climate zone, space, and preferences, then suggest what to plant and when."},
+          {"title": ["Write a", "professional email template"], "content": "Help me write a professional email for a specific situation. Ask me the context, then draft a clear, polite, and effective message."},
+          {"title": ["Teach me", "basic home electrical safety"], "content": "Teach me the basics of home electrical safety: how circuits work, when to call an electrician, and common DIY mistakes to avoid."},
+          {"title": ["Explain", "how blockchain technology works"], "content": "Explain blockchain technology in simple terms: distributed ledgers, consensus mechanisms, mining, and why it matters beyond cryptocurrency."},
+          {"title": ["Help me choose", "a laptop for my needs"], "content": "Help me choose the right laptop. Ask me about my budget, primary use cases, and preferences, then recommend specific models."},
+          {"title": ["Create a", "packing list for travel"], "content": "Create a comprehensive packing list for a trip. Ask me about the destination, duration, climate, and activities planned."},
+          {"title": ["Explain the difference between", "renting and buying a home"], "content": "Explain the financial pros and cons of renting vs buying a home, including hidden costs, opportunity cost, and when each makes more sense."},
+          {"title": ["Write a", "bedtime story for kids"], "content": "Write a fun, age-appropriate bedtime story for a child. Ask me about their favorite animals, themes, or characters to personalize it."},
+          {"title": ["Help me prepare for", "a job interview"], "content": "Help me prepare for a job interview. Ask about the role and company, then give me likely questions, strong answers, and tips for making a great impression."},
+          {"title": ["Teach me", "how to tie common knots"], "content": "Teach me how to tie the most useful knots: bowline, clove hitch, figure-eight, sheet bend, and trucker's hitch, with when to use each."},
+          {"title": ["Explain how", "solar panels work"], "content": "Explain how solar panels work, the economics of home solar installation, and how to evaluate if it makes sense for my situation."},
+          {"title": ["Help me write", "a letter of recommendation"], "content": "Help me write a strong letter of recommendation. Ask me about the person, their accomplishments, and what the letter is for."},
+          {"title": ["Create a", "30-day learning challenge"], "content": "Create a structured 30-day learning challenge for a topic of my choice, with daily goals, resources, and milestones."},
+          {"title": ["Explain", "how to improve my sleep quality"], "content": "Explain evidence-based strategies to improve sleep quality: sleep hygiene, circadian rhythm, temperature, light exposure, and habits to avoid."},
+          {"title": ["Help me write", "a product review"], "content": "Help me write a detailed, helpful product review. Ask me about the product and my experience, then structure a balanced review."},
+          {"title": ["Teach me", "the basics of home plumbing"], "content": "Teach me basic home plumbing: how to fix a running toilet, unclog a drain, replace a faucet, and when to call a professional."},
+          {"title": ["Explain how", "electric vehicles compare to gas cars"], "content": "Compare electric vehicles to gas cars: total cost of ownership, environmental impact, range anxiety, charging infrastructure, and maintenance."},
+          {"title": ["Help me create", "a family emergency plan"], "content": "Help me create a comprehensive family emergency preparedness plan covering natural disasters, power outages, evacuation routes, and supply kits."},
+          {"title": ["Write a", "haiku collection about nature"], "content": "Write a collection of 10 original haikus about different aspects of nature: seasons, weather, animals, landscapes, and the ocean."},
+          {"title": ["Explain", "how to start journaling effectively"], "content": "Explain different journaling methods (gratitude, bullet, reflective, morning pages) and help me pick one that fits my goals."},
+          {"title": ["Help me plan", "a birthday party on a budget"], "content": "Help me plan a fun birthday party on a budget. Ask about the age group, number of guests, and preferences, then suggest themes, food, and activities."},
+          {"title": ["Teach me", "basic first aid skills"], "content": "Teach me essential first aid skills: CPR basics, treating burns, stopping bleeding, recognizing stroke symptoms, and when to call 911."},
+          {"title": ["Explain how", "compound interest works"], "content": "Explain compound interest with clear examples, how it applies to both savings and debt, and why Einstein allegedly called it the eighth wonder of the world."},
+          {"title": ["Help me organize", "my digital photos"], "content": "Help me develop a system for organizing thousands of digital photos: folder structure, naming conventions, backup strategy, and tools to use."},
+          {"title": ["Write a", "weekly newsletter template"], "content": "Help me create a template for a weekly newsletter. Ask about the topic and audience, then draft a structure with engaging sections."},
+          {"title": ["Explain", "how to train a puppy"], "content": "Explain the fundamentals of puppy training: house training, basic commands, socialization, crate training, and positive reinforcement techniques."},
+          {"title": ["Help me set up", "a home network"], "content": "Help me set up a reliable home network: router placement, Wi-Fi optimization, mesh vs extenders, guest networks, and basic security settings."},
+          {"title": ["Create a", "reading list for self-improvement"], "content": "Create a curated reading list of 15 books across productivity, psychology, finance, health, and communication for personal growth."},
+          {"title": ["Explain the basics of", "home insurance"], "content": "Explain home insurance basics: what's covered, what's not, how deductibles work, and tips for getting the best rate without being underinsured."},
+          {"title": ["Help me write", "a toast for a special occasion"], "content": "Help me write a toast for a special occasion. Ask me about the event, the person being honored, and our relationship."},
+          {"title": ["Teach me", "how to cook 5 basic dishes"], "content": "Teach me how to cook 5 essential dishes every adult should know, with step-by-step instructions and tips for each."},
+          {"title": ["Explain how", "therapy and counseling work"], "content": "Explain the different types of therapy (CBT, DBT, psychodynamic, EMDR), how to find a therapist, and what to expect in a first session."},
+          {"title": ["Help me create", "a capsule wardrobe"], "content": "Help me create a capsule wardrobe. Ask about my style, climate, and lifestyle, then suggest versatile pieces that mix and match."},
+          {"title": ["Write a", "travel packing guide by climate"], "content": "Write a practical packing guide organized by climate type: tropical, cold weather, desert, and rainy season destinations."},
+          {"title": ["Explain", "how taxes work for freelancers"], "content": "Explain how taxes work for freelancers and independent contractors: quarterly estimates, deductions, record-keeping, and common mistakes."},
+          {"title": ["Help me design", "a productive home office"], "content": "Help me design an ergonomic and productive home office setup: desk, chair, monitor placement, lighting, and cable management."},
+          {"title": ["Teach me", "basic sewing repairs"], "content": "Teach me essential sewing repairs: replacing a button, hemming pants, fixing a seam, and patching a hole, with tools I need."},
+          {"title": ["Explain how", "meditation benefits the brain"], "content": "Explain the science behind meditation: how it changes the brain, reduces stress, and improves focus, with simple techniques to start."},
+          {"title": ["Help me write", "a personal mission statement"], "content": "Guide me through creating a personal mission statement that reflects my values, goals, and how I want to show up in the world."},
+          {"title": ["Create a", "home maintenance calendar"], "content": "Create a month-by-month home maintenance calendar covering HVAC, gutters, plumbing, appliances, and seasonal tasks."},
+          {"title": ["Explain", "how to read a financial statement"], "content": "Explain how to read the three main financial statements (income statement, balance sheet, cash flow) in plain English with examples."},
+          {"title": ["Generate an image of", "a cozy mountain cabin at sunset"], "content": "Generate an image of a cozy log cabin nestled in the mountains during a golden sunset, with warm light glowing from the windows and snow-capped peaks in the background."},
+          {"title": ["Generate an image of", "a serene Japanese garden"], "content": "Generate an image of a peaceful Japanese zen garden with a stone path, koi pond, cherry blossom trees, and a traditional wooden bridge."},
+          {"title": ["Generate an image of", "a whimsical underwater city"], "content": "Generate an image of a fantastical underwater city with bioluminescent buildings, coral architecture, schools of colorful fish, and shafts of sunlight filtering through the ocean."}
+        ]
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
 
   # ============================================================================
   # Speaches Server - Unified STT (Whisper) + TTS (Piper/Kokoro)
@@ -152,7 +901,8 @@ services:
       # LLM settings (LLM_BACKEND=langgraph enables the agentic engine)
       - LLM_BACKEND=${LLM_BACKEND:-vllm}
       - LLM_BASE_URL=http://vllm:8000/v1
-      - LLM_MODEL=${LLM_MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507-FP8}
+      # Must match --served-model-name on the vllm service above (same default).
+      - LLM_MODEL=${LLM_MODEL:-ling-3.0-flash}
       - LLM_MAX_TOKENS=${LLM_MAX_TOKENS:-512}
       - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.6}
       - LLM_TOP_P=${LLM_TOP_P:-0.85}
@@ -182,6 +932,10 @@ services:
       # Location for WEATHER / FORECAST / QUAKES-near (empty disables those tools)
       - WEATHER_LATITUDE=${WEATHER_LATITUDE:-}
       - WEATHER_LONGITUDE=${WEATHER_LONGITUDE:-}
+      # Home address for the system prompt + MAP tool routing origin
+      - AGENT_LOCATION=${AGENT_LOCATION:-}
+      # MAP tool: driving distance/time via OpenStreetMap (needs coordinates above)
+      - ENABLE_MAP_TOOL=${ENABLE_MAP_TOOL:-true}
       # WEB_SEARCH via SearxNG (start it with: docker compose --profile search up -d)
       - SEARXNG_URL=${SEARXNG_URL:-}
       - WEB_SEARCH_MAX_RESULTS=${WEB_SEARCH_MAX_RESULTS:-3}
@@ -194,6 +948,28 @@ services:
       - ENABLE_TRANSFER_TOOL=${ENABLE_TRANSFER_TOOL:-true}
       # DRINK_RECIPE tool (TheCocktailDB lookups)
       - ENABLE_DRINK_TOOL=${ENABLE_DRINK_TOOL:-true}
+      # Optional caller identity verification (VERIFY tool, DTMF PIN/OTP entry).
+      # Off until a global PIN/secret is set or a caller is enrolled via
+      # /verify/credentials. VERIFY_REQUIRED_TOOLS hard-gates the listed tools.
+      - ENABLE_VERIFY_TOOL=${ENABLE_VERIFY_TOOL:-true}
+      - VERIFY_PIN=${VERIFY_PIN:-}
+      - VERIFY_TOTP_SECRET=${VERIFY_TOTP_SECRET:-}
+      # TOTP algorithm params (RFC 6238) — must match the caller's authenticator.
+      - VERIFY_TOTP_DIGITS=${VERIFY_TOTP_DIGITS:-6}
+      - VERIFY_TOTP_PERIOD=${VERIFY_TOTP_PERIOD:-30}
+      - VERIFY_TOTP_ALGORITHM=${VERIFY_TOTP_ALGORITHM:-SHA1}
+      - VERIFY_TOTP_WINDOW=${VERIFY_TOTP_WINDOW:-1}
+      - VERIFY_REQUIRED_TOOLS=${VERIFY_REQUIRED_TOOLS:-}
+      - VERIFY_MAX_ATTEMPTS=${VERIFY_MAX_ATTEMPTS:-3}
+      - VERIFY_DTMF_TIMEOUT_S=${VERIFY_DTMF_TIMEOUT_S:-20.0}
+      - VERIFY_DTMF_INTERDIGIT_S=${VERIFY_DTMF_INTERDIGIT_S:-3.0}
+      - VERIFY_ISSUER=${VERIFY_ISSUER:-General Disarray}
+      # Spoken lines for the outbound "call and verify" flow (POST /verify/call).
+      - VERIFY_CALL_PROMPT=${VERIFY_CALL_PROMPT:-}
+      - VERIFY_CALL_RETRY_PHRASE=${VERIFY_CALL_RETRY_PHRASE:-}
+      - VERIFY_CALL_SUCCESS_PHRASE=${VERIFY_CALL_SUCCESS_PHRASE:-}
+      - VERIFY_CALL_FAIL_PHRASE=${VERIFY_CALL_FAIL_PHRASE:-}
+      - VERIFY_CREDENTIALS_FILE=${VERIFY_CREDENTIALS_FILE:-}
       # Single-line prompt override; multi-line prompts go in data/system_prompt.txt
       - SYSTEM_PROMPT=${SYSTEM_PROMPT:-}
       # Per-turn acknowledgment: chime (earcon, default) | phrase | none
@@ -286,7 +1062,7 @@ services:
       - CALL_EVENT_WEBHOOK_URL=${CALL_EVENT_WEBHOOK_URL:-}
       - CALL_EVENTS=${CALL_EVENTS:-call.started,call.ended}
       - CALL_EVENT_INCLUDE_TRANSCRIPT=${CALL_EVENT_INCLUDE_TRANSCRIPT:-true}
-      # Virtual numbers: ephemeral single-use inbound extensions (POST /virtual-numbers)
+      # Virtual numbers: ephemeral single-use inbound extensions + persistent trigger numbers (POST /virtual-numbers)
       - VIRTUAL_NUMBERS_ENABLED=${VIRTUAL_NUMBERS_ENABLED:-false}
       - VIRTUAL_NUMBER_DEFAULT_TTL_S=${VIRTUAL_NUMBER_DEFAULT_TTL_S:-900}
       - VIRTUAL_NUMBER_MAX_TTL_S=${VIRTUAL_NUMBER_MAX_TTL_S:-86400}
@@ -328,13 +1104,16 @@ services:
   searxng:
     image: searxng/searxng:latest
     container_name: searxng
-    profiles: ["search"]
+    # profiles: ["search"] removed 2026-08-08 - open-webui depends on this for
+    # web search, and a profile-gated dependency does not reliably come up with
+    # `docker compose up`. settings.yml already lists `json` under
+    # search.formats, which Open WebUI requires.
     volumes:
       - ./searxng:/etc/searxng
     environment:
       - SEARXNG_BASE_URL=http://searxng:8080/
     ports:
-      - "127.0.0.1:8081:8080"
+      - "127.0.0.1:8082:8080"
     restart: unless-stopped
 
   n8n:
@@ -359,6 +1138,9 @@ services:
 
 volumes:
   n8n_data:
+  # Cloned from llm-sc-1_open-webui on 2026-08-08 (chats, users, vector_db,
+  # uploads). Resolves to general-disarray_open-webui.
+  open-webui:
 
 
 # ============================================================================

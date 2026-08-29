@@ -151,3 +151,19 @@ async def test_cancel_task_removes_from_persistence(assistant, comp_config):
     assert tm.cancel_task(task_id) is False
     persisted = _json.loads((comp_config.data_dir / "scheduled_tasks.json").read_text())
     assert all(entry["id"] != task_id for entry in persisted)
+
+
+async def test_verify_required_tool_is_gated(make_client, config_factory, tmp_path):
+    """A tool in VERIFY_REQUIRED_TOOLS refuses until session.verified is True."""
+    cfg = config_factory(data_dir=str(tmp_path), verify_required_tools="CALC")
+    _, a = make_client(cfg)
+    a.session = SimpleNamespace(verified=False)
+
+    blocked = await a.tool_manager.execute_tool(_call("CALC", expression="2+2"))
+    assert blocked.status == ToolStatus.FAILED
+    assert "verify" in blocked.message.lower()
+
+    a.session.verified = True
+    ok = await a.tool_manager.execute_tool(_call("CALC", expression="2+2"))
+    assert ok.status == ToolStatus.SUCCESS
+    assert "4" in ok.message

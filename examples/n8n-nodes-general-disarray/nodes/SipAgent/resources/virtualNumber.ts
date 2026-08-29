@@ -99,6 +99,28 @@ export const virtualNumberProperties: INodeProperties[] = [
 				default: true,
 				description: 'Whether the completion webhook includes the call transcript',
 			},
+			{
+				displayName: 'Persistent (Trigger Number)',
+				name: 'persistent',
+				type: 'boolean',
+				default: false,
+				description:
+					'Whether the number never expires and survives its calls, so every call to it fires the callback until it is deleted (TTL ignored). For a number tied to a workflow\'s lifetime prefer the SIP Agent Trigger node in Trigger Number mode.',
+			},
+			{
+				displayName: 'Events',
+				name: 'events',
+				type: 'multiOptions',
+				options: [
+					{ name: 'Call Answered', value: 'answered' },
+					{ name: 'First Utterance', value: 'first_speech' },
+					{ name: 'Every Utterance', value: 'speech' },
+					{ name: 'Call Completed', value: 'completed' },
+				],
+				default: ['completed'],
+				description:
+					'Which call-time webhooks the agent POSTs to the Callback URL (anything beyond Call Completed requires one)',
+			},
 		],
 	},
 
@@ -143,6 +165,13 @@ export async function executeVirtualNumber(
 		}
 		if (additionalFields.includeTranscript === false) {
 			body.include_transcript = false;
+		}
+		if (additionalFields.persistent === true) {
+			body.persistent = true;
+		}
+		const events = additionalFields.events as string[] | undefined;
+		if (Array.isArray(events) && events.length > 0) {
+			body.events = events;
 		}
 
 		return sipAgentApiRequest.call(ctx, 'POST', '/virtual-numbers', body);

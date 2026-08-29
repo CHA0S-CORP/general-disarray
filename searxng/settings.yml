@@ -1,6 +1,6 @@
-# SearxNG settings for the General Disarray WEB_SEARCH tool.
-# Minimal delta over defaults: enable the JSON API the agent queries and
-# disable the bot limiter (the only client is the agent on the compose net).
+# SearxNG settings for the General Disarray WEB_SEARCH tool + Open WebUI RAG.
+# Minimal delta over defaults: enable the JSON API the clients query and
+# disable the bot limiter (the only clients are on the compose network).
 use_default_settings: true
 
 server:
@@ -12,3 +12,69 @@ search:
   formats:
     - html
     - json
+
+outgoing:
+  # Defaults are tight enough that slower engines get dropped, which is part of
+  # why results came back thin. Give them room without hanging the request.
+  request_timeout: 10.0
+  max_request_timeout: 15.0
+  pool_connections: 100
+  pool_maxsize: 20
+
+# --------------------------------------------------------------------------
+# Engine breadth (tuned 2026-08-08).
+#
+# Before: only duckduckgo answered. One query gave 10 results / 9 domains and
+# another gave ZERO, because DDG had started serving CAPTCHAs and 429s. Open
+# WebUI asking for 30 results cannot get them from one source capped at ~10.
+#
+# TESTING GOTCHA - read before "verifying" an engine:
+#   ?engines=<name> with an UNKNOWN name silently falls back to the default
+#   engines and still returns results. So a name that does not exist in this
+#   build looks like it "works". Always confirm via the per-result `engine`
+#   field, e.g.:
+#     curl -s 'http://127.0.0.1:8082/search?q=test&format=json&engines=foo' \
+#       | python3 -c 'import json,sys;print({r["engine"] for r in json.load(sys.stdin)["results"]})'
+#   marginalia / stract / "right dao" are NOT in this build's 246-engine
+#   registry; earlier notes claiming they worked were this fallback artifact.
+#
+# Measured from this box, attributed by `engine` field:
+#   RELIABLE     : bing, wiby
+#   INTERMITTENT : yahoo, brave, duckduckgo  (work, then 429/CAPTCHA under load
+#                  and recover on their own - SearXNG auto-suspends them)
+#   BLOCKED HERE : google, mojeek, wikipedia, startpage, qwant, presearch
+#                  (403 / CAPTCHA / access denied - upstream anti-bot against a
+#                  datacenter IP. Not fixable in config; only an egress proxy
+#                  or paid API keys would change it.)
+#
+# Keep several enabled precisely so one CAPTCHA does not zero out a search.
+# --------------------------------------------------------------------------
+engines:
+  # --- reliable here ---
+  - name: bing
+    disabled: false
+  - name: wiby
+    disabled: false
+    categories: [general, web]
+  # --- intermittent but genuinely productive; keep on ---
+  - name: yahoo
+    disabled: false
+  - name: brave
+    disabled: false
+  - name: duckduckgo
+    disabled: false
+  # --- blocked right now, but blocks are IP/rate based and do lift ---
+  - name: google
+    disabled: false
+  - name: mojeek
+    disabled: false
+    categories: [general, web]
+  # --- consistently failing here; off to cut error noise and latency ---
+  - name: startpage
+    disabled: true
+  - name: qwant
+    disabled: true
+  - name: presearch
+    disabled: true
+  - name: wikidata
+    disabled: true
