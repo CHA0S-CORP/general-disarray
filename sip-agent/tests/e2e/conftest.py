@@ -164,6 +164,15 @@ def _transcribe(path: Path) -> str:
             f"{SPEACHES_URL.rstrip('/')}/v1/audio/transcriptions",
             files=files, data=data, timeout=120.0,
         )
+    if resp.status_code == 500 and "clip timestamps" in resp.text.lower():
+        # faster-whisper's VAD found no speech at all in the capture — that
+        # is a real test outcome (the agent never spoke), not an STT outage.
+        # Surface it as such instead of an opaque HTTPStatusError.
+        rms, duration = _wav_rms_and_duration(path)
+        raise AssertionError(
+            f"captured audio has no transcribable speech ({duration:.1f}s, "
+            f"rms={rms:.0f}) — the agent likely never answered within the "
+            f"softphone's window; check LLM/TTS latency in the agent log")
     resp.raise_for_status()
     return (resp.json().get("text") or "").strip()
 

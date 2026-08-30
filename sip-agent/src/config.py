@@ -404,6 +404,11 @@ class Config:
     enable_weather_tool: bool = True
     enable_drink_tool: bool = field(
         default_factory=lambda: os.getenv("ENABLE_DRINK_TOOL", "true").lower() == "true")
+    # MAP tool: driving distance/time + directions via OpenStreetMap (Nominatim
+    # geocoding + OSRM routing, both keyless). Needs WEATHER_LATITUDE/LONGITUDE
+    # for the "from home" origin; self-disables without them.
+    enable_map_tool: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_MAP_TOOL", "true").lower() == "true")
     enable_search_tool: bool = False
     enable_calendar_tool: bool = False
     max_timer_duration_hours: int = 24
@@ -415,6 +420,11 @@ class Config:
     # QUAKES "near"). Empty disables those tools/filters.
     weather_latitude: str = field(default_factory=lambda: os.getenv("WEATHER_LATITUDE", ""))
     weather_longitude: str = field(default_factory=lambda: os.getenv("WEATHER_LONGITUDE", ""))
+
+    # Human-readable home/base address, injected into the system prompt so the
+    # agent knows where "here"/"home" is (e.g. for directions). Empty omits it.
+    # The MAP tool uses the WEATHER_LATITUDE/LONGITUDE coordinates as its origin.
+    agent_location: str = field(default_factory=lambda: os.getenv("AGENT_LOCATION", ""))
 
     # SearxNG instance for the WEB_SEARCH tool (empty disables the tool).
     # The compose files ship an optional service: docker compose --profile search up -d
@@ -454,7 +464,60 @@ class Config:
     # TRANSFER tool (SIP REFER to another extension; same outbound dial policy).
     enable_transfer_tool: bool = field(
         default_factory=lambda: os.getenv("ENABLE_TRANSFER_TOOL", "true").lower() == "true")
-    
+
+    # ===================
+    # Caller identity verification (optional)
+    # ===================
+    # Prove a caller is who they claim before sensitive actions, via a static PIN
+    # and/or a rolling TOTP code entered over DTMF (the VERIFY tool). Credentials
+    # resolve per-caller first (data/verify_credentials.json), then fall back to
+    # the global values below. Empty PIN + empty secret + no enrolled caller =
+    # feature off (nothing changes). Fail-open, except tool-gating (fails closed).
+    enable_verify_tool: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_VERIFY_TOOL", "true").lower() == "true")
+    # Global fallback factors (shared across all callers). Empty = no global factor.
+    verify_pin: str = field(default_factory=lambda: os.getenv("VERIFY_PIN", ""))
+    verify_totp_secret: str = field(default_factory=lambda: os.getenv("VERIFY_TOTP_SECRET", ""))
+    # TOTP algorithm parameters (RFC 6238). Must match the caller's authenticator
+    # app / issuing system. Number of digits in a code, seconds per step, and the
+    # HMAC hash (SHA1|SHA256|SHA512). SHA1/6/30 are the near-universal defaults.
+    verify_totp_digits: int = field(default_factory=lambda: int(os.getenv("VERIFY_TOTP_DIGITS", "6")))
+    verify_totp_period: int = field(default_factory=lambda: int(os.getenv("VERIFY_TOTP_PERIOD", "30")))
+    verify_totp_algorithm: str = field(
+        default_factory=lambda: os.getenv("VERIFY_TOTP_ALGORITHM", "SHA1"))
+    # Accept TOTP codes within +/- this many steps (clock skew tolerance).
+    verify_totp_window: int = field(default_factory=lambda: int(os.getenv("VERIFY_TOTP_WINDOW", "1")))
+    # Comma-separated tool names that require a verified caller before they run
+    # (e.g. "TRANSFER,CONTAINER_CTL"). Parsed to verify_required_tools_set below.
+    verify_required_tools: str = field(
+        default_factory=lambda: os.getenv("VERIFY_REQUIRED_TOOLS", ""))
+    # Wrong-code attempts allowed per call before VERIFY refuses further tries.
+    verify_max_attempts: int = field(default_factory=lambda: int(os.getenv("VERIFY_MAX_ATTEMPTS", "3")))
+    # How long to wait for the caller to START keying in a code (seconds).
+    verify_dtmf_timeout_s: float = field(
+        default_factory=lambda: float(os.getenv("VERIFY_DTMF_TIMEOUT_S", "20.0")))
+    # Once digits are being entered, submit after this gap with no new key
+    # (an inter-digit timeout, so the caller need not press '#'). Keeps a
+    # time-based one-time code from expiring while we wait out the full window.
+    verify_dtmf_interdigit_s: float = field(
+        default_factory=lambda: float(os.getenv("VERIFY_DTMF_INTERDIGIT_S", "3.0")))
+    # Issuer label embedded in authenticator provisioning URIs (enrollment).
+    verify_issuer: str = field(default_factory=lambda: os.getenv("VERIFY_ISSUER", "General Disarray"))
+    # Spoken lines for the outbound "call and verify" flow (POST /verify/call).
+    # `or` (not getenv default) so a set-but-empty env var still uses the default
+    # rather than speaking nothing — an empty prompt is never wanted.
+    verify_call_prompt: str = field(default_factory=lambda: os.getenv("VERIFY_CALL_PROMPT")
+        or "Please enter your PIN or one-time code, then press pound.")
+    verify_call_retry_phrase: str = field(default_factory=lambda: os.getenv("VERIFY_CALL_RETRY_PHRASE")
+        or "That code wasn't right. Please try again.")
+    verify_call_success_phrase: str = field(default_factory=lambda: os.getenv("VERIFY_CALL_SUCCESS_PHRASE")
+        or "Thank you — your identity is verified. Goodbye.")
+    verify_call_fail_phrase: str = field(default_factory=lambda: os.getenv("VERIFY_CALL_FAIL_PHRASE")
+        or "I could not verify your identity. Goodbye.")
+    # Resolved in __post_init__ to <data_dir>/verify_credentials.json.
+    verify_credentials_file: Optional[Path] = field(
+        default_factory=lambda: Path(os.getenv("VERIFY_CREDENTIALS_FILE")) if os.getenv("VERIFY_CREDENTIALS_FILE") else None)
+
     # ===================
     # REST API / Webhook security & limits
     # ===================
@@ -636,6 +699,15 @@ class Config:
         # Persona profiles file defaults relative to data_dir too.
         if self.persona_file is None:
             self.persona_file = self.data_dir / "personas.json"
+
+        # Per-caller verification credentials file defaults relative to data_dir.
+        if self.verify_credentials_file is None:
+            self.verify_credentials_file = self.data_dir / "verify_credentials.json"
+        # Parse the gated-tool allowlist once into an uppercased set for O(1)
+        # lookups on the (hot) tool-execution path. Tool names are uppercase.
+        self.verify_required_tools_set = {
+            t.strip().upper() for t in (self.verify_required_tools or "").split(",") if t.strip()
+        }
         
         # Load phrases from JSON file if it exists
         phrases_file = self.data_dir / "phrases.json"

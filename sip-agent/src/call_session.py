@@ -112,6 +112,18 @@ class CallSession:
     # default demeanor. Set/cleared live by the PERSONA tool; never persisted
     # with the session — saved profiles live in the PersonaStore.
     persona: str = ""
+    # Identity verification for THIS call: flips to True once the caller passes
+    # a PIN/OTP check via the VERIFY tool. Read directly by tool-gating in
+    # tool_manager (which is why it's a first-class field, not tool_state).
+    # verify_attempts counts wrong entries this call, capped by config.
+    verified: bool = False
+    verify_attempts: int = 0
+    # True while a tool is collecting a keypad code from the caller. The
+    # audio loop suppresses barge-in for the duration (in-band DTMF tones and
+    # "okay" would otherwise cancel the turn mid-entry) and the agentic engine
+    # pauses its wall-clock budget so the wait for digits is not charged to
+    # the LLM turn.
+    dtmf_collecting: bool = False
     # True once the post-call memory update has been dispatched (teardown and
     # the audio-loop tail can both reach the update site).
     memory_update_started: bool = False
@@ -124,6 +136,9 @@ class CallSession:
     # single-use consumption (teardown and the audio-loop tail both reach it).
     virtual_number: Optional[Any] = None
     virtual_number_finalized: bool = False
+    # User utterances seen so far on a virtual-number call (drives the
+    # first_speech / speech trigger webhooks).
+    virtual_number_speech_count: int = 0
     # This call's audio-pipeline state (VAD + utterance buffer + latency
     # metrics; a SessionAudioState from audio_pipeline.new_session_state()).
     # Typed loosely so this module stays dependency-light.

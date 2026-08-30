@@ -17,7 +17,7 @@ import signal
 import asyncio
 import logging
 import ipaddress
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import call_events
 import context_manager
@@ -27,6 +27,7 @@ from call_session import (CallSession, TurnLedger, spoken_text,
                           set_current_session, get_current_session)
 from caller_memory import CallerMemoryStore, caller_id_from_uri
 from persona_store import PersonaStore
+from identity_verification import IdentityVerifier, VerificationStore
 from virtual_numbers import VirtualNumberRegistry, extension_from_uri
 from earcons import generate_chime, generate_thinking_tick
 from knowledge_base import KnowledgeBase
@@ -170,6 +171,12 @@ class SIPAIAssistant:
         # save/load. The active persona lives on the CallSession; this is just
         # persistence. Fail-open.
         self.persona_store = PersonaStore(config)
+        # Optional caller identity verification (static PIN + rolling TOTP over
+        # DTMF). The store persists per-caller credentials; the verifier holds
+        # the check logic (with a global config fallback). Shared by the VERIFY
+        # tool and the /verify REST endpoints. Fail-open.
+        self.verify_store = VerificationStore(config)
+        self.verifier = IdentityVerifier(config, self.verify_store)
         # MCP client (external tool servers). Connected inside
         # ToolManager.start() so MCP tools register through the same
         # wrapper path as plugins. No-op unless MCP_ENABLED.
@@ -213,6 +220,11 @@ class SIPAIAssistant:
         
         # Combined list for pre-caching
         self._phrases_to_cache = self.config.phrases.get_all_phrases_for_cache()
+        # The VERIFY tool's keypad prompt is a fixed phrase too: pre-cache it
+        # so it plays instantly instead of being synthesized mid-turn.
+        if getattr(self.config, "enable_verify_tool", False):
+            self._phrases_to_cache = list(dict.fromkeys(
+                self._phrases_to_cache + [self.config.verify_call_prompt]))
 
         # Confirmation earcon (in-memory PCM), generated once; played via the
         # same send_audio path as TTS so barge-in/flush semantics are identical.
@@ -422,18 +434,46 @@ class SIPAIAssistant:
         log_event(logger, logging.INFO,
                   f"Virtual number completed: {entry.number}",
                   event="virtual_number_completed", number=entry.number,
-                  virtual_number_id=entry.id, consumed=consumed is not None)
+                  virtual_number_id=entry.id, consumed=consumed is not None,
+                  persistent=entry.persistent)
 
-        extra = {
-            "caller": getattr(session.call_info, "remote_uri", "") or "",
-            "call_id": session.transcript_id,
-            "duration_seconds": round(time.time() - session.start_time, 1),
-        }
+        if not entry.wants("completed"):
+            return
+        extra = self._virtual_number_call_fields(session)
+        extra["duration_seconds"] = round(time.time() - session.start_time, 1)
         if entry.include_transcript:
             transcript = self.transcripts.get(session.transcript_id)
             if transcript is not None:
                 extra["transcript"] = transcript
         self.virtual_numbers.fire_webhook(entry, status="completed", extra=extra)
+
+    @staticmethod
+    def _virtual_number_call_fields(session: CallSession) -> Dict[str, Any]:
+        """Per-call fields shared by every virtual-number webhook."""
+        return {
+            "caller": getattr(session.call_info, "remote_uri", "") or "",
+            "call_id": session.transcript_id,
+        }
+
+    def _emit_virtual_number_speech(self, session: CallSession, text: str) -> None:
+        """Trigger-number speech hooks: `first_speech` fires once per call,
+        `speech` on every utterance. Fire-and-forget; never on the speaking
+        path's critical section."""
+        entry = session.virtual_number
+        if entry is None:
+            return
+        session.virtual_number_speech_count += 1
+        first = session.virtual_number_speech_count == 1
+        if not ((first and entry.wants("first_speech")) or entry.wants("speech")):
+            return
+        extra = self._virtual_number_call_fields(session)
+        extra.update({
+            "text": text,
+            "utterance_index": session.virtual_number_speech_count,
+            "first": first,
+        })
+        self.virtual_numbers.fire_webhook(
+            entry, status="first_speech" if first else "speech", extra=extra)
 
     async def start(self):
         """Start all components and run main loop."""
@@ -680,6 +720,12 @@ class SIPAIAssistant:
 
                 session = self._begin_session(call_info, "inbound", remote_uri,
                                               virtual_number=virtual_number)
+                if virtual_number and virtual_number.wants("answered"):
+                    # Trigger-number hook: kick the workflow off the moment
+                    # the call is matched, before the greeting plays.
+                    self.virtual_numbers.fire_webhook(
+                        virtual_number, status="answered",
+                        extra=self._virtual_number_call_fields(session))
 
             # Everything below acts on behalf of the new call: bind it so
             # greeting playback (and anything else reaching self.session /
@@ -823,7 +869,13 @@ class SIPAIAssistant:
                         speech = self.audio_pipeline.has_speech(
                             session.audio_state, audio_chunk)
 
-                        if self._playback_active(session):
+                        if session.dtmf_collecting:
+                            # A tool is collecting a keypad code: the caller's
+                            # own DTMF tones / an "okay" must not cancel the
+                            # turn. (Digits mute the prompt themselves.)
+                            barge_in_run.reset()
+                            cancel_merge_run.reset()
+                        elif self._playback_active(session):
                             cancel_merge_run.reset()
                             if barge_in_run.update(chunk_ms, speech):
                                 barge_in_run.reset()
@@ -1069,6 +1121,7 @@ class SIPAIAssistant:
         })
         self.transcripts.add_turn(session.transcript_id, "user", text)
         self._publish_admin_event("user_turn", {"text": text}, session)
+        self._emit_virtual_number_speech(session, text)
 
         # Deterministic farewell: when the whole utterance is just a goodbye,
         # don't gamble on the model invoking HANGUP — answer with a goodbye
@@ -1293,6 +1346,12 @@ class SIPAIAssistant:
             call_context["caller_memory"] = session.caller_memory_prompt
         if session.virtual_number and session.virtual_number.purpose:
             call_context["virtual_number_context"] = session.virtual_number.purpose
+        # Identity verification state: tell the model whether the caller has
+        # verified, and whether any tool is gated behind verification (so it
+        # knows to route through the VERIFY tool before a sensitive action).
+        if getattr(self.config, "verify_required_tools_set", None):
+            call_context["verification_required"] = True
+            call_context["verified"] = bool(session.verified)
         if rolling_summary:
             call_context["conversation_summary"] = rolling_summary
         if self.config.knowledge_auto_inject:

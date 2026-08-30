@@ -111,9 +111,13 @@ class FakeAssistant:
         from tool_manager import ToolManager
         from transcript_store import TranscriptStore
         from virtual_numbers import VirtualNumberRegistry
+        from identity_verification import IdentityVerifier, VerificationStore
         self.tool_manager = ToolManager(self)
         self.transcripts = TranscriptStore(config)
         self.virtual_numbers = VirtualNumberRegistry(config)
+        # Optional identity verification, wired exactly as main.py does.
+        self.verify_store = VerificationStore(config)
+        self.verifier = IdentityVerifier(config, self.verify_store)
         # Like production (main.py): always constructed, disabled by default —
         # so ToolManager.start() exercises _start_mcp_tools' no-op path in
         # every baseline test, exactly as a default deployment does.

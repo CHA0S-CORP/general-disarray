@@ -9,6 +9,14 @@ number is cleared. Numbers are single-use, expire after a TTL when no call
 arrives, and the registry persists across restarts
 (data/virtual_numbers.json, same atomic-write pattern as the scheduler).
 
+Persistent "trigger numbers" (persistent=True) are the long-lived variant:
+they never expire and survive their calls, so every call dialed to one
+fires the number's webhook — the hook an n8n workflow registers on
+activation to be kicked off by a phone call. The `events` list selects
+which call-time webhooks fire: "answered" (call matched, before the
+greeting), "first_speech" (the caller's first transcribed utterance),
+"speech" (every utterance) and "completed" (call ended, + transcript).
+
 Threading model: all registry state is touched only from the asyncio event
 loop (API handlers, the call path, and the sweep task), so no locks are
 needed. The PJSIP thread never calls in here — it only captures the dialed
@@ -51,6 +59,11 @@ def extension_from_uri(uri: str) -> Optional[str]:
         return ext
     return None
 
+# Call-time webhook events a number can subscribe to (the "expired" lifecycle
+# webhook is not optional — it tells the creator the number is gone).
+VALID_EVENTS = ("answered", "first_speech", "speech", "completed")
+DEFAULT_EVENTS = ["completed"]
+
 # Sweep cadence. Expiry precision of ~1s is plenty for minutes-scale TTLs.
 _SWEEP_INTERVAL_S = 1.0
 
@@ -78,6 +91,14 @@ class VirtualNumber:
     # Set when a call to this number is live; a claimed entry is exempt from
     # the TTL sweep so it can't vanish mid-call.
     claimed: bool = False
+    # Trigger number: never expires (expires_at is 0) and is not consumed by
+    # its calls — every call to it fires the webhook until it is DELETEd.
+    persistent: bool = False
+    # Which call-time webhooks fire (subset of VALID_EVENTS).
+    events: List[str] = field(default_factory=lambda: list(DEFAULT_EVENTS))
+
+    def wants(self, event: str) -> bool:
+        return event in self.events
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -90,11 +111,15 @@ class VirtualNumber:
             "created_at": self.created_at,
             "expires_at": self.expires_at,
             "claimed": self.claimed,
+            "persistent": self.persistent,
+            "events": list(self.events),
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'VirtualNumber':
-        return cls(**data)
+        # Tolerate records written before persistent/events existed.
+        known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
+        return cls(**known)
 
 
 class VirtualNumberRegistry:
@@ -137,13 +162,26 @@ class VirtualNumberRegistry:
 
     def create(self, number: Optional[str] = None, ttl_s: Optional[int] = None,
                purpose: str = "", greeting: str = "", callback_url: str = "",
-               include_transcript: bool = True) -> VirtualNumber:
+               include_transcript: bool = True, persistent: bool = False,
+               events: Optional[List[str]] = None) -> VirtualNumber:
         """Register a new virtual number; raises VirtualNumberError on policy
-        violations (400 bad number, 409 collision, 503 exhausted/at cap)."""
+        violations (400 bad number/events, 409 collision, 503 exhausted/at cap).
+
+        persistent=True makes a trigger number: no TTL, not consumed by its
+        calls. `events` selects the call-time webhooks (VALID_EVENTS)."""
         if len(self._entries) >= self.config.virtual_number_max_active:
             raise VirtualNumberError(
                 503, f"Too many active virtual numbers "
                      f"(VIRTUAL_NUMBER_MAX_ACTIVE={self.config.virtual_number_max_active})")
+
+        events = list(DEFAULT_EVENTS) if events is None else list(dict.fromkeys(events))
+        bad = [e for e in events if e not in VALID_EVENTS]
+        if bad:
+            raise VirtualNumberError(
+                400, f"Unknown events {bad}; valid: {', '.join(VALID_EVENTS)}")
+        if events and events != list(DEFAULT_EVENTS) and not callback_url:
+            raise VirtualNumberError(
+                400, "events require a callback_url to deliver them to")
 
         ttl = int(ttl_s) if ttl_s else self.config.virtual_number_default_ttl_s
         ttl = max(1, min(ttl, self.config.virtual_number_max_ttl_s))
@@ -168,14 +206,19 @@ class VirtualNumberRegistry:
             greeting=greeting,
             callback_url=callback_url,
             include_transcript=include_transcript,
-            expires_at=time.time() + ttl,
+            expires_at=0.0 if persistent else time.time() + ttl,
+            persistent=persistent,
+            events=events,
         )
         self._entries[entry.id] = entry
         self._persist()
         log_event(logger, logging.INFO,
-                  f"Virtual number created: {number} (ttl {ttl}s)",
+                  f"Virtual number created: {number} "
+                  f"({'persistent' if persistent else f'ttl {ttl}s'}, "
+                  f"events={','.join(events) or '-'})",
                   event="virtual_number_created", number=number,
-                  virtual_number_id=entry.id, ttl_s=ttl)
+                  virtual_number_id=entry.id, ttl_s=0 if persistent else ttl,
+                  persistent=persistent, events=events)
         return entry
 
     def get(self, entry_id: str) -> Optional[VirtualNumber]:
@@ -204,18 +247,28 @@ class VirtualNumberRegistry:
         if not self.config.virtual_numbers_enabled or not number:
             return None
         entry = self._by_number(number)
-        if entry is None or entry.claimed:
+        if entry is None:
+            return None
+        # A trigger number answers every call (concurrent ones included);
+        # a single-use number is busy while its one call is live.
+        if entry.claimed and not entry.persistent:
             return None
         entry.claimed = True
         self._persist()
         return entry
 
     def consume(self, entry_id: str) -> Optional[VirtualNumber]:
-        """Pop an entry after its call finished (single-use). Idempotent:
+        """Finish an entry after its call: pop a single-use number, un-claim
+        a persistent one (it stays registered for the next call). Idempotent:
         returns None when already gone."""
-        entry = self._entries.pop(entry_id, None)
-        if entry is not None:
-            self._persist()
+        entry = self._entries.get(entry_id)
+        if entry is None:
+            return None
+        if entry.persistent:
+            entry.claimed = False
+        else:
+            self._entries.pop(entry_id, None)
+        self._persist()
         return entry
 
     def release(self, entry_id: str):
@@ -261,7 +314,7 @@ class VirtualNumberRegistry:
     def _sweep(self):
         now = time.time()
         expired = [e for e in self._entries.values()
-                   if not e.claimed and e.expires_at <= now]
+                   if not e.persistent and not e.claimed and e.expires_at <= now]
         if not expired:
             return
         for entry in expired:
@@ -284,11 +337,17 @@ class VirtualNumberRegistry:
             "number": entry.number,
             "status": status,
             "purpose": entry.purpose,
+            "persistent": entry.persistent,
             "created_at": entry.created_at,
             "timestamp": time.time(),
         }
         if extra:
             payload.update(extra)
+        log_event(logger, logging.INFO,
+                  f"Virtual number webhook {status}: {entry.number}",
+                  event="virtual_number_webhook", status=status,
+                  number=entry.number, virtual_number_id=entry.id,
+                  call_id=payload.get("call_id"))
         # Imported lazily to avoid an import cycle with api.py.
         from api import deliver_webhook
         task = asyncio.create_task(deliver_webhook(
@@ -332,7 +391,7 @@ class VirtualNumberRegistry:
             # A claimed entry from before a crash reloads as active (its call
             # outcome is lost); expiry then applies normally.
             entry.claimed = False
-            if entry.expires_at <= now:
+            if not entry.persistent and entry.expires_at <= now:
                 self._expired_on_load.append(entry)
                 continue
             self._entries[entry.id] = entry

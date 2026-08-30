@@ -28,10 +28,15 @@ from pydantic import BaseModel, Field, model_validator
 
 from admin_events import EventBus
 from call_session import set_current_session
+from identity_verification import is_safe_caller_id
+from dtmf_collect import collect_dtmf_code
 
 from telemetry import create_span, Metrics
 from logging_utils import log_event
 from retry_utils import retry_async, RetryError
+
+# Reserved caller id under which GET /verify/otp serves the GLOBAL TOTP secret.
+GLOBAL_OTP_ID = "global"
 
 if TYPE_CHECKING:
     from main import SIPAIAssistant
@@ -43,6 +48,12 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # Request validation / security helpers
 # ============================================================================
+
+class _VerifyCallDone(Exception):
+    """Internal signal inside run_verify_call: a terminal non-answer outcome
+    (no answer / initiate failure) with status already set — jump to the shared
+    teardown + webhook exit rather than running the prompt/verify loop."""
+
 
 class RequestRejected(HTTPException):
     """Raised when a request is rejected at the handler boundary.
@@ -449,6 +460,8 @@ class CallStatus(str, Enum):
     NO_ANSWER = "no_answer"
     FAILED = "failed"
     BUSY = "busy"
+    # Verify calls only: the caller hung up before any code was checked.
+    HANGUP = "hangup"
 
 
 class OutboundCallResponse(BaseModel):
@@ -615,6 +628,17 @@ class VirtualNumberRequest(BaseModel):
     include_transcript: bool = Field(
         default=True,
         description="Include the transcript in the completion webhook")
+    persistent: bool = Field(
+        default=False,
+        description="Trigger number: never expires and is not consumed by "
+                    "its calls — every call to it fires the webhook until "
+                    "the number is deleted (ttl_s is ignored)")
+    events: Optional[List[str]] = Field(
+        default=None,
+        description="Call-time webhooks to fire: answered (call matched, "
+                    "before the greeting), first_speech (caller's first "
+                    "utterance), speech (every utterance), completed (call "
+                    "ended, + transcript). Default [\"completed\"]")
 
 
 class VirtualNumberResponse(BaseModel):
@@ -626,6 +650,124 @@ class VirtualNumberResponse(BaseModel):
     purpose: str
     expires_at: float
     created_at: float
+    persistent: bool = False
+    events: List[str] = []
+    callback_url: str = ""
+
+
+class VerifyRequest(BaseModel):
+    """Out-of-band identity check for a caller (no live call needed)."""
+    caller_id: str = Field(..., min_length=1, max_length=64,
+                           description="Caller id (SIP URI user part)")
+    pin: Optional[str] = Field(default=None, description="Static PIN to check")
+    otp: Optional[str] = Field(default=None, description="One-time (TOTP) code to check")
+
+    @model_validator(mode="after")
+    def _at_least_one_factor(self):
+        if not (self.pin or self.otp):
+            raise ValueError("Provide a pin and/or otp to check")
+        return self
+
+
+class VerifyResponse(BaseModel):
+    """Result of an identity check."""
+    caller_id: str
+    verified: bool
+    method: Optional[str] = None  # "pin" | "otp" | None
+
+
+class VerifyCallRequest(BaseModel):
+    """Place an outbound call that verifies a caller's identity by keypad.
+
+    The agent dials ``extension`` (defaulting to ``caller_id``), asks the person
+    to key in their PIN or one-time code, and checks it against the credentials
+    stored for ``caller_id``. Digits are entered by DTMF, never spoken, so the
+    code never lands in the transcript.
+    """
+    caller_id: Optional[str] = Field(
+        default=None, max_length=64,
+        description="Caller id whose stored credentials are checked (SIP URI user "
+                    "part). Defaults to the extension when omitted.")
+    extension: Optional[str] = Field(
+        default=None,
+        description="SIP extension or number to dial (defaults to caller_id)")
+    method: str = Field(
+        default="auto", pattern=r"^(pin|otp|auto)$",
+        description="Which factor to require: 'pin', 'otp', or 'auto' (either)")
+    pin: Optional[str] = Field(
+        default=None,
+        description="Check the entered code against this PIN for this call "
+                    "(instead of the caller's stored/global PIN)")
+    totp_secret: Optional[str] = Field(
+        default=None,
+        description="Check the entered code against this base32 TOTP secret for "
+                    "this call (instead of the stored/global secret)")
+    totp_digits: Optional[int] = Field(
+        default=None, ge=4, le=10,
+        description="Digits in the TOTP code (defaults to VERIFY_TOTP_DIGITS)")
+    totp_period: Optional[int] = Field(
+        default=None, ge=5, le=300,
+        description="TOTP step in seconds (defaults to VERIFY_TOTP_PERIOD)")
+    totp_algorithm: Optional[str] = Field(
+        default=None, pattern=r"^(?i:sha1|sha256|sha512)$",
+        description="TOTP hash: SHA1|SHA256|SHA512 (defaults to VERIFY_TOTP_ALGORITHM)")
+    totp_window: Optional[int] = Field(
+        default=None, ge=0, le=10,
+        description="Clock-skew steps to accept (defaults to VERIFY_TOTP_WINDOW)")
+    prompt: Optional[str] = Field(
+        default=None,
+        description="Custom spoken prompt (defaults to VERIFY_CALL_PROMPT)")
+    retry_phrase: Optional[str] = Field(
+        default=None,
+        description="Spoken line after a wrong code (defaults to VERIFY_CALL_RETRY_PHRASE)")
+    success_phrase: Optional[str] = Field(
+        default=None,
+        description="Spoken line on success (defaults to VERIFY_CALL_SUCCESS_PHRASE)")
+    fail_phrase: Optional[str] = Field(
+        default=None,
+        description="Spoken line on failure (defaults to VERIFY_CALL_FAIL_PHRASE)")
+    ring_timeout: int = Field(default=30, ge=1, le=600,
+                              description="Seconds to wait for the call to be answered")
+    callback_url: Optional[str] = Field(
+        default=None, description="Optional webhook URL to POST the result to")
+    call_id: Optional[str] = Field(default=None, description="Optional caller-provided ID for tracking")
+
+
+class VerifyCallResponse(BaseModel):
+    """Result of an outbound identity-verification call."""
+    call_id: str
+    status: CallStatus
+    verified: bool
+    method: Optional[str] = None  # "pin" | "otp" | None
+    attempts: int = 0
+    error: Optional[str] = None
+
+
+class VerifyCredentialsRequest(BaseModel):
+    """Enroll or update a caller's verification factors."""
+    caller_id: str = Field(..., min_length=1, max_length=64,
+                           description="Caller id (SIP URI user part)")
+    pin: Optional[str] = Field(default=None, description="Static PIN to set/rotate")
+    totp_secret: Optional[str] = Field(
+        default=None, description="Base32 TOTP secret to store (ignored if generate_totp)")
+    generate_totp: bool = Field(
+        default=False, description="Mint a fresh random TOTP secret for this caller")
+
+
+class VerifyCredentialsResponse(BaseModel):
+    """Public view of a caller's enrollment (never the secret or PIN hash)."""
+    caller_id: str
+    has_pin: bool
+    has_totp: bool
+    provisioning_uri: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class OtpResponse(BaseModel):
+    """Current TOTP code for a caller (for delivery/testing)."""
+    caller_id: str
+    otp: str
+    expires_in_s: int
 
 
 class ToolExecuteResponse(BaseModel):
@@ -1162,6 +1304,219 @@ class OutboundCallHandler:
                 log_event(logger, logging.INFO, "Webhook sent successfully",
                          event="outbound_call_webhook_success", url=url)
 
+    # --- Outbound identity verification ---------------------------------
+    async def _collect_code(self, call_info, timeout: float,
+                            prompt_audio: Optional[bytes] = None) -> Optional[str]:
+        """Speak the prompt and collect keypad digits for a PIN/OTP.
+
+        Thin wrapper over the shared ``dtmf_collect.collect_dtmf_code`` loop
+        (also used by the in-call VERIFY tool): first keypress mutes the prompt,
+        '*' restarts entry, '#' or an inter-digit pause submits. NEVER log the
+        returned code.
+        """
+        interdigit = float(getattr(self.assistant.config, "verify_dtmf_interdigit_s", 3.0))
+        return await collect_dtmf_code(
+            self.assistant.sip_handler, call_info, timeout=timeout,
+            interdigit=interdigit, prompt_audio=prompt_audio)
+
+    async def _say(self, call_info, text: str) -> None:
+        """Speak a line into the live call and wait for it to finish (best-effort)."""
+        try:
+            audio = await self.assistant.audio_pipeline.synthesize(text)
+            if audio and getattr(call_info, "is_active", False):
+                await self.assistant.sip_handler.send_audio(call_info, audio)
+                duration = len(audio) / (self.assistant.config.sample_rate * 2)
+                await asyncio.sleep(duration + 0.3)
+        except Exception as e:
+            logger.debug(f"verify-call prompt playback failed: {e}")
+
+    async def run_verify_call(self, request: 'VerifyCallRequest') -> 'VerifyCallResponse':
+        """Dial the caller, collect a PIN/OTP by keypad, and verify it.
+
+        Runs synchronously (the HTTP request awaits the verdict). Bounded by
+        ring_timeout, VERIFY_DTMF_TIMEOUT_S and VERIFY_MAX_ATTEMPTS so the call
+        can't run unbounded. Fails closed on the security decision (any error
+        leaves verified=False) but never raises on an expected call outcome.
+        """
+        config = self.assistant.config
+        caller_id = (request.caller_id or "").strip()
+        extension = (request.extension or caller_id).strip()
+        call_id = request.call_id or self.generate_call_id()
+
+        # caller_id is optional: it names whose stored credentials to check (and
+        # is the default dial target). Omitted, it defaults to the extension so
+        # the extension's own enrollment is consulted. At least one is required.
+        if not extension:
+            raise RequestRejected(400, "Provide a caller_id or an extension to dial")
+        if not caller_id and is_safe_caller_id(extension):
+            caller_id = extension
+        if caller_id and not is_safe_caller_id(caller_id):
+            raise RequestRejected(400, "Invalid caller_id")
+        validate_extension(extension, config)
+        await validate_callback_url(request.callback_url, config)
+        if request.call_id and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", request.call_id):
+            raise RequestRejected(
+                400, "call_id may only contain letters, digits, '.', '_', '-' (max 64 chars)")
+
+        verifier = self.assistant.verifier
+
+        # Per-request ("ad-hoc") credentials: when the caller supplies a PIN
+        # and/or TOTP secret in the request, the entered code is checked against
+        # exactly those, with no store/global lookup (an n8n workflow that holds
+        # the factors itself, without enrolling the caller first).
+        adhoc_pin = request.pin or None
+        adhoc_secret = (request.totp_secret or "").strip().replace(" ", "").upper() or None
+        if adhoc_secret and not re.fullmatch(r"[A-Z2-7]+=*", adhoc_secret):
+            raise RequestRejected(400, "totp_secret must be base32")
+        adhoc = bool(adhoc_pin or adhoc_secret)
+
+        # No ad-hoc factor and no stored/global factor: nothing to check.
+        if not adhoc and not verifier.can_verify(caller_id):
+            raise RequestRejected(
+                400, "No verification credentials configured: supply a pin/totp_secret "
+                     "or a caller_id (or global VERIFY_*) with enrolled credentials")
+
+        # Concurrency guard (verify calls are not queued — they're interactive).
+        if call_id in self.pending_calls:
+            raise RequestRejected(409, f"call_id '{call_id}' already in progress")
+        if len(self.pending_calls) >= config.max_direct_concurrent_calls:
+            raise RequestRejected(429, "Too many concurrent calls in progress; try again later")
+
+        request.ring_timeout = min(request.ring_timeout, config.max_ring_timeout_s)
+        # Park a marker so the concurrency guard and /call/{id} see this call.
+        self.pending_calls[call_id] = request  # type: ignore[assignment]
+
+        set_current_session(None)
+        status = CallStatus.FAILED
+        verified = False
+        method: Optional[str] = None
+        attempts = 0
+        error: Optional[str] = None
+        call_info = None
+        hung_up = False
+
+        with create_span("api.verify_call", {
+            "call.id": call_id, "call.extension": extension, "verify.method": request.method,
+        }) as span:
+            try:
+                uri = extension
+                if not uri.startswith("sip:"):
+                    uri = f"sip:{uri}@{config.sip_domain}" if "@" not in uri else f"sip:{uri}"
+
+                call_info = await self.assistant.sip_handler.make_call(uri)
+                if not call_info:
+                    error = "Failed to initiate call"
+                    Metrics.record_call_failed("verify", "initiate_failed")
+                    raise _VerifyCallDone()
+
+                status = CallStatus.RINGING
+                ring_start = asyncio.get_event_loop().time()
+                while asyncio.get_event_loop().time() - ring_start < request.ring_timeout:
+                    if getattr(call_info, "is_active", False):
+                        status = CallStatus.ANSWERED
+                        break
+                    await asyncio.sleep(0.5)
+                else:
+                    status = CallStatus.NO_ANSWER
+                    Metrics.record_call_failed("verify", "no_answer")
+                    await self.assistant.sip_handler.hangup_call(call_info)
+                    hung_up = True
+                    raise _VerifyCallDone()
+
+                await asyncio.sleep(1)  # let media settle
+
+                # Spoken lines: per-request override, else the configured default.
+                prompt = request.prompt or config.verify_call_prompt
+                retry_phrase = request.retry_phrase or config.verify_call_retry_phrase
+                success_phrase = request.success_phrase or config.verify_call_success_phrase
+                fail_phrase = request.fail_phrase or config.verify_call_fail_phrase
+                dtmf_timeout = float(getattr(config, "verify_dtmf_timeout_s", 20.0))
+                max_attempts = max(1, int(getattr(config, "verify_max_attempts", 3)))
+                # Pre-synthesize the prompt once; it's replayed each attempt and
+                # the caller's first keypress mutes it (barge-in) inside collect.
+                prompt_audio = await self.assistant.audio_pipeline.synthesize(prompt)
+
+                empty_entries = 0
+                while attempts < max_attempts and getattr(call_info, "is_active", False):
+                    code = await self._collect_code(call_info, dtmf_timeout, prompt_audio)
+                    if not code:
+                        if not getattr(call_info, "is_active", False):
+                            break  # hung up mid-prompt: not a completed attempt
+                        # Timeout with nothing keyed — not a wrong code (the in-call
+                        # VERIFY tool doesn't burn an attempt either), but bound
+                        # the re-prompts so the call can't run unbounded.
+                        empty_entries += 1
+                        if empty_entries >= max_attempts:
+                            break
+                        continue
+                    if adhoc:
+                        ok, used = await verifier.averify_explicit(
+                            code, pin=adhoc_pin, totp_secret=adhoc_secret,
+                            method=request.method, totp_digits=request.totp_digits,
+                            totp_period=request.totp_period,
+                            totp_algorithm=request.totp_algorithm,
+                            totp_window=request.totp_window)
+                    else:
+                        ok, used = await verifier.averify(caller_id, code, method=request.method)
+                    attempts += 1
+                    # Diagnostic only — length, never the code itself.
+                    log_event(logger, logging.DEBUG, "Verify attempt",
+                              event="verify_call_attempt", call_id=call_id,
+                              code_len=len(code), method=request.method,
+                              adhoc=adhoc, matched=used, ok=ok)
+                    if ok:
+                        verified, method = True, used
+                        break
+                    if attempts < max_attempts:
+                        await self._say(call_info, retry_phrase)
+
+                # A caller who hung up before any code was checked is
+                # distinguishable from a wrong code on the webhook.
+                status = (CallStatus.COMPLETED
+                          if getattr(call_info, "is_active", False) or attempts
+                          else CallStatus.HANGUP)
+                if status is CallStatus.HANGUP and error is None:
+                    error = "Caller hung up before entering a code"
+                # NEVER log the entered code — only the outcome.
+                log_event(logger, logging.INFO,
+                          f"Verify call {'succeeded' if verified else 'failed'}",
+                          event="verify_call", outcome="ok" if verified else "failed",
+                          caller=caller_id or extension, call_id=call_id,
+                          method=method, attempts=attempts)
+                span.set_attribute("verify.verified", verified)
+
+                if getattr(call_info, "is_active", False):
+                    await self._say(call_info, success_phrase if verified else fail_phrase)
+                    if getattr(call_info, "is_active", False):
+                        await self.assistant.sip_handler.hangup_call(call_info)
+                        hung_up = True
+
+            except _VerifyCallDone:
+                # Terminal non-answer outcome — status/error already set; fall
+                # through to the shared teardown + webhook exit below.
+                pass
+            except Exception as e:
+                error = str(e)
+                logger.error(f"Verify call error: {e}", exc_info=True)
+                span.record_exception(e)
+            finally:
+                if call_info is not None and not hung_up and getattr(call_info, "is_active", False):
+                    try:
+                        await self.assistant.sip_handler.hangup_call(call_info)
+                    except Exception as cleanup_err:
+                        logger.warning(f"Failed to hang up verify call: {cleanup_err}")
+                self.pending_calls.pop(call_id, None)
+
+        response = VerifyCallResponse(call_id=call_id, status=status, verified=verified,
+                                      method=method, attempts=attempts, error=error)
+        if request.callback_url:
+            try:
+                await deliver_webhook(request.callback_url, response.model_dump(mode="json"),
+                                      config, api_name="verify_call_webhook")
+            except Exception as e:
+                logger.warning(f"verify-call webhook delivery failed: {e}")
+        return response
+
 
 # ============================================================================
 # FastAPI Application
@@ -1281,6 +1636,31 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
         _deps_cache["ts"] = now
         _deps_cache["deps"] = deps
         return deps
+
+    def _require_verified_for(tool_name: str, call_id: Optional[str]) -> None:
+        """Apply the VERIFY_REQUIRED_TOOLS gate to REST tool execution.
+
+        The same check tool_manager.execute_tool applies to LLM-driven calls:
+        a gated tool runs only for a call whose caller has passed VERIFY this
+        call. Over REST the relevant session is the one named by ``call_id``
+        (else the single active call); with no live verified session the tool
+        is refused (fail closed) with 403.
+        """
+        session = None
+        try:
+            sessions = _active_call_sessions(assistant)
+            if call_id:
+                session = next((sess for sess in sessions
+                                if _session_matches(sess, call_id)), None)
+            elif len(sessions) == 1:
+                session = sessions[0]
+        except Exception:
+            session = None
+        blocked = assistant.tool_manager.verification_block(tool_name, session)
+        if blocked is not None:
+            log_event(logger, logging.INFO, f"REST tool {tool_name} blocked: caller not verified",
+                      event="verify_gate", tool=tool_name, outcome="blocked", source="api")
+            raise HTTPException(status_code=403, detail=blocked.message)
 
     @app.get("/health")
     async def health_check(deep: bool = False):
@@ -1638,6 +2018,7 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
 
         log_event(logger, logging.INFO, f"Tool call request: {actual_tool_name} -> {request.extension}",
                  event="api_tool_call", tool=actual_tool_name, extension=request.extension)
+        _require_verified_for(actual_tool_name, None)
 
         try:
             # Execute the tool first
@@ -1727,7 +2108,8 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
         
         log_event(logger, logging.INFO, f"API executing tool: {actual_tool_name}",
                  event="api_tool_execute", tool=actual_tool_name, params=request.params)
-        
+        _require_verified_for(actual_tool_name, request.call_id)
+
         try:
             # Execute the tool
             result = await tool.execute(request.params)
@@ -2175,6 +2557,9 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
             purpose=entry.purpose,
             expires_at=entry.expires_at,
             created_at=entry.created_at,
+            persistent=entry.persistent,
+            events=list(entry.events),
+            callback_url=entry.callback_url,
         )
 
     @app.post("/virtual-numbers", response_model=VirtualNumberResponse,
@@ -2189,6 +2574,13 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
         greeting); when the call ends, the outcome and transcript are POSTed
         to `callback_url` and the number is cleared. Unused numbers expire
         after `ttl_s` (an "expired" webhook fires instead).
+
+        With `persistent: true` the number becomes a **trigger number**: it
+        never expires, survives its calls, and every call to it fires the
+        webhooks selected in `events` — e.g. `["answered", "first_speech"]`
+        kicks a workflow off as soon as the call lands and again with what
+        the caller first said. Payloads carry `event: virtual_number.<name>`,
+        `caller`, `call_id`, and for speech events `text`.
 
         Example:
         ```json
@@ -2212,6 +2604,8 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
                 greeting=request.greeting or "",
                 callback_url=request.callback_url or "",
                 include_transcript=request.include_transcript,
+                persistent=request.persistent,
+                events=request.events,
             )
         except VirtualNumberError as e:
             raise HTTPException(status_code=e.status_code, detail=e.detail)
@@ -2243,6 +2637,108 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
         if not assistant.virtual_numbers.delete(number_id):
             raise HTTPException(status_code=404, detail="Virtual number not found")
         return {"success": True, "message": f"Virtual number {number_id} deleted"}
+
+    # --- Identity verification -------------------------------------------
+    def _verify_credentials_view(caller_id: str) -> VerifyCredentialsResponse:
+        view = assistant.verify_store.public_view(caller_id)
+        uri = assistant.verify_store.provisioning_uri(
+            caller_id, assistant.config.verify_issuer)
+        return VerifyCredentialsResponse(
+            caller_id=caller_id, has_pin=view["has_pin"], has_totp=view["has_totp"],
+            provisioning_uri=uri, updated_at=view.get("updated_at"))
+
+    @app.post("/verify", response_model=VerifyResponse, dependencies=protected)
+    async def verify_caller(request: VerifyRequest):
+        """Check a caller's PIN and/or OTP out-of-band (no live call needed).
+
+        OTP is tried first when supplied, then the PIN; `verified` is true if
+        either matches. Credentials resolve per-caller, then global fallback.
+        """
+        caller_id = (request.caller_id or "").strip()
+        verifier = assistant.verifier
+        ok = False
+        method: Optional[str] = None
+        if request.otp and await verifier.averify_totp(caller_id, request.otp):
+            ok, method = True, "otp"
+        elif request.pin and await verifier.averify_pin(caller_id, request.pin):
+            ok, method = True, "pin"
+        return VerifyResponse(caller_id=caller_id, verified=ok, method=method)
+
+    @app.post("/verify/call", response_model=VerifyCallResponse, dependencies=protected)
+    async def verify_call(request: VerifyCallRequest):
+        """Place an outbound call that verifies a caller by keypad.
+
+        Dials the caller (``extension``, defaulting to ``caller_id``), asks them
+        to key in their PIN or one-time code, checks it, and returns the verdict
+        synchronously (also POSTed to ``callback_url`` when set). Returns 400
+        when the caller has no verification credentials configured.
+        """
+        try:
+            return await handler.run_verify_call(request)
+        except RequestRejected as e:
+            raise HTTPException(status_code=e.status_code, detail=e.detail)
+
+    @app.post("/verify/credentials", response_model=VerifyCredentialsResponse,
+              dependencies=protected)
+    async def set_verify_credentials(request: VerifyCredentialsRequest):
+        """Enroll/update a caller's PIN and/or TOTP secret.
+
+        Returns the enrollment metadata plus an otpauth:// provisioning URI when
+        a per-caller TOTP secret exists (import into an authenticator app). The
+        raw secret and PIN are never returned.
+        """
+        caller_id = (request.caller_id or "").strip()
+        if not is_safe_caller_id(caller_id):
+            raise HTTPException(status_code=400, detail="Invalid caller_id")
+        if not (request.pin or request.totp_secret or request.generate_totp):
+            raise HTTPException(
+                status_code=400,
+                detail="Provide a pin, totp_secret, or generate_totp=true")
+        # PBKDF2 hashing is CPU-bound; keep it off the call-serving event loop.
+        result = await asyncio.to_thread(
+            assistant.verify_store.set_credentials,
+            caller_id, pin=request.pin, totp_secret=request.totp_secret,
+            generate_totp=request.generate_totp)
+        if result is None:
+            raise HTTPException(status_code=400, detail="Could not store credentials")
+        return _verify_credentials_view(caller_id)
+
+    @app.get("/verify/credentials/{caller_id}",
+             response_model=VerifyCredentialsResponse, dependencies=protected)
+    async def get_verify_credentials(caller_id: str):
+        """Enrollment metadata for a caller (404 when none). Never the secret/PIN."""
+        if not assistant.verify_store.get(caller_id):
+            raise HTTPException(status_code=404, detail="No credentials for this caller")
+        return _verify_credentials_view(caller_id)
+
+    @app.delete("/verify/credentials/{caller_id}", dependencies=protected)
+    async def delete_verify_credentials(caller_id: str):
+        """Remove a caller's enrolled credentials."""
+        if not assistant.verify_store.delete(caller_id):
+            raise HTTPException(status_code=404, detail="No credentials for this caller")
+        return {"success": True, "message": f"Credentials for {caller_id} deleted"}
+
+    @app.get("/verify/otp/{caller_id}", response_model=OtpResponse,
+             dependencies=protected)
+    async def get_current_otp(caller_id: str):
+        """Current TOTP code for an ENROLLED caller's own secret.
+
+        The global VERIFY_TOTP_SECRET is served only under the reserved id
+        ``global`` — never as a silent fallback for an unknown/typo'd caller,
+        which would deliver the shared code to the wrong recipient.
+        """
+        if caller_id == GLOBAL_OTP_ID:
+            if not getattr(assistant.config, "verify_totp_secret", ""):
+                raise HTTPException(status_code=404, detail="No global TOTP secret configured")
+        elif not is_safe_caller_id(caller_id):
+            raise HTTPException(status_code=400, detail="Invalid caller_id")
+        elif not assistant.verifier.has_own_totp_secret(caller_id):
+            raise HTTPException(status_code=404, detail="No TOTP secret for this caller")
+        result = assistant.verifier.current_otp(caller_id if caller_id != GLOBAL_OTP_ID else "")
+        if result is None:
+            raise HTTPException(status_code=404, detail="No TOTP secret for this caller")
+        code, remaining = result
+        return OtpResponse(caller_id=caller_id, otp=code, expires_in_s=remaining)
 
     return app
 

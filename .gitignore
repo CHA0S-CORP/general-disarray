@@ -9,6 +9,9 @@ data/workflows.json
 data/virtual_numbers.json
 data/mcp_servers.json
 data/personas.json
+# Per-caller PIN hashes + plaintext TOTP secrets — never commit.
+data/verify_credentials.json
+data/verify_credentials.tmp
 
 # Ship one example knowledge doc (indexed by RAG, exercised by the e2e
 # KNOWLEDGE test); keep any other user-dropped documents ignored.

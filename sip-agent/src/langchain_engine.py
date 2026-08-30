@@ -76,6 +76,44 @@ class LangChainEngine(LLMEngine):
         # cached so a vLLM that rejects it costs a single failed request.
         self._tool_choice_supported = True
 
+    def _clock_paused(self) -> bool:
+        """True while a tool is waiting on the caller (keypad entry): that wait
+        is the caller's time, not the LLM's, so it isn't charged to the budget."""
+        try:
+            session = getattr(self.tool_manager.assistant, "session", None)
+            return bool(getattr(session, "dtmf_collecting", False))
+        except Exception:
+            return False
+
+    async def _invoke_with_budget(self, coro, timeout: float):
+        """``asyncio.wait_for`` whose clock pauses while ``_clock_paused()``.
+
+        Otherwise the VERIFY tool's DTMF wait (prompt + up to
+        VERIFY_DTMF_TIMEOUT_S) alone could exhaust LLM_AGENT_TIMEOUT_S and a
+        correct code would still end in the spoken error phrase.
+        """
+        task = asyncio.ensure_future(coro)
+        loop = asyncio.get_event_loop()
+        remaining = float(timeout)
+        try:
+            while True:
+                tick = loop.time()
+                done, _ = await asyncio.wait({task}, timeout=min(remaining, 0.25))
+                if done:
+                    return task.result()
+                if not self._clock_paused():
+                    remaining -= loop.time() - tick
+                if remaining <= 0:
+                    task.cancel()
+                    try:
+                        await task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    raise asyncio.TimeoutError()
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+
     async def start(self):
         # Keeps self.client (AsyncOpenAI) alive for the shared utility paths
         # (reformat_for_speech, summarize_text) and connectivity logging.
@@ -229,12 +267,12 @@ class LangChainEngine(LLMEngine):
         }) as span:
             start_time = time.time()
             try:
-                result = await asyncio.wait_for(
+                result = await self._invoke_with_budget(
                     self._agent.ainvoke(
                         {"messages": messages},
                         config={"recursion_limit": recursion_limit},
                     ),
-                    timeout=self.config.llm_agent_timeout_s,
+                    self.config.llm_agent_timeout_s,
                 )
             except asyncio.TimeoutError:
                 logger.warning(

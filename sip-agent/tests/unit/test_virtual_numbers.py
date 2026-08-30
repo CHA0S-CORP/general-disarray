@@ -214,3 +214,67 @@ def test_expired_entries_dropped_on_load(config_factory, tmp_path):
     reloaded = VirtualNumberRegistry(cfg)
     assert reloaded.get(entry.id) is None
     assert [e.id for e in reloaded._expired_on_load] == [entry.id]
+
+
+# --- persistent trigger numbers ---------------------------------------------
+
+def test_persistent_never_expires_and_survives_calls(config_factory, tmp_path):
+    reg = make_registry(config_factory, tmp_path)
+    entry = reg.create(number="7350", purpose="hotline", persistent=True,
+                       callback_url="http://n8n/hook", events=["answered"])
+    assert entry.persistent and entry.expires_at == 0.0
+    # Sweep leaves it alone regardless of "age".
+    reg._sweep()
+    assert reg.get(entry.id) is entry
+    # Claim -> consume keeps it registered (un-claimed) for the next call.
+    assert reg.claim("7350") is entry and entry.claimed
+    assert reg.consume(entry.id) is entry
+    assert reg.get(entry.id) is entry and not entry.claimed
+    # A concurrent call while one is live still matches a trigger number.
+    reg.claim("7350")
+    assert reg.claim("7350") is entry
+    # DELETE is the only way out.
+    assert reg.delete(entry.id) and reg.get(entry.id) is None
+
+
+def test_single_use_still_consumed(config_factory, tmp_path):
+    reg = make_registry(config_factory, tmp_path)
+    entry = reg.create(number="7351", purpose="one-shot")
+    reg.claim("7351")
+    assert reg.claim("7351") is None
+    assert reg.consume(entry.id) is entry
+    assert reg.get(entry.id) is None
+
+
+def test_events_validated(config_factory, tmp_path):
+    reg = make_registry(config_factory, tmp_path)
+    with pytest.raises(VirtualNumberError) as e:
+        reg.create(purpose="x", callback_url="http://h", events=["bogus"])
+    assert e.value.status_code == 400
+    with pytest.raises(VirtualNumberError) as e:
+        reg.create(purpose="x", events=["answered"])  # no callback_url
+    assert e.value.status_code == 400
+    entry = reg.create(purpose="x", callback_url="http://h",
+                       events=["speech", "speech", "completed"])
+    assert entry.events == ["speech", "completed"]
+    assert entry.wants("speech") and not entry.wants("answered")
+    assert reg.create(purpose="default").events == ["completed"]
+
+
+def test_persistent_survives_reload_and_legacy_records(config_factory, tmp_path):
+    reg = make_registry(config_factory, tmp_path)
+    trig = reg.create(number="7352", purpose="p", persistent=True,
+                      callback_url="http://h", events=["first_speech"])
+    # Hand-write a pre-persistent-era record alongside it.
+    import json
+    raw = json.loads(reg._store_file.read_text())
+    raw.append({"id": "old1", "number": "7353", "purpose": "legacy",
+                "expires_at": time.time() + 600, "created_at": time.time()})
+    reg._store_file.write_text(json.dumps(raw))
+
+    reg2 = VirtualNumberRegistry(reg.config)
+    loaded = reg2.get(trig.id)
+    assert loaded.persistent and loaded.events == ["first_speech"]
+    legacy = reg2.get("old1")
+    assert legacy is not None and not legacy.persistent
+    assert legacy.events == ["completed"]

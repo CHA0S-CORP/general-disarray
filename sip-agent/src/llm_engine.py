@@ -813,7 +813,15 @@ class LLMEngine:
         except Exception:
             now = datetime.now()
         prompt += f"\n\nCurrent time: {now.strftime('%I:%M %p %Z on %A, %B %d, %Y')}"
-        
+
+        # Static home/base address so "here", "home", and directions questions
+        # have a fixed reference point. The MAP tool routes from this location.
+        location = getattr(self.config, "agent_location", "") or ""
+        if location.strip():
+            prompt += (
+                f"\n\nYour location (where \"here\" and \"home\" are): "
+                f"{location.strip()}")
+
         # Caller-chosen demeanor for this call, layered over the base prompt.
         # Placed right after the base persona and before the call facts so it
         # colors the whole reply, but it can only shape TONE — the base prompt's
@@ -858,6 +866,21 @@ class LLMEngine:
                     "\n\nThis call came in on a temporary number set up for a"
                     " specific purpose. Handle the call with that purpose in"
                     " mind:\n" + virtual_purpose)
+
+            # Identity verification: some actions require a verified caller. Tell
+            # the model where this caller stands so it routes through the VERIFY
+            # tool before a gated action rather than refusing or guessing.
+            if call_context.get("verification_required"):
+                if call_context.get("verified"):
+                    prompt += (
+                        "\n\nThe caller has verified their identity on this call;"
+                        " you may proceed with sensitive actions.")
+                else:
+                    prompt += (
+                        "\n\nThe caller has NOT verified their identity. Before any"
+                        " sensitive or restricted action, verify them using the"
+                        " VERIFY tool (they enter a PIN or one-time code on the"
+                        " keypad — do not ask them to say it aloud).")
 
 
         # Add dynamic tools section from ToolManager. In native mode the tool
