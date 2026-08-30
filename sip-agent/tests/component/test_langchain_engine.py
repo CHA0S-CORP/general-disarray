@@ -249,3 +249,31 @@ async def test_grounding_retry_nudge_fallback_on_400(native_engine):
     assert nudged, "nudge fallback request never sent"
     import re
     assert re.search(r"\d{1,2}:\d{2} (AM|PM)", reply), reply
+
+
+# --- agent wall clock pauses during keypad entry ---------------------------------
+
+def test_invoke_with_budget_pauses_while_dtmf_collecting():
+    """The VERIFY tool's DTMF wait is the caller's time: with the clock paused a
+    turn longer than LLM_AGENT_TIMEOUT_S still completes; unpaused it times out."""
+    import asyncio
+    from langchain_engine import LangChainEngine
+
+    class _Self:
+        paused = True
+
+        def _clock_paused(self):
+            return self.paused
+
+    async def slow():
+        await asyncio.sleep(0.6)
+        return "done"
+
+    async def go(paused):
+        fake = _Self()
+        fake.paused = paused
+        return await LangChainEngine._invoke_with_budget(fake, slow(), 0.3)
+
+    assert asyncio.run(go(True)) == "done"
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(go(False))

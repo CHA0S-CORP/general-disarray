@@ -314,6 +314,29 @@ def test_virtual_number_crud(vn_client):
     assert client.delete(f"/virtual-numbers/{vn_id}").status_code == 404
 
 
+def test_trigger_number_create_and_events(make_client, config_factory, tmp_path):
+    """persistent + events round-trip through the API; bad events are 400."""
+    client, _assistant = make_client(config_factory(
+        VIRTUAL_NUMBERS_ENABLED="true", WEBHOOK_ALLOW_PRIVATE="true",
+        data_dir=str(tmp_path)))
+    r = client.post("/virtual-numbers", json={
+        "purpose": "hotline", "number": "7360", "persistent": True,
+        "callback_url": "http://127.0.0.1/hook",
+        "events": ["answered", "first_speech"]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["persistent"] is True
+    assert body["events"] == ["answered", "first_speech"]
+    assert body["expires_at"] == 0
+    assert client.get(f"/virtual-numbers/{body['id']}").json()["persistent"] is True
+
+    r = client.post("/virtual-numbers", json={
+        "purpose": "x", "callback_url": "http://127.0.0.1/hook",
+        "events": ["nope"]})
+    assert r.status_code == 400
+    assert "nope" in r.json()["detail"]
+
+
 def test_virtual_number_disabled_is_403(client):
     # Default comp_config has VIRTUAL_NUMBERS_ENABLED unset (false).
     assert client.post("/virtual-numbers", json={"purpose": "x"}).status_code == 403

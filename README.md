@@ -490,7 +490,7 @@ TTS_SPEED=1.1
 | ☎️ `TRANSFER` | Blind-transfer the caller (SIP REFER) | *"Transfer me to extension 2001"* |
 
 Several tools stay hidden until configured: `WEB_SEARCH` needs `SEARXNG_URL`
-(`docker compose --profile search up -d`), `FORECAST` needs `WEATHER_LATITUDE`/`WEATHER_LONGITUDE`,
+(started by default in the base compose; `--profile search` on `docker-compose.dgx.yml`), `FORECAST` needs `WEATHER_LATITUDE`/`WEATHER_LONGITUDE`,
 `GPU_STATUS`/`ALERTS` need the observability stack, and `CONTAINER_CTL` needs **both** a
 `CONTAINER_CTL_ALLOWLIST` and the (commented-out) docker-socket mount — the socket is
 root-equivalent on the host, so enable it deliberately.

@@ -160,6 +160,8 @@ class ToolManager:
         from plugins.container_tool import ContainerControlTool
         from plugins.transfer_tool import TransferTool
         from plugins.drink_tool import DrinkRecipeTool
+        from plugins.map_tool import MapTool
+        from plugins.verify_tool import VerifyTool
 
         # All available tool classes
         tool_classes = [
@@ -185,6 +187,7 @@ class ToolManager:
             NWSForecastTool,
             KpIndexTool,
             EarthquakeTool,
+            MapTool,
             # Memory + automation
             RememberTool,
             ForgetTool,
@@ -196,6 +199,8 @@ class ToolManager:
             ContainerControlTool,
             # Telephony
             TransferTool,
+            # Identity verification
+            VerifyTool,
         ]
         
         for tool_class in tool_classes:
@@ -273,6 +278,10 @@ class ToolManager:
         if name == "PERSONA" and not self.config.enable_persona_tool:
             return False
         if name == "DRINK_RECIPE" and not self.config.enable_drink_tool:
+            return False
+        if name == "MAP" and not self.config.enable_map_tool:
+            return False
+        if name == "VERIFY" and not self.config.enable_verify_tool:
             return False
         # WEB_SEARCH, FORECAST and CONTAINER_CTL self-disable in __init__ when
         # their required config (SearxNG URL / coordinates / allowlist+socket)
@@ -654,6 +663,24 @@ class ToolManager:
             logger.debug(f"Admin tool_call event publish failed: {e}")
         return result
 
+    def verification_block(self, tool_name: str, session) -> Optional[ToolResult]:
+        """The VERIFY_REQUIRED_TOOLS gate, shared by LLM-driven and REST execution.
+
+        Returns a FAILED ToolResult when ``tool_name`` is gated and ``session``
+        is not a verified call session (fail closed, including no session at
+        all); None when the tool may run. VERIFY itself is never gated.
+        """
+        tool_name = (tool_name or "").upper()
+        gated_tools = getattr(self.config, "verify_required_tools_set", None) or set()
+        if tool_name not in gated_tools or tool_name == "VERIFY":
+            return None
+        if getattr(session, "verified", False):
+            return None
+        return ToolResult(
+            status=ToolStatus.FAILED,
+            message=("You'll need to verify your identity first — "
+                     "say 'verify me' to begin."))
+
     async def _execute_tool_inner(self, tool_call) -> ToolResult:
         tool_name = tool_call.name.upper()
         start_time = time.time()
@@ -683,7 +710,20 @@ class ToolManager:
         if error:
             Metrics.record_tool_error(tool_name, "validation_error")
             return ToolResult(status=ToolStatus.FAILED, message=error)
-            
+
+        # --- IDENTITY VERIFICATION GATE ---
+        # Tools named in config.verify_required_tools require a caller who has
+        # passed the VERIFY flow this call. Fail CLOSED: if verification can't be
+        # confirmed, refuse. VERIFY itself is never gated (that would deadlock).
+        blocked = self.verification_block(
+            tool_name, getattr(self.assistant, "session", None))
+        if blocked is not None:
+            Metrics.record_tool_error(tool_name, "verification_required")
+            log_event(logger, logging.INFO,
+                      f"Tool {tool_name} blocked: caller not verified",
+                      event="verify_gate", tool=tool_name, outcome="blocked")
+            return blocked
+
         with create_span(f"tool.{tool_name.lower()}", {
             "tool.name": tool_name,
             "tool.params": str(params_dict)

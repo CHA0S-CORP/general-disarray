@@ -7,3 +7,6 @@
 [submodule "speaches"]
 	path = speaches
 	url = https://github.com/speaches-ai/speaches.git
+[submodule "examples/n8n-nodes"]
+	path = examples/n8n-nodes
+	url = https://github.com/CHA0S-CORP/n8n-nodes.git

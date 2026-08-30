@@ -35,6 +35,9 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      # Blackwell (GB10/sm_121): DeepGemm FP8 MoE asserts ("Unknown SF transformation")
+      # on the 30B-A3B-FP8. Keep this unless you've confirmed the 25.11 image fixed it.
+      - VLLM_USE_DEEP_GEMM=0                     # <-- re-added (was missing)
     ipc: host
     ulimits:
       memlock: -1
@@ -43,17 +46,16 @@ services:
       vllm serve
       ${LLM_MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507-FP8}
       --port 8000
-      --gpu-memory-utilization 0.60
-      --max-model-len 8192
+      --gpu-memory-utilization 0.75
+      --max-model-len 65536
       --trust-remote-code
       --enable-prefix-caching
       --enable-chunked-prefill
-      --max-num-batched-tokens 2048
-      --max-num-seqs 4
+      --kv-cache-dtype fp8
+      --max-num-batched-tokens 8192
+      --max-num-seqs 16
       ${VLLM_TOOL_ARGS---enable-auto-tool-choice --tool-call-parser hermes}
     ports:
-      # Host-side publish is parameterized so the stack can coexist with other
-      # services on the box; in-cluster traffic uses http://vllm:8000 regardless.
       - "${VLLM_PORT:-8000}:8000"
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
@@ -71,7 +73,6 @@ services:
               count: all
               capabilities: [gpu]
     restart: unless-stopped
-
   # ============================================================================
   # Speaches Server - Unified STT (Whisper) + TTS (Piper/Kokoro)
   # OpenAI-compatible API for both transcription and speech synthesis
@@ -176,6 +177,10 @@ services:
       # Location for WEATHER / FORECAST / QUAKES-near (empty disables those tools)
       - WEATHER_LATITUDE=${WEATHER_LATITUDE:-}
       - WEATHER_LONGITUDE=${WEATHER_LONGITUDE:-}
+      # Home address for the system prompt + MAP tool routing origin
+      - AGENT_LOCATION=${AGENT_LOCATION:-}
+      # MAP tool: driving distance/time via OpenStreetMap (needs coordinates above)
+      - ENABLE_MAP_TOOL=${ENABLE_MAP_TOOL:-true}
       # WEB_SEARCH via SearxNG (start it with: docker compose --profile search up -d)
       - SEARXNG_URL=${SEARXNG_URL:-}
       - WEB_SEARCH_MAX_RESULTS=${WEB_SEARCH_MAX_RESULTS:-3}
@@ -188,6 +193,28 @@ services:
       - ENABLE_TRANSFER_TOOL=${ENABLE_TRANSFER_TOOL:-true}
       # DRINK_RECIPE tool (TheCocktailDB lookups)
       - ENABLE_DRINK_TOOL=${ENABLE_DRINK_TOOL:-true}
+      # Optional caller identity verification (VERIFY tool, DTMF PIN/OTP entry).
+      # Off until a global PIN/secret is set or a caller is enrolled via
+      # /verify/credentials. VERIFY_REQUIRED_TOOLS hard-gates the listed tools.
+      - ENABLE_VERIFY_TOOL=${ENABLE_VERIFY_TOOL:-true}
+      - VERIFY_PIN=${VERIFY_PIN:-}
+      - VERIFY_TOTP_SECRET=${VERIFY_TOTP_SECRET:-}
+      # TOTP algorithm params (RFC 6238) — must match the caller's authenticator.
+      - VERIFY_TOTP_DIGITS=${VERIFY_TOTP_DIGITS:-6}
+      - VERIFY_TOTP_PERIOD=${VERIFY_TOTP_PERIOD:-30}
+      - VERIFY_TOTP_ALGORITHM=${VERIFY_TOTP_ALGORITHM:-SHA1}
+      - VERIFY_TOTP_WINDOW=${VERIFY_TOTP_WINDOW:-1}
+      - VERIFY_REQUIRED_TOOLS=${VERIFY_REQUIRED_TOOLS:-}
+      - VERIFY_MAX_ATTEMPTS=${VERIFY_MAX_ATTEMPTS:-3}
+      - VERIFY_DTMF_TIMEOUT_S=${VERIFY_DTMF_TIMEOUT_S:-20.0}
+      - VERIFY_DTMF_INTERDIGIT_S=${VERIFY_DTMF_INTERDIGIT_S:-3.0}
+      - VERIFY_ISSUER=${VERIFY_ISSUER:-General Disarray}
+      # Spoken lines for the outbound "call and verify" flow (POST /verify/call).
+      - VERIFY_CALL_PROMPT=${VERIFY_CALL_PROMPT:-}
+      - VERIFY_CALL_RETRY_PHRASE=${VERIFY_CALL_RETRY_PHRASE:-}
+      - VERIFY_CALL_SUCCESS_PHRASE=${VERIFY_CALL_SUCCESS_PHRASE:-}
+      - VERIFY_CALL_FAIL_PHRASE=${VERIFY_CALL_FAIL_PHRASE:-}
+      - VERIFY_CREDENTIALS_FILE=${VERIFY_CREDENTIALS_FILE:-}
       # Single-line prompt override; multi-line prompts go in data/system_prompt.txt
       - SYSTEM_PROMPT=${SYSTEM_PROMPT:-}
       # Per-turn acknowledgment: chime (earcon, default) | phrase | none
@@ -280,7 +307,7 @@ services:
       - CALL_EVENT_WEBHOOK_URL=${CALL_EVENT_WEBHOOK_URL:-}
       - CALL_EVENTS=${CALL_EVENTS:-call.started,call.ended}
       - CALL_EVENT_INCLUDE_TRANSCRIPT=${CALL_EVENT_INCLUDE_TRANSCRIPT:-true}
-      # Virtual numbers: ephemeral single-use inbound extensions (POST /virtual-numbers)
+      # Virtual numbers: ephemeral single-use inbound extensions + persistent trigger numbers (POST /virtual-numbers)
       - VIRTUAL_NUMBERS_ENABLED=${VIRTUAL_NUMBERS_ENABLED:-false}
       - VIRTUAL_NUMBER_DEFAULT_TTL_S=${VIRTUAL_NUMBER_DEFAULT_TTL_S:-900}
       - VIRTUAL_NUMBER_MAX_TTL_S=${VIRTUAL_NUMBER_MAX_TTL_S:-86400}
@@ -328,7 +355,7 @@ services:
     environment:
       - SEARXNG_BASE_URL=http://searxng:8080/
     ports:
-      - "127.0.0.1:8081:8080"
+      - "127.0.0.1:8082:8080"
     restart: unless-stopped
 
   n8n:
@@ -348,8 +375,8 @@ services:
       - N8N_CUSTOM_EXTENSIONS=/custom-nodes
     volumes:
       - n8n_data:/home/node/.n8n
-      # Custom SIP Agent nodes — built by examples/n8n-nodes-general-disarray/build.sh
-      - ./examples/n8n-nodes-general-disarray/dist:/custom-nodes/n8n-nodes-general-disarray:ro
+      # Custom SIP Agent nodes — from the examples/n8n-nodes submodule (CHA0S-CORP/n8n-nodes); build with examples/n8n-nodes/packages/n8n-nodes-general-disarray/build.sh
+      - ./examples/n8n-nodes/packages/n8n-nodes-general-disarray/dist:/custom-nodes/n8n-nodes-general-disarray:ro
 
 volumes:
   n8n_data:
