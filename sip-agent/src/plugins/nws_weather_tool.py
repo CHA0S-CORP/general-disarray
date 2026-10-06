@@ -14,6 +14,7 @@ LLM: [TOOL:FORECAST:when=week]
 """
 
 import logging
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from plugins.helpers import fetch_json
@@ -48,16 +49,45 @@ async def _fetch_json(url: str, params: Optional[Dict[str, Any]] = None,
                             follow_redirects=True)
 
 
-def _select_period(periods: List[Dict[str, Any]], when: str) -> Dict[str, Any]:
+def _period_date(period: Dict[str, Any]) -> Optional[date]:
+    """Local calendar date of a period's startTime (NWS gives it with the
+    forecast location's UTC offset, e.g. 2026-10-07T06:00:00-06:00)."""
+    try:
+        return datetime.fromisoformat(str(period.get("startTime") or "")).date()
+    except ValueError:
+        return None
+
+
+def _select_tomorrow(periods: List[Dict[str, Any]],
+                     today: Optional[date]) -> Dict[str, Any]:
+    """Tomorrow's DAYTIME period: the first isDaytime period starting on
+    today + 1 (location-local date). Without usable dates, the first daytime
+    period after the current one that isn't today's ("Today"/"This
+    Afternoon") — never "Tonight"."""
+    if today is not None:
+        tomorrow = today + timedelta(days=1)
+        for period in periods:
+            if period.get("isDaytime") and _period_date(period) == tomorrow:
+                return period
+    for period in periods[1:]:
+        name = str(period.get("name") or "").lower()
+        if period.get("isDaytime") and name not in ("today", "this afternoon"):
+            return period
+    return periods[1] if len(periods) > 1 else periods[0]
+
+
+def _select_period(periods: List[Dict[str, Any]], when: str,
+                   today: Optional[date] = None) -> Dict[str, Any]:
     """Pick the period whose name matches `when` (case-insensitive), with a
-    positional fallback: NWS never names a period "Tomorrow", so that falls
-    back to the second period; "today"/"tonight" fall back to the first."""
+    positional fallback: NWS never names a period "Tomorrow", so that picks
+    tomorrow's daytime period (see _select_tomorrow); "today"/"tonight" fall
+    back to the first."""
     target = when.lower()
     for period in periods:
         if str(period.get("name") or "").lower() == target:
             return period
     if target == "tomorrow" and len(periods) > 1:
-        return periods[1]
+        return _select_tomorrow(periods, today)
     return periods[0]
 
 
@@ -139,6 +169,18 @@ class NWSForecastTool(BaseTool):
         self._forecast_url = forecast_url
         self._hourly_url = hourly_url
 
+    def _today(self, periods: List[Dict[str, Any]]) -> Optional[date]:
+        """Today's date at the forecast location: the first period's start
+        date (it begins at the current hour, location-local), else the
+        configured LOCAL_TIMEZONE clock."""
+        first = _period_date(periods[0]) if periods else None
+        if first is not None:
+            return first
+        try:
+            return self.config.local_now().date()
+        except Exception:
+            return None
+
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
         when = str(params.get("when") or "today").strip().lower()
         if when not in _VALID_WHEN:
@@ -168,7 +210,7 @@ class NWSForecastTool(BaseTool):
                 return ToolResult(status=ToolStatus.FAILED, message=_UNAVAILABLE)
             message = " ".join(_period_sentence(p) for p in chosen)
         else:
-            chosen = [_select_period(periods, when)]
+            chosen = [_select_period(periods, when, self._today(periods))]
             message = _period_sentence(chosen[0])
 
         log_event(logger, logging.INFO, f"Forecast ({when}): {message}",

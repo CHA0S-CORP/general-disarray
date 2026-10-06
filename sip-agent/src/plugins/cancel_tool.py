@@ -1,7 +1,7 @@
 """
 Cancel Tool Plugin
 ==================
-Cancel pending timers and callbacks.
+Cancel the current caller's own pending timers and callbacks.
 
 Usage in conversation:
 User: "Cancel my timer"
@@ -33,9 +33,14 @@ class CancelTool(BaseTool):
     }
     
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
-        task_type = params.get('task_type', 'all')
-        
-        cancelled = await self.assistant.tool_manager.cancel_tasks(task_type)
+        task_type = str(params.get('task_type') or 'all').strip().lower()
+        if task_type not in ('timer', 'callback', 'all'):
+            task_type = 'all'
+
+        # Scoped to the current caller's own timers/callbacks: a caller can
+        # never cancel another caller's tasks or REST-scheduled calls.
+        cancelled = await self.assistant.tool_manager.cancel_tasks(
+            task_type, owned_only=True)
         
         if cancelled == 0:
             return ToolResult(

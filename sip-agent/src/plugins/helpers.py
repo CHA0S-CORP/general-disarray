@@ -104,9 +104,12 @@ async def fetch_json(url: str, params: Optional[Dict[str, Any]] = None,
 
 
 def number_to_words(n: int) -> str:
-    """Spell a small integer for speech ('3' -> 'three'); >=100 stays digits."""
+    """Spell a small integer for speech ('3' -> 'three', -5 -> 'minus five');
+    magnitudes >= 100 stay digits."""
     n = int(n)
-    if 0 <= n < 20:
+    if n < 0:
+        return "minus " + number_to_words(-n)
+    if n < 20:
         return _ONES[n]
     if n < 100:
         tens, ones = divmod(n, 10)
@@ -143,3 +146,67 @@ def home_coordinates(config) -> Optional[Tuple[float, float]]:
         return (float(config.weather_latitude), float(config.weather_longitude))
     except (TypeError, ValueError):
         return None
+
+
+# Characters a spoken/typed phone number carries for readability only.
+_DIAL_PUNCTUATION_RE = re.compile(r"[\s\-().]")
+
+
+def normalize_dial_target(target: str) -> str:
+    """Strip readability punctuation (spaces, dashes, dots, parentheses) from a
+    bare number ("(555) 123-4567" -> "5551234567"). SIP URIs are returned
+    stripped of surrounding whitespace only (their dots are significant)."""
+    target = str(target or "").strip()
+    if target.lower().startswith(("sip:", "sips:")) or "@" in target:
+        return target
+    return _DIAL_PUNCTUATION_RE.sub("", target)
+
+
+def _dial_number_part(target: str) -> str:
+    """The number to screen: the user part of a SIP URI, else the target,
+    normalized (punctuation removed) so "+44 20..." can't dodge the deny
+    pattern by formatting."""
+    m = re.match(r"(?i)sips?:([^@;>]+)", target)
+    user = m.group(1) if m else target.split("@", 1)[0]
+    return _DIAL_PUNCTUATION_RE.sub("", user)
+
+
+def check_voice_dial_allowed(target: str, config) -> Optional[str]:
+    """Dial-target policy for VOICE-initiated dialing (CALLBACK to a number
+    other than the caller's own, TRANSFER). Returns an error string, or None
+    when the target may be dialed.
+
+    Layers on top of the REST policy (``api.check_extension_allowed``: raw
+    SIP URIs / pattern) because these targets come from an untrusted caller
+    talking to the LLM — toll-fraud protection:
+
+    - VOICE_DIAL_ALLOW_PATTERN, when set, must fullmatch the number;
+    - VOICE_DIAL_DENY_PATTERN (default: international and premium-rate
+      prefixes) must not match it.
+
+    The number is normalized (spaces/dashes/dots/parens removed; the user
+    part of a SIP URI) before the patterns run. A malformed pattern fails
+    CLOSED.
+    """
+    # Imported lazily: api.py is heavy and imports plugins indirectly.
+    from api import check_extension_allowed
+
+    target = normalize_dial_target(target)
+    error = check_extension_allowed(target, config)
+    if error:
+        return error
+    number = _dial_number_part(target)
+    if not number:
+        return "extension is required"
+
+    allow = getattr(config, "voice_dial_allow_pattern", "") or ""
+    deny = getattr(config, "voice_dial_deny_pattern", "") or ""
+    try:
+        if allow and not re.fullmatch(allow, number):
+            return "number is not in the allowed voice-dial range"
+        if deny and re.match(deny, number):
+            return "number is blocked by the voice-dial policy"
+    except re.error as e:
+        logger.error(f"Invalid VOICE_DIAL_*_PATTERN ({e}) - refusing to dial")
+        return "voice-dial policy is misconfigured"
+    return None

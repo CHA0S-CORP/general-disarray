@@ -75,3 +75,59 @@ async def test_fetch_json_returns_payload(monkeypatch):
 
     monkeypatch.setattr(httpx, "AsyncClient", patched)
     assert await fetch_json("https://example.com/x", params={"q": "1"}) == {"ok": True}
+
+
+def test_number_to_words_negative():
+    # Regression: negatives raised KeyError.
+    assert number_to_words(-5) == "minus five"
+    assert number_to_words(-42) == "minus forty two"
+    assert number_to_words(-250) == "minus 250"
+
+
+# --- voice-dial policy (toll-fraud screen) -----------------------------------
+
+from plugins.helpers import check_voice_dial_allowed, normalize_dial_target  # noqa: E402
+
+
+@pytest.mark.parametrize("target", [
+    "+44 20 7946 0958",      # international
+    "011-44-20-7946-0958",   # US international prefix, with dashes
+    "0044 20 7946 0958",     # 00 international prefix
+    "1-900-555-0100",        # premium rate
+    "(976) 555-0100",        # premium rate, parenthesised
+    "+1 900 555 0100",
+])
+def test_voice_dial_default_deny_pattern(config_factory, target):
+    assert check_voice_dial_allowed(target, config_factory()) is not None
+
+
+@pytest.mark.parametrize("target", ["2001", "555-123-4567", "+1 (555) 123-4567"])
+def test_voice_dial_allows_domestic(config_factory, target):
+    assert check_voice_dial_allowed(target, config_factory()) is None
+
+
+def test_voice_dial_allow_pattern_must_fullmatch(config_factory):
+    cfg = config_factory(voice_dial_allow_pattern=r"2\d{3}")
+    assert check_voice_dial_allowed("2001", cfg) is None
+    assert check_voice_dial_allowed("20012", cfg) is not None
+    assert check_voice_dial_allowed("5551234567", cfg) is not None
+
+
+def test_voice_dial_rejects_raw_sip_uri_by_default(config_factory):
+    assert check_voice_dial_allowed("sip:2001@evil.example", config_factory()) is not None
+
+
+def test_voice_dial_screens_sip_uri_user_part_when_allowed(config_factory):
+    cfg = config_factory(outbound_allow_sip_uri="true")
+    assert check_voice_dial_allowed("sip:2001@pbx", cfg) is None
+    assert check_voice_dial_allowed("sip:+442079460958@pbx", cfg) is not None
+
+
+def test_voice_dial_bad_pattern_fails_closed(config_factory):
+    cfg = config_factory(voice_dial_deny_pattern="(")
+    assert check_voice_dial_allowed("2001", cfg) is not None
+
+
+def test_normalize_dial_target():
+    assert normalize_dial_target(" (555) 123-4567 ") == "5551234567"
+    assert normalize_dial_target("sip:2001@pbx.example.com") == "sip:2001@pbx.example.com"

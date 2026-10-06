@@ -547,3 +547,83 @@ async def test_slow_call_times_out():
     manager = _mgr_with_conn(conn)
     with pytest.raises(MCPTimeoutError):
         await manager.call_tool("srv", "t")
+
+
+# --- _MCPConnection.start(): serialization + per-run ready events ------------
+
+async def test_concurrent_start_is_serialized_and_reuses_live_session():
+    """Two calls finding the session dead at once must not tear down each
+    other's fresh connection: start() is serialized and the second caller
+    reuses the session the first one established."""
+    conn = mcp_tools._MCPConnection(_entry(name="srv"))
+    runs = []
+    session = object()
+
+    async def fake_run(stop_event, ready):
+        runs.append(stop_event)
+        await asyncio.sleep(0.05)
+        conn.session = session
+        ready.set()
+        await stop_event.wait()
+
+    conn._run = fake_run
+    r1, r2 = await asyncio.gather(conn.start(), conn.start())
+    assert r1 is True and r2 is True
+    assert len(runs) == 1
+    assert conn.session is session
+    await conn.stop()
+
+
+async def test_abandoned_run_cannot_signal_a_newer_start(monkeypatch):
+    """Regression: _run's finally set whatever self._ready was at that moment,
+    so an abandoned connection unwinding mid-reconnect woke the NEW start()
+    before its session existed -> spurious 'reconnect failed'."""
+    from contextlib import asynccontextmanager
+
+    first_gate = asyncio.Event()
+    sessions = []
+
+    @asynccontextmanager
+    async def fake_http_client(url):
+        yield (None, None, None)
+
+    class FakeClientSession:
+        def __init__(self, read, write):
+            self.index = len(sessions)
+            sessions.append(self)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def initialize(self):
+            if self.index == 0:
+                await first_gate.wait()          # hangs until released...
+                raise ConnectionError("old connection died")
+            await asyncio.sleep(0.1)             # new one connects slowly
+
+        async def list_tools(self):
+            return SimpleNamespace(tools=[])
+
+    monkeypatch.setattr(mcp_tools, "streamablehttp_client", fake_http_client,
+                        raising=False)
+    monkeypatch.setattr(mcp_tools, "ClientSession", FakeClientSession,
+                        raising=False)
+
+    conn = mcp_tools._MCPConnection(_entry(name="srv"))
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(conn.start(), 0.05)
+    conn.abandon()
+
+    async def release_old_soon():
+        await asyncio.sleep(0.02)
+        first_gate.set()   # old run fails + unwinds while new start() waits
+
+    releaser = asyncio.create_task(release_old_soon())
+    ok = await conn.start()
+    await releaser
+    assert ok is True
+    assert conn.session is sessions[1]
+    await conn.stop()

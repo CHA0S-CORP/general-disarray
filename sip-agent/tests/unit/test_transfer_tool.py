@@ -110,3 +110,22 @@ async def test_self_disables_when_config_flag_off(config_factory):
     assistant, _ = make_assistant(cfg)
     tool = TransferTool(assistant)
     assert tool.enabled is False
+
+
+async def test_international_target_rejected_by_voice_dial_policy(config_factory):
+    """Regression (toll fraud): TRANSFER applies VOICE_DIAL_DENY_PATTERN."""
+    assistant, calls = make_assistant(config_factory())
+    tool = TransferTool(assistant)
+    for target in ("011 44 20 7946 0958", "+44-20-7946-0958", "1-900-555-0100"):
+        result = await tool.execute({"extension": target})
+        assert result.status == ToolStatus.FAILED
+        assert result.message == "I cannot transfer to that number."
+    assert calls == []
+
+
+async def test_transfer_normalizes_spoken_number(config_factory):
+    cfg = config_factory(sip_domain="pbx.example.com")
+    assistant, calls = make_assistant(cfg)
+    result = await TransferTool(assistant).execute({"extension": "555-123-4567"})
+    assert result.status == ToolStatus.SUCCESS
+    assert calls[0][1] == "sip:5551234567@pbx.example.com"

@@ -1,7 +1,7 @@
 """
 Status Tool Plugin
 ==================
-Check status of pending timers and callbacks.
+Check status of the current caller's own pending timers and callbacks.
 
 Usage in conversation:
 User: "Do I have any timers running?"
@@ -24,7 +24,9 @@ class StatusTool(BaseTool):
     parameters = {}  # No parameters needed
     
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
-        pending = self.assistant.tool_manager.get_pending_tasks()
+        # Only the current caller's own timers/callbacks (never other
+        # callers' tasks or REST-scheduled calls).
+        pending = self.assistant.tool_manager.get_owned_pending_tasks()
         
         if not pending:
             return ToolResult(

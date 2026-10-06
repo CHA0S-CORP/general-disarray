@@ -164,3 +164,37 @@ def test_summary_feels_like_and_gusts():
     assert "gusting to 35" in msg
     assert "west" in msg
     assert "quite windy" in msg
+
+
+async def test_stale_observation_is_flagged(config_factory, monkeypatch):
+    """Regression: an hours-old 'latest' observation was spoken as current."""
+    import time
+    from datetime import datetime, timezone
+
+    old = datetime.fromtimestamp(time.time() - 3 * 3600, timezone.utc).isoformat()
+    stale_obs = {"properties": dict(FULL_OBS["properties"], timestamp=old)}
+    install_fake_fetch(monkeypatch, {
+        "api.weather.gov/points/": POINTS_RESPONSE,
+        "/observations/latest": stale_obs,
+        "/stations": STATIONS_RESPONSE,
+    })
+    result = await make_tool(config_factory).execute({})
+    assert result.status == ToolStatus.SUCCESS
+    assert result.message.endswith("That reading is from about three hours ago.")
+    assert result.data["stale"] is True
+
+
+async def test_fresh_observation_not_flagged(config_factory, monkeypatch):
+    import time
+    from datetime import datetime, timezone
+
+    recent = datetime.fromtimestamp(time.time() - 600, timezone.utc).isoformat()
+    obs = {"properties": dict(FULL_OBS["properties"], timestamp=recent)}
+    install_fake_fetch(monkeypatch, {
+        "api.weather.gov/points/": POINTS_RESPONSE,
+        "/observations/latest": obs,
+        "/stations": STATIONS_RESPONSE,
+    })
+    result = await make_tool(config_factory).execute({})
+    assert "reading is from" not in result.message
+    assert result.data["stale"] is False

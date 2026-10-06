@@ -82,3 +82,36 @@ async def test_rejects_huge_exponent(calc):
     result = await calc.execute({"expression": "9**99999"})
     assert result.status == ToolStatus.FAILED
     assert "too large" in result.message.lower()
+
+
+@pytest.mark.parametrize("expression", ["999**1000", "1e308*10", "1e999",
+                                        "(10**300)*(10**300)"])
+async def test_too_large_or_non_finite_results_rejected(calc, expression):
+    """Regression: 999**1000 read out ~3000 digits; inf/overflow surfaced raw
+    errors. Sized before evaluation, spoken as a friendly failure."""
+    result = await calc.execute({"expression": expression})
+    assert result.status == ToolStatus.FAILED
+    assert result.message == "That number is too large for me to work out."
+
+
+async def test_large_result_spoken_in_scientific_notation(calc):
+    result = await calc.execute({"expression": "999**100"})
+    assert result.status == ToolStatus.SUCCESS
+    assert "times ten to the power of 299" in result.message
+    assert result.data["result_str"].endswith("e+299")
+    assert len(result.message) < 120
+
+
+async def test_exact_power_of_ten_not_hedged(calc):
+    result = await calc.execute({"expression": "10**20"})
+    assert result.message.endswith("is 1 times ten to the power of 20")
+
+
+async def test_below_threshold_stays_plain(calc):
+    result = await calc.execute({"expression": "10**15-1"})
+    assert result.message.endswith("is 999999999999999")
+
+
+async def test_complex_result_rejected(calc):
+    result = await calc.execute({"expression": "(-8)**0.5"})
+    assert result.status == ToolStatus.FAILED

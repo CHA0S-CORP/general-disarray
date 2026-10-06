@@ -3,10 +3,10 @@ Transfer Tool Plugin
 ====================
 Blind-transfers the live caller to another extension via SIP REFER.
 
-The target is validated against the same outbound dial policy as the REST
-API (`api.check_extension_allowed`): raw ``sip:`` URIs are only accepted
-when OUTBOUND_ALLOW_SIP_URI is set, and OUTBOUND_EXTENSION_PATTERN can
-restrict extensions further. Bare extensions are expanded to
+The target is validated by ``plugins.helpers.check_voice_dial_allowed``: the
+REST dial policy (`api.check_extension_allowed`: raw ``sip:`` URIs only when
+OUTBOUND_ALLOW_SIP_URI is set, OUTBOUND_EXTENSION_PATTERN) plus the
+VOICE_DIAL_ALLOW_PATTERN / VOICE_DIAL_DENY_PATTERN toll-fraud screen. Bare extensions are expanded to
 ``sip:<extension>@<SIP_DOMAIN>``.
 
 Usage in conversation:
@@ -19,6 +19,7 @@ from typing import Any, Dict
 
 from tool_plugins import BaseTool, ToolResult, ToolStatus
 from logging_utils import log_event
+from plugins.helpers import check_voice_dial_allowed, normalize_dial_target
 
 logger = logging.getLogger(__name__)
 
@@ -50,10 +51,7 @@ class TransferTool(BaseTool):
             logger.info("TRANSFER tool disabled - ENABLE_TRANSFER_TOOL is false")
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
-        # Imported inside execute to avoid an import cycle with api.py.
-        from api import check_extension_allowed
-
-        extension = str(params.get("extension") or "").strip()
+        extension = normalize_dial_target(str(params.get("extension") or ""))
 
         if not self.assistant or not getattr(self.assistant, "current_call", None):
             return ToolResult(
@@ -61,9 +59,11 @@ class TransferTool(BaseTool):
                 message="There is no active call to transfer.",
             )
 
-        # Same dial-target policy as the REST /call endpoint, so the voice
-        # path cannot be talked into routing calls to arbitrary SIP domains.
-        policy_error = check_extension_allowed(extension, self.config)
+        # REST dial-target policy (no arbitrary SIP domains) PLUS the
+        # voice-dial allow/deny patterns: a REFER makes the PBX place a new
+        # outbound leg, so an untrusted caller must not be able to talk the
+        # LLM into bridging them to international / premium-rate numbers.
+        policy_error = check_voice_dial_allowed(extension, self.config)
         if policy_error:
             log_event(logger, logging.WARNING,
                       f"TRANSFER target rejected by policy: {policy_error}",

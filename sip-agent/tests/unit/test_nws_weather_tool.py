@@ -115,12 +115,13 @@ async def test_unknown_period_name_falls_back(monkeypatch, config_factory):
     monkeypatch.setattr(nws_module, "_fetch_json", make_fake_fetch([]))
     tool = make_tool(config_factory)
 
-    # NWS never names a period "Tomorrow" -> falls back to periods[1]
+    # NWS never names a period "Tomorrow" -> tomorrow's DAYTIME period, never
+    # "Tonight" (regression: positional periods[1] was tonight during the day)
     result = await tool.execute({"when": "tomorrow"})
 
     assert result.status == ToolStatus.SUCCESS
-    assert result.message.startswith("Tonight:")
-    assert "41 degrees" in result.message
+    assert result.message.startswith("Wednesday:")
+    assert "70 degrees" in result.message
 
 
 async def test_points_lookup_cached_across_calls(monkeypatch, config_factory):
@@ -184,3 +185,49 @@ def test_period_sentence_formats_speech():
     # Missing temperature still yields a spoken sentence
     assert _period_sentence({"name": "Friday", "shortForecast": "Sunny",
                              "isDaytime": True}) == "Friday: sunny."
+
+
+def _dated(name, start, daytime, temp):
+    return {"name": name, "startTime": start, "isDaytime": daytime,
+            "temperature": temp, "shortForecast": "Clear"}
+
+
+def test_tomorrow_picks_daytime_period_dated_tomorrow():
+    from datetime import date
+    # Fetched during the afternoon: This Afternoon, Tonight, Wednesday, ...
+    periods = [
+        _dated("This Afternoon", "2026-10-06T14:00:00-06:00", True, 62),
+        _dated("Tonight", "2026-10-06T18:00:00-06:00", False, 41),
+        _dated("Wednesday", "2026-10-07T06:00:00-06:00", True, 70),
+        _dated("Wednesday Night", "2026-10-07T18:00:00-06:00", False, 45),
+    ]
+    assert _select_period(periods, "tomorrow", date(2026, 10, 6))["name"] == "Wednesday"
+
+
+def test_tomorrow_after_midnight_skips_overnight_and_today():
+    from datetime import date
+    periods = [
+        _dated("Overnight", "2026-10-07T01:00:00-06:00", False, 40),
+        _dated("Wednesday", "2026-10-07T06:00:00-06:00", True, 70),
+        _dated("Wednesday Night", "2026-10-07T18:00:00-06:00", False, 45),
+        _dated("Thursday", "2026-10-08T06:00:00-06:00", True, 75),
+    ]
+    assert _select_period(periods, "tomorrow", date(2026, 10, 7))["name"] == "Thursday"
+
+
+async def test_execute_tomorrow_uses_period_dates(monkeypatch, config_factory):
+    periods = [
+        _dated("This Afternoon", "2026-10-06T14:00:00-06:00", True, 62),
+        _dated("Tonight", "2026-10-06T18:00:00-06:00", False, 41),
+        _dated("Wednesday", "2026-10-07T06:00:00-06:00", True, 70),
+    ]
+
+    async def fake(url, params=None, headers=None):
+        if "api.weather.gov/points/" in url:
+            return {"properties": {"forecast": FORECAST_URL,
+                                   "forecastHourly": HOURLY_URL}}
+        return {"properties": {"periods": periods}}
+
+    monkeypatch.setattr(nws_module, "_fetch_json", fake)
+    result = await make_tool(config_factory).execute({"when": "tomorrow"})
+    assert result.message.startswith("Wednesday:")
