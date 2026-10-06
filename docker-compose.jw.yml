@@ -1,0 +1,208 @@
+# JasonW NVFP4 W4A16 hybrid on vLLM, ablated. Overlay for the `vllm` service.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.jw.yml up -d vllm
+#
+# ROLLBACK IS DROPPING THE SECOND -f, exactly as with docker-compose.ablate.yml.
+# Nothing in docker-compose.yml or .env is modified by this file, so
+#   docker compose -f docker-compose.yml -f docker-compose.ablate.yml up -d vllm
+# restores the SGLang int4 + NEXTN server this replaces.
+#
+# WHY (measured 2026-08-22, client-timed, isolated on loopback)
+#     SGLang int4 + NEXTN 1/2   33.84 tok/s bs=1   63.40 bs=2   139.74 bs=6
+#     vLLM hybrid               53.31              84.94        165.72
+#     vLLM hybrid + MTP d1      63.97              68.72(*)     178.47
+# Tools 3/3 with thinking on in every arm. (*) the bs=2 MTP figure is a single
+# shot taken while Triton kernels were still JIT-compiling inside the timed
+# window; it is not trusted -- see ling-nvfp4/results/jasonw.
+#
+# The win is attention traffic, which ling-fp4/README.md's roofline identified
+# as ~60% of per-token bytes: at layer 21 the int4 checkpoint spends 126.1 MB on
+# six BF16 projections where this one spends 35.6 MB on NVFP4. It is the only
+# Ling-3.0-flash quant that takes the KDA projections below 8 bits.
+#
+# WHY vLLM AND NOT SGLANG
+# Not a preference. SGLang cannot load this checkpoint: its W4A16_NVFP4 matches
+# "NVFP4" by substring and routes to modelopt_fp4 (W4A4), whose
+# ModelOptFp4LinearMethod.create_weights requires a per-tensor input_scale. The
+# checkpoint is weight-only and ships none -- 63,672 .weight, 61,833
+# .weight_scale, 61,833 .weight_scale_2, and zero input_scale. There is no
+# W4A16-float scheme anywhere in that build to fall back to.
+#
+# ENGINE ATTRIBUTION IS UNMEASURED
+# The V-int4 arm (int4 under vLLM, to separate engine from checkpoint) timed out
+# after 25 minutes -- the cold-load stall ling-vllm/FINDINGS.md records at ~50/50
+# for that checkpoint. So it is not established how much of the gain is vLLM
+# rather than the quantisation. The hybrid loaded cleanly three times running.
+#
+# MEM: gpu-memory-utilization 0.74, NOT the card's 0.80
+# vLLM computes the budget as utilization x TOTAL and then demands that much be
+# FREE at startup. On GB10 the GPU and host share one pool, so imagegen,
+# code-llm-embed, speaches and nvitop-exporter are charged against it -- ~30 GiB.
+# 0.80 x 119.7 = 95.76 GiB does not exist here and the engine hard-fails at init
+# with "Free memory on device cuda:0 (89.49/119.7 GiB) ... is less than desired".
+# 0.74 leaves ~85 GiB: 67 GiB of weights and ~18 GiB of KV, which at MLA's
+# ~7.9 KiB/token is far more than 6 slots x 32k needs. If the co-resident set
+# changes, this number must be re-derived -- it is not a constant.
+#
+# FP8 KV IS OFF. It needs a one-line stage-drop patch to vLLM's Triton MLA
+# decode kernel on sm_121 (MLA Lk=576 at num_stages=2 wants 102,400 B; sm_121
+# exposes 101,376 B) or the engine will not start. The card measures it as
+# costing no decode speed -- it buys KV capacity, which is not the constraint
+# here.
+services:
+  vllm:
+    image: vllm-ling-ablate:local
+
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      # Same contract as docker-compose.ablate.yml. The hook is a runtime
+      # residual-stream projection; no weights are modified, so it applies to
+      # this checkpoint despite the different quantisation.
+      - LING_ABLATE_MODE=${LING_ABLATE_MODE:-ablate}
+      - LING_ABLATE_BASIS=/opt/ling/refusal_basis.npz
+      - LING_ABLATE_LAYERS=${LING_ABLATE_LAYERS:-28:42}
+      - LING_ABLATE_SCALE=${LING_ABLATE_SCALE:-1.0}
+
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+      # No chat_template mount: vLLM uses the template shipped inside the
+      # checkpoint, which is the one the artifact's prompt-injection result was
+      # measured against. Substituting the SGLang-side template would void that.
+      - ~/code-llm/ling-ablate/out/refusal_basis.npz:/opt/ling/refusal_basis.npz:ro
+      # LOGGING FIX MOUNTED OVER THE IMAGE'S COPY -- 2026-08-27, no rebuild.
+      # The baked-in module did logging.getLogger(__name__), which lands outside
+      # vLLM's logging config (that configures "vllm" to INFO with a handler;
+      # everything else inherits root at WARNING). install_ablation_vllm's
+      # confirmation line was therefore dropped on every run this image has ever
+      # served, so "hooks installed" and "LING_ABLATE_MODE=off" were
+      # indistinguishable from the log -- and _resolve() returns SILENTLY when
+      # the mode is off. Verified 2026-08-27: getEffectiveLevel() was WARNING
+      # for "ling_ablate_vllm", INFO for "vllm".
+      #
+      # The host file is the same source the image COPYs at build time and is
+      # byte-identical apart from that one line, so mounting it is a no-op for
+      # behaviour. Rebuilding ling-ablate-vllm:local picks the fix up properly
+      # and this mount can then be dropped -- until then it is what makes the
+      # running server say whether it ablated.
+      #
+      # AFTER A RESTART, EXPECT THIS AT INFO (absence now means a real problem):
+      #   ling_ablate_vllm[target]: mode=ablate layers=28:42 (14 of 42) ...
+      - ~/code-llm/ling-ablate-vllm/ling_ablate_vllm.py:/opt/ling/ling_ablate_vllm.py:ro
+
+    entrypoint: []
+    command:
+      - vllm
+      - serve
+      - JasonW2025/Ling-3.0-flash-HybridQuant-NVFP4-W4A16-LocalHessian
+      - --served-model-name=${LLM_MODEL:-ling-3.0-flash}
+      - --host=0.0.0.0
+      - --port=8000
+      - --tensor-parallel-size=1
+      - --dtype=bfloat16
+      - --trust-remote-code
+      # See the MEM note above before changing this.
+      # RE-DERIVED 2026-08-27, when imagegen came back into the co-resident set
+      # -- exactly the condition the MEM note says forces a re-derivation.
+      # 0.74 x 119.7 = 88.58 GiB reserved, of which the engine actually used
+      # 74.03 (weights + non-torch) + 1.44 (peak activation) + 0.22 (CUDA
+      # graphs), handing the remaining 13.1 to KV. That KV pool measured
+      # 929,206 tokens = 28.36x concurrency at full context, but --max-num-seqs
+      # =6 caps the scheduler at 6 x 32,768 = 196,608 tokens. Over 4x of the
+      # pool was unreachable, so shrinking it costs no real capacity.
+      # 0.68 x 119.7 = 81.40 GiB against a re-derived footprint of 80.19 GiB
+      # (75.69 fixed + 4.50 KV). Lowering utilization is not cosmetic: vLLM
+      # demands utilization x TOTAL be FREE at init, so with imagegen's ~11.5
+      # GiB resident the old 88.58 GiB would no longer exist on this box and
+      # the engine would hard-fail at startup -- the same failure the MEM note
+      # records for 0.80. This value is what makes Ling restartable WHILE
+      # imagegen is up.
+      - --gpu-memory-utilization=0.68
+      # 4.5 GiB = 4,831,838,208 B. At the measured 15,140 B/token (13.1 GiB /
+      # 929,206 tokens) that is ~319,000 tokens, 9.7x concurrency at full 32k
+      # context -- still comfortably above the 6 slots the scheduler can run,
+      # with the surplus left to prefix caching. Frees 8.6 GiB, which is what
+      # buys imagegen (SDXL-Turbo BF16, ~11.5 GiB, full GPU residence, no
+      # offload) its place back in the co-resident set.
+      #
+      # THE FLAG IS --kv-cache-memory-bytes, NOT --kv-cache-memory. vLLM's own
+      # startup hint prints "Replace gpu_memory_utilization config with
+      # `--kv-cache-memory=...`" -- that is the CacheConfig FIELD name, and
+      # passing it as a CLI flag makes the server exit on an unrecognised
+      # argument. Verified against this image:
+      #     docker exec sip-ai-vllm vllm serve --help=CacheConfig
+      #
+      # Per that help text, kv_cache_memory_bytes when set "ignores
+      # gpu_memory_utilization" for SIZING the pool. The 0.68 above is
+      # therefore not redundant: it still governs how much free memory the
+      # engine demands at init, which is what keeps Ling restartable while
+      # imagegen holds its ~11.5 GiB. The two settings do different jobs.
+      #
+      # RE-DERIVED 2026-10-05 for 4 x 128k context instead of 6 x 32k.
+      # 4 x 131,072 = 524,288 tokens x 15,140 B = 7.4 GiB, plus the up-to-14%
+      # padding-layer waste vLLM warns about at startup -> 8.5 GiB =
+      # 9,126,805,504 B. Footprint becomes 75.69 + 8.5 = 84.2 GiB, so
+      # utilization goes 0.68 -> 0.71 (0.71 x 119.7 = 85.0 GiB demanded free
+      # at init). Measured before the change, full stack + imagegen +
+      # open-terminal resident: ~10 GiB MemAvailable; this spends ~4 of it.
+      # To go back: 0.68 / 4831838208 / 32768 / 6.
+      #
+      # RE-DERIVED AGAIN 2026-10-06: 4 x 64k instead of 4 x 128k, to give the
+      # memory back. 128k left only ~4 GiB MemAvailable with the full stack
+      # idle, under the 5.4 GiB low-water the imagegen gate documents during a
+      # render. Fitting the two measured pool sizes (4.5 GiB -> 319,488 tokens,
+      # 8.5 GiB -> 854,456) gives ~2.1 GiB fixed + ~8 KB/token, so 4 x 65,536
+      # = 262,144 tokens needs ~4.1 GiB; 4.5 GiB covers it (~4.9x of 64k) and
+      # the footprint drops back to 80.2 GiB, so utilization returns to 0.68.
+      - --kv-cache-memory-bytes=4831838208
+      - --max-model-len=65536
+      # Was 6 (matching the SGLang server's --max-running-requests=6).
+      - --max-num-seqs=4
+      # PREFIX CACHING, 2026-10-06. This vLLM build supports it for hybrid
+      # (KDA linear-attention + MLA) models but keeps it OPT-IN, so without
+      # this flag the engine logged enable_prefix_caching=False and every
+      # turn re-prefilled the agent's ~2.2K-token prompt+tools prefix from
+      # scratch: measured 1.1-1.3 s to first token, identical prompts
+      # included (0.36 ms/token, linear). Cache granularity is one block --
+      # the attention block was sized to 1920 tokens to match the mamba page
+      # -- so only prefixes >= 1920 tokens can hit; the agent's static prefix
+      # (base prompt + 29 tool schemas, ~2.4K) qualifies. sip-agent sends the
+      # per-turn context (clock, caller...) as a SECOND system message so the
+      # first one stays byte-identical (LLM_SPLIT_SYSTEM_PROMPT).
+      - --enable-prefix-caching
+      # Spec decode clamps the scheduler to max_num_batched_tokens minus the
+      # draft slots, and the OpenAI-server default (2048) made vLLM warn
+      # "max_num_scheduled_tokens is set to 2048 ... suboptimal" -- a 2.2K
+      # prompt took two scheduler steps to prefill. 8192 is the threshold the
+      # warning asks for.
+      - --max-num-batched-tokens=8192
+      - --enable-auto-tool-choice
+      - --tool-call-parser=ling3
+      - --reasoning-parser=ling3
+      # QUOTED: unquoted, YAML parses the {...} as a flow mapping and compose
+      # rejects it with "services.vllm.command.15 must be a string".
+      - '--default-chat-template-kwargs={"enable_thinking": true}'
+      # MTP depth 1: 53.31 -> 63.97 tok/s bs=1, reproducing the artifact card's
+      # 1.21x independently. The draft layer is ablated too (the second anchor in
+      # patch_ablation_hook_vllm.py) -- an ablated target drafted by an
+      # un-ablated MTP head sheds acceptance on exactly the prompts the ablation
+      # exists for, which is the failure ling-ablate/patch_ablation_hook.py
+      # predicted in writing and did not guard against.
+      # MTP OFF, 2026-10-06 -- it blocks the prefix cache for the phone agent.
+      # vLLM's scheduler (_mamba_block_aligned_split) backs the last cacheable
+      # mamba position off by ONE FULL BLOCK whenever an eagle-family drafter
+      # is active, and "mtp" is in that family (SpeculativeConfig.use_eagle).
+      # The block is 2048 tokens here (sized to the KDA state page), so with
+      # MTP on nothing under 4096 tokens is ever cached -- and the agent's
+      # static prefix (base prompt + 29 tool schemas) is ~2.4K. Measured with
+      # MTP on: the agent-shaped prompt hit 0% and stayed at 1.0-1.3 s to first
+      # token; a 7K prompt did hit (2.8 s -> 1.06 s), which is how the backoff
+      # was spotted. Depth 2 was also measured slower than depth 1 on decode
+      # (46 vs 58 tok/s client-timed; second-position acceptance ~0.35).
+      # For a phone reply of ~30 tokens MTP depth 1 is worth ~0.1 s; the cache
+      # is worth ~0.75 s per LLM call (twice on a tool turn). Open WebUI loses
+      # the 1.21x decode of MTP depth 1 (53 -> 64 tok/s) as the price.
+      # To get both back: drop block size under 1024 (e.g. a bf16 SSM cache
+      # halves the page, untested here) or restore the line below and accept
+      # no caching for the agent:
+      # - '--speculative-config={"method":"mtp","num_speculative_tokens":1}'
