@@ -14,8 +14,10 @@ _MD_LINK = re.compile(r'\[([^\]]+)\]\([^)]*\)')             # [text](url) -> tex
 _CODE = re.compile(r'`{1,3}([^`]*)`{1,3}')                  # `code` -> code
 _HEADER = re.compile(r'^\s{0,3}#{1,6}\s+', re.MULTILINE)    # "# Title" -> "Title"
 _BULLET = re.compile(r'^\s*(?:[-*+]|\d+[.)])\s+', re.MULTILINE)
-_BOLD_IT = re.compile(r'(\*{1,3})(?=\S)(.+?)(?<=\S)\1')     # paired * only
-_UNDERLINE = re.compile(r'(_{2,3})(?=\S)(.+?)(?<=\S)\1')    # __bold__ only
+# Paired * only, and only at word edges: "2*3*4 is 24" must keep its
+# operators (an inner "*3*" is arithmetic, not emphasis).
+_BOLD_IT = re.compile(r'(?<![\w*])(\*{1,3})(?=\S)(.+?)(?<=\S)\1(?![\w*])')
+_UNDERLINE = re.compile(r'(?<![\w])(_{2,3})(?=\S)(.+?)(?<=\S)\1(?!\w)')  # __bold__ only
 _URL = re.compile(r'(?:https?://|www\.)\S+')
 _EMOJI = re.compile(
     '[\U0001F000-\U0001FAFF\U00002600-\U000027BF'

@@ -11,6 +11,7 @@ pytestmark = pytest.mark.unit
     ("**bold** and *italic*", "bold and italic"),
     ("__x__ and ___y___", "x and y"),
     ("***both***", "both"),
+    ("(*aside*) and **5** items, **done**.", "(aside) and 5 items, done."),
     # Headers and bullets flow into prose
     ("# Header\nbody", "Header body"),
     ("Here you go:\n- apples\n- pears\n1. figs", "Here you go: apples pears figs"),
@@ -35,6 +36,9 @@ def test_sanitize(raw, expected):
 
 @pytest.mark.parametrize("text", [
     "2*3 equals 6",
+    # Inner "*3*" is arithmetic, not emphasis (regression: was "234 is 24")
+    "2*3*4 is 24",
+    "a*b*c and x**2**3",
     "3 * 4",
     "snake_case_name stays",
     "3.5 seconds",

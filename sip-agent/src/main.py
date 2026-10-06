@@ -11,6 +11,7 @@ This container is lightweight - just orchestration.
 
 import json
 import os
+import re
 import time
 import random
 import signal
@@ -39,7 +40,7 @@ from config import Config, get_config
 from llm_engine import create_llm_engine
 from sentence_stream import split_into_sentences  # noqa: F401 (re-export; also used below)
 from audio_pipeline import LowLatencyAudioPipeline
-from logging_utils import log_event, HANGUP_DELAY_SECONDS
+from logging_utils import log_event, HANGUP_DELAY_SECONDS, WAV_HEADER_SIZE
 from speech_text import is_farewell
 
 # How often to poll the playlist player while waiting for enqueued playback
@@ -49,6 +50,42 @@ from speech_text import is_farewell
 # until the player runs dry; a slightly stale poll is fine, so this is a
 # module constant, not deployment configuration.
 PLAYBACK_DRAIN_POLL_S = 0.1
+
+
+# Appended to an interrupted reply in the TRANSCRIPT (API/admin feed) so a
+# reader can tell it was cut off. It must never reach the LLM history or TTS:
+# a live call on 2026-10-06 showed Ling copying "[interrupted by caller]" from
+# earlier assistant turns into its own replies after a few barge-ins, and the
+# agent then spoke the bracket text aloud.
+INTERRUPTED_MARKER = " [interrupted by caller]"
+_MARKER_RE = re.compile(r"\s*\[interrupted by caller\]", re.IGNORECASE)
+
+
+def scrub_markers(text: str) -> str:
+    """Strip any history/transcript annotation the model may have echoed."""
+    if not text or "[" not in text:
+        return text
+    return _MARKER_RE.sub("", text).strip()
+
+
+class OutboundCallFailed(Exception):
+    """An outbound call was never established (dial failure, busy/declined,
+    or not answered within the ring timeout). Raised so the scheduler's
+    retry loops (ToolManager._execute_callback / _execute_scheduled_call)
+    retry it instead of logging a callback that never connected as done."""
+
+
+def _reraise_if_cancelling() -> None:
+    """Call from an ``except asyncio.CancelledError`` that awaited ANOTHER
+    task: re-raise when the current task itself has a cancellation pending,
+    so absorbing the awaited task's cancellation never swallows ours."""
+    current = asyncio.current_task()
+    if current is not None and current.cancelling():
+        raise asyncio.CancelledError()
+
+
+# Minimum seconds between WARNING-level audio-read error logs per session.
+AUDIO_ERROR_LOG_INTERVAL_S = 10.0
 
 
 class _SpeechRun:
@@ -197,6 +234,14 @@ class SIPAIAssistant:
         # registry mutation only.
         self.sessions: Dict[str, CallSession] = {}
         self._call_lock = asyncio.Lock()
+        # Set by drain_active_call(): shutdown has begun, so _on_call_received
+        # must not admit new calls into a stack that is about to stop.
+        self._draining = False
+
+        # Any tool executing inside a turn makes that turn unsafe to cancel-
+        # merge (the merged re-dispatch would run the tool again), so every
+        # engine path's ToolManager.execute_tool disarms speculation first.
+        self._install_tool_execution_hook()
 
         # Per-call conversation transcripts (bounded memory + data/transcripts).
         self.transcripts = TranscriptStore(config)
@@ -233,6 +278,32 @@ class SIPAIAssistant:
         # Softer periodic tick played while a slow LLM turn is in flight.
         self._thinking_pcm: bytes = generate_thinking_tick(
             sample_rate=config.sample_rate, volume=config.chime_volume)
+
+    def _install_tool_execution_hook(self) -> None:
+        """Wrap ToolManager.execute_tool (on this instance) so a tool running
+        in a turn disarms that turn's speculative cancel-merge.
+
+        Every engine path — marker tools, native rounds, the LangGraph agent
+        — executes through tool_manager.execute_tool inside the turn task, so
+        the bound session is the turn's own. Tools may run before any audio
+        is enqueued (native rounds, a marker-only reply); without this a
+        cancel-merge would re-dispatch the utterance and re-run them.
+        """
+        original = self.tool_manager.execute_tool
+
+        async def execute_tool(tool_call):
+            self._disarm_speculation()
+            return await original(tool_call)
+
+        self.tool_manager.execute_tool = execute_tool
+
+    def _disarm_speculation(self, session: Optional[CallSession] = None) -> None:
+        """The in-flight turn is no longer side-effect-free (it played audio
+        or ran a tool): later caller speech must be a barge-in or a pending
+        transcript, never a speculative cancel-merge."""
+        session = session or self.session
+        if session is not None:
+            session.speculative_turn_text = None
 
     @property
     def session(self) -> Optional[CallSession]:
@@ -363,7 +434,9 @@ class SIPAIAssistant:
             try:
                 await session.audio_loop_task
             except asyncio.CancelledError:
-                pass
+                # The loop's own (expected) cancellation is absorbed; OUR
+                # cancellation must keep propagating.
+                _reraise_if_cancelling()
         await self._cancel_turn(session)
         # Close this session's realtime STT connection, if any (idempotent;
         # no-op in batch mode).
@@ -542,7 +615,11 @@ class SIPAIAssistant:
         call): the in-flight response turn may finish (``turn_timeout``), a
         goodbye is spoken so the caller isn't cut off mid-sentence, then the
         call hangs up cleanly. No-op when idle.
+
+        Sets the draining flag first: from here on _on_call_received refuses
+        new calls, so nothing is admitted into a stack that is shutting down.
         """
+        self._draining = True
         sessions = [
             s for s in self.sessions.values()
             if s.call_info and getattr(s.call_info, 'is_active', False)]
@@ -660,20 +737,60 @@ class SIPAIAssistant:
         """Get a random follow-up phrase."""
         return random.choice(self.followup_phrases)
         
+    @staticmethod
+    def _session_is_dead(session: CallSession) -> bool:
+        """True when a registered session's SIP call has already ended (its
+        audio loop just hasn't noticed and detached it yet)."""
+        info = session.call_info
+        return (not getattr(info, 'is_active', False)
+                or bool(getattr(info, 'ended', False)))
+
     async def _on_call_received(self, call_info):
         """Handle incoming call."""
         try:
             remote_uri = getattr(call_info, 'remote_uri', 'unknown')
+
+            if self._draining:
+                # Shutdown drain in progress: PJSIP already auto-answered,
+                # so end the leg rather than leave the caller in dead air.
+                log_event(logger, logging.WARNING,
+                          f"Rejecting call from {remote_uri}: shutting down",
+                          event="call_rejected_draining", caller=remote_uri)
+                Metrics.record_call_failed("inbound", "draining")
+                try:
+                    await self.sip_handler.hangup_call(call_info)
+                except Exception as e:
+                    logger.warning(f"Hangup of rejected call failed: {e}")
+                return
+
             log_event(logger, logging.INFO, f"Call received from: {remote_uri}",
                      event="call_start", caller=remote_uri, direction="inbound")
 
             # Record call started metric
             Metrics.record_call_started("inbound")
 
+            # Live SIP legs evicted to make room; hung up once the lock is
+            # released (the hangup round-trips through the PJSIP thread).
+            evicted_live: List[Any] = []
+            virtual_number = None
+
             # The lock guards registry mutation only (greeting playback and
             # the audio loop run outside it, so a second call can be admitted
             # while the first is still greeting).
             async with self._call_lock:
+                # Sweep sessions whose SIP call already ended first. PJSIP
+                # drops a hung-up call from active_calls immediately, but its
+                # session stays registered until its audio loop notices
+                # (>=50ms poll); in that window _busy() (which counts PJSIP-
+                # alive calls) can admit a new INVITE — possibly on the SAME
+                # pjsua call slot (call_id is the slot index, reused). The
+                # lingering dead session must neither count against capacity
+                # (so a live call is never evicted in its place) nor make the
+                # new call look like a duplicate (it would be left silent).
+                for dead in [s for s in self.sessions.values()
+                             if self._session_is_dead(s)]:
+                    await self._teardown_session(dead)
+
                 # Duplicate-INVITE suppression keys on the SIP call id: a
                 # second REAL call while another is live is a new session,
                 # not a duplicate.
@@ -684,30 +801,20 @@ class SIPAIAssistant:
                         "ignoring duplicate callback")
                     return
 
-                # Capacity: at the cap, evict a session. Prefer one whose SIP
-                # call has already ended — PJSIP drops a hung-up call from
-                # active_calls immediately, but its session stays registered
-                # until its audio loop notices (>=50ms poll), and in that
-                # window _busy() (which counts PJSIP-alive calls) can admit a
-                # new INVITE. Blindly evicting the oldest registry entry here
-                # would tear down a LIVE call while the dead session lingered.
-                # Only when every registered session is still live fall back
-                # to replacing the oldest (the pre-existing
-                # SIP_BUSY_REJECT=false replace-the-call semantics; with the
-                # busy gate on this is only reachable in a tight INVITE race).
-                while len(self.sessions) >= max(
-                        1, self.config.max_concurrent_calls):
-                    victim = next(
-                        (s for s in self.sessions.values()
-                         if not getattr(s.call_info, 'is_active', False)),
-                        None)
-                    if victim is None:
-                        victim = next(iter(self.sessions.values()))
+                # Capacity: every remaining session is live. At the cap,
+                # replace the oldest (the pre-existing SIP_BUSY_REJECT=false
+                # replace-the-call semantics; with the busy gate on this is
+                # only reachable in a tight INVITE race) — exactly as many as
+                # needed to admit this one call.
+                cap = max(1, self.config.max_concurrent_calls)
+                while len(self.sessions) >= cap:
+                    victim = next(iter(self.sessions.values()))
                     await self._teardown_session(victim)
+                    if not self._session_is_dead(victim):
+                        evicted_live.append(victim.call_info)
 
                 # Match the dialed extension against the virtual-number
                 # registry (the PJSIP thread only captured the URI string).
-                virtual_number = None
                 dialed = extension_from_uri(getattr(call_info, 'local_uri', '') or '')
                 if dialed:
                     virtual_number = self.virtual_numbers.claim(dialed)
@@ -718,8 +825,20 @@ class SIPAIAssistant:
                                  number=virtual_number.number,
                                  virtual_number_id=virtual_number.id)
 
-                session = self._begin_session(call_info, "inbound", remote_uri,
-                                              virtual_number=virtual_number)
+                try:
+                    session = self._begin_session(
+                        call_info, "inbound", remote_uri,
+                        virtual_number=virtual_number)
+                except BaseException:
+                    # The call never started: un-claim the number, or a
+                    # single-use entry stays claimed (unusable) forever, and
+                    # drop any half-registered session for this call.
+                    if virtual_number is not None:
+                        self.virtual_numbers.release(virtual_number.id)
+                    for key, existing in list(self.sessions.items()):
+                        if existing.call_info is call_info:
+                            del self.sessions[key]
+                    raise
                 if virtual_number and virtual_number.wants("answered"):
                     # Trigger-number hook: kick the workflow off the moment
                     # the call is matched, before the greeting plays.
@@ -727,21 +846,46 @@ class SIPAIAssistant:
                         virtual_number, status="answered",
                         extra=self._virtual_number_call_fields(session))
 
-            # Everything below acts on behalf of the new call: bind it so
-            # greeting playback (and anything else reaching self.session /
-            # current_call) resolves this session even with other calls live.
-            set_current_session(session)
+            # An evicted session's SIP leg is still up: hang it up, or that
+            # caller sits in dead air and the pjsua call slot leaks.
+            for evicted in evicted_live:
+                log_event(logger, logging.WARNING,
+                          "Hanging up call evicted to admit a new call",
+                          event="call_evicted",
+                          call_id=getattr(evicted, 'call_id', ''))
+                try:
+                    await self.sip_handler.hangup_call(evicted)
+                except Exception as e:
+                    logger.warning(f"Hangup of evicted call failed: {e}")
 
-            # Per-session realtime STT connection (no-op in batch mode).
-            await self.audio_pipeline.start_session_stt(session.audio_state)
+            try:
+                # Everything below acts on behalf of the new call: bind it so
+                # greeting playback (and anything else reaching self.session /
+                # current_call) resolves this session even with other calls
+                # live.
+                set_current_session(session)
 
-            # Play greeting
-            await self._play_greeting(session)
+                # Per-session realtime STT connection (no-op in batch mode).
+                await self.audio_pipeline.start_session_stt(session.audio_state)
 
-            # Start listening (single task per session)
-            logger.info("Listening...")
-            session.audio_loop_task = asyncio.create_task(
-                self._audio_processing_loop(session))
+                # Play greeting
+                await self._play_greeting(session)
+
+                # Start listening (single task per session)
+                logger.info("Listening...")
+                session.audio_loop_task = asyncio.create_task(
+                    self._audio_processing_loop(session))
+            except Exception:
+                # No audio loop will ever run for this session (nothing would
+                # detach it): tear it down and end the leg instead of leaving
+                # a silent call holding a registry slot.
+                async with self._call_lock:
+                    await self._teardown_session(session)
+                try:
+                    await self.sip_handler.hangup_call(call_info)
+                except Exception as e:
+                    logger.warning(f"Hangup after failed call setup failed: {e}")
+                raise
         except Exception as e:
             logger.error(f"Error handling call: {e}", exc_info=True)
         
@@ -774,6 +918,9 @@ class SIPAIAssistant:
 
         audio_received_count = 0
         last_log_time = time.time()
+        # Rate limit for audio-read error warnings (see the except below).
+        last_audio_error_log = float("-inf")
+        audio_errors_suppressed = 0
         # Speech (ms) heard while the assistant is speaking; a barge-in only
         # triggers once this reaches barge_in_min_duration_ms, so clicks/pops/
         # short noise bursts can't cancel an in-flight turn.
@@ -928,7 +1075,17 @@ class SIPAIAssistant:
                                 self._dispatch_turn(session, transcription)
 
                 except Exception as e:
-                    logger.debug(f"Audio read error: {e}")
+                    # Surface persistent failures (a broken STT/VAD path makes
+                    # the call deaf) without flooding the log at ~50 reads/s.
+                    now = time.monotonic()
+                    audio_errors_suppressed += 1
+                    if now - last_audio_error_log >= AUDIO_ERROR_LOG_INTERVAL_S:
+                        logger.warning(
+                            f"Audio read error: {e}"
+                            + (f" ({audio_errors_suppressed - 1} more since last report)"
+                               if audio_errors_suppressed > 1 else ""))
+                        last_audio_error_log = now
+                        audio_errors_suppressed = 0
 
                 # Back off only when there was nothing to read — receive_audio()
                 # has already slept out its timeout on every empty path. With
@@ -953,8 +1110,11 @@ class SIPAIAssistant:
         # concurrent calls allowed, nothing else replaces it): remove exactly
         # this session's entry. Idempotent — a forced teardown, or the
         # outbound caller's finally block, may already have detached it.
-        async with self._call_lock:
-            self._detach_session(session)
+        # Deliberately NOT under _call_lock: the detach is synchronous (atomic
+        # on the event loop), and the lock holder may be _on_call_received
+        # waiting in _teardown_session for THIS task to finish — taking the
+        # lock here would deadlock every later call.
+        self._detach_session(session)
 
         # Close this session's realtime STT connection (idempotent; no-op in
         # batch mode).
@@ -1016,7 +1176,12 @@ class SIPAIAssistant:
             try:
                 await task
             except asyncio.CancelledError:
-                pass
+                # Absorb only the turn's cancellation. When the CALLING task
+                # is itself being cancelled (e.g. _teardown_session cancelling
+                # the audio loop at its tail, or mid barge-in/cancel-merge),
+                # swallowing it would let the loop tail run on into
+                # `_call_lock` while the canceller holds it: deadlock.
+                _reraise_if_cancelling()
         session.turn_task = None
         # Drop any held transcript: after a barge-in the caller is redirecting
         # the conversation, and after call end there is no one to answer.
@@ -1163,6 +1328,8 @@ class SIPAIAssistant:
             first_audio_ms: Optional[float] = None
             try:
                 async for event in stream:
+                    if event["type"] == "sentence":
+                        event = dict(event, text=scrub_markers(event["text"]))
                     if event["type"] == "sentence" and event["text"].strip():
                         if not got_first_sentence:
                             got_first_sentence = True
@@ -1187,7 +1354,7 @@ class SIPAIAssistant:
                             session.speculative_turn_text = None
                         tts_complete = tts_complete and ok
                     elif event["type"] == "final":
-                        final_text = event["text"]
+                        final_text = scrub_markers(event["text"])
                 ticker.cancel()  # no-sentence safety (empty final)
                 # Keep the turn alive (and cancellable) until the queued
                 # audio has actually played out; without this, a barge-in
@@ -1373,8 +1540,8 @@ class SIPAIAssistant:
         try:
             history_slice, call_context = await self._build_llm_turn_inputs(
                 session, user_input)
-            return await self.llm_engine.generate_response(
-                history_slice, call_context)
+            return scrub_markers(await self.llm_engine.generate_response(
+                history_slice, call_context))
         except Exception as e:
             logger.error(f"LLM error: {e}")
             return self.get_random_error()
@@ -1418,6 +1585,9 @@ class SIPAIAssistant:
             cached = self.audio_pipeline.get_cached_audio(text)
             if cached:
                 await self._play_audio(cached, tag=self._allocate_tag(ledger, text))
+                # Spoken words were enqueued (phrase ack, farewell, error
+                # phrase): the turn is audible, so no cancel-merge.
+                self._disarm_speculation()
                 return True
 
             sentences = (split_into_sentences(text)
@@ -1445,6 +1615,7 @@ class SIPAIAssistant:
         cached = self.audio_pipeline.get_cached_audio(text)
         if cached:
             await self._play_audio(cached, tag=self._allocate_tag(ledger, text))
+            self._disarm_speculation()
             return True
 
         start = time.time()
@@ -1454,6 +1625,9 @@ class SIPAIAssistant:
         if audio:
             logger.info(f"TTS: {elapsed:.0f}ms for {len(text)} chars")
             await self._play_audio(audio, tag=self._allocate_tag(ledger, text))
+            # Spoken content is enqueued for the bound session (earcons go
+            # straight through _play_audio and do not disarm).
+            self._disarm_speculation()
             return True
         logger.warning("TTS returned no audio")
         return False
@@ -1501,10 +1675,12 @@ class SIPAIAssistant:
         spoken = self._reconstruct_spoken(session, ledger)
         if not spoken:
             return
-        truncated = spoken + " [interrupted by caller]"
+        truncated = spoken + INTERRUPTED_MARKER
+        # The LLM sees exactly what was heard, unannotated (see
+        # INTERRUPTED_MARKER); the marker is for the transcript readers.
         session.conversation_history.append({
             "role": "assistant",
-            "content": truncated
+            "content": spoken
         })
         self.transcripts.add_turn(session.transcript_id, "assistant", truncated)
         self._publish_admin_event("assistant_turn", {"text": truncated}, session)
@@ -1625,126 +1801,144 @@ class SIPAIAssistant:
         logger.info(f"Making outbound call to {uri} (from: {original_uri})")
         try:
             call_info = await self.sip_handler.make_call(uri)
-            if call_info:
-                # Wait for call to connect (configurable ring timeout)
-                ring_timeout = self.config.callback_ring_timeout_s
-                start_time = asyncio.get_event_loop().time()
-                
-                # Poll for call to be answered
-                while asyncio.get_event_loop().time() - start_time < ring_timeout:
-                    if getattr(call_info, 'is_active', False):
-                        break
-                    await asyncio.sleep(0.5)
-                else:
-                    # Timed out waiting for answer
-                    log_event(logger, logging.WARNING, f"Call to {uri} not answered",
-                             event="call_timeout", uri=uri, timeout=ring_timeout)
-                    Metrics.record_call_failed("outbound", "timeout")
-                    await self.sip_handler.hangup_call(call_info)
-                    return
-                
-                log_event(logger, logging.INFO, f"Outbound call connected to {uri}",
-                         event="call_start", caller=uri, direction="outbound")
-                
-                # Record call started metric
-                Metrics.record_call_started("outbound")
-                outbound_call_start_time = time.time()
-                
-                # Small delay after answer for audio to stabilize
-                await asyncio.sleep(1)
-                
-                # Play the callback message
-                audio = await self.audio_pipeline.synthesize(message)
-                if audio:
-                    await self.sip_handler.send_audio(call_info, audio)
-                    # Wait for audio to play (estimate based on audio length)
-                    audio_duration = len(audio) / (self.config.sample_rate * 2)
-                    await asyncio.sleep(audio_duration + 0.5)
+            if not call_info:
+                Metrics.record_call_failed("outbound", "dial_failed")
+                # Raise so the scheduler's retry loop (tool_manager) retries.
+                raise OutboundCallFailed(f"Failed to place outbound call to {uri}")
 
-                # Now start interactive session
-                try:
-                    # The lock guards registry mutation only: this call ADDS
-                    # a session — existing sessions (an inbound call in
-                    # progress) are no longer torn down.
-                    async with self._call_lock:
-                        logger.info(f"Starting interactive session with: {uri}")
-                        session = self._begin_session(call_info, "outbound", uri)
+            # Wait for call to connect (configurable ring timeout)
+            ring_timeout = self.config.callback_ring_timeout_s
+            start_time = asyncio.get_event_loop().time()
 
-                    # Everything below acts on behalf of the new call (the
-                    # followup TTS and the audio loop resolve the session
-                    # through the contextvar).
-                    set_current_session(session)
-
-                    self.transcripts.add_turn(session.transcript_id, "assistant", message)
-                    self._publish_admin_event(
-                        "assistant_turn", {"text": message}, session)
-
-                    # Per-session realtime STT (no-op in batch mode).
-                    await self.audio_pipeline.start_session_stt(
-                        session.audio_state)
-
-                    # Ask if they need anything else
-                    followup = self.get_random_followup()
-                    log_event(logger, logging.INFO, f"Assistant: {followup}",
-                             event="assistant_response", text=followup)
-                    await self._speak(followup)
-
-                    # Start listening loop (runs until call ends)
-                    logger.info("Listening...")
-                    session.audio_loop_task = asyncio.create_task(
-                        self._audio_processing_loop(session))
-
-                    # Wait for the audio loop to complete (call ends)
-                    await session.audio_loop_task
-
-                except asyncio.CancelledError:
-                    logger.info("Outbound call session cancelled")
-                except Exception as e:
-                    logger.error(f"Error in interactive session: {e}", exc_info=True)
-                finally:
-                    # Clean up when session ends
-                    if call_info.is_active:
-                        await self.sip_handler.hangup_call(call_info)
-                    # Only detach THIS session's registry entry (identity
-                    # match), so we don't clobber an inbound call that
-                    # arrived meanwhile and replaced it.
-                    async with self._call_lock:
-                        self._detach_session(session)
-                    
-                logger.info(f"Outbound call to {uri} completed")
-                
-                # Record call end metrics
-                if 'outbound_call_start_time' in locals():
-                    duration_ms = (time.time() - outbound_call_start_time) * 1000
-                    Metrics.record_call_duration(duration_ms, "outbound")
-                    Metrics.record_call_ended("outbound", "completed")
+            # Poll for call to be answered
+            while asyncio.get_event_loop().time() - start_time < ring_timeout:
+                if getattr(call_info, 'is_active', False):
+                    break
+                if getattr(call_info, 'ended', False):
+                    # Busy / declined / unreachable: the call is over, no
+                    # point waiting out the ring timeout.
+                    status = getattr(call_info, 'last_status_code', 0)
+                    log_event(logger, logging.WARNING,
+                              f"Call to {uri} ended before answer (SIP {status})",
+                              event="call_not_answered", uri=uri,
+                              status_code=status)
+                    Metrics.record_call_failed("outbound", f"sip_{status}")
+                    raise OutboundCallFailed(
+                        f"Call to {uri} ended before answer (SIP {status})")
+                await asyncio.sleep(0.5)
             else:
-                logger.error(f"Failed to connect outbound call to {uri}")
+                # Timed out waiting for answer
+                log_event(logger, logging.WARNING, f"Call to {uri} not answered",
+                         event="call_timeout", uri=uri, timeout=ring_timeout)
+                Metrics.record_call_failed("outbound", "timeout")
+                await self.sip_handler.hangup_call(call_info)
+                raise OutboundCallFailed(
+                    f"Call to {uri} not answered within {ring_timeout}s")
+
+            log_event(logger, logging.INFO, f"Outbound call connected to {uri}",
+                     event="call_start", caller=uri, direction="outbound")
+
+            # Record call started metric
+            Metrics.record_call_started("outbound")
+            outbound_call_start_time = time.time()
+
+            # Small delay after answer for audio to stabilize
+            await asyncio.sleep(1)
+
+            # Play the callback message
+            audio = await self.audio_pipeline.synthesize(message)
+            if audio:
+                await self.sip_handler.send_audio(call_info, audio)
+                # Wait for audio to play (estimate based on audio length)
+                audio_duration = len(audio) / (self.config.sample_rate * 2)
+                await asyncio.sleep(audio_duration + 0.5)
+
+            # Now start interactive session. Pre-bound so the finally can't
+            # hit an UnboundLocalError (masking the real error) when
+            # _begin_session itself raises.
+            session: Optional[CallSession] = None
+            try:
+                # The lock guards registry mutation only: this call ADDS
+                # a session — existing sessions (an inbound call in
+                # progress) are no longer torn down.
+                async with self._call_lock:
+                    logger.info(f"Starting interactive session with: {uri}")
+                    session = self._begin_session(call_info, "outbound", uri)
+
+                # Everything below acts on behalf of the new call (the
+                # followup TTS and the audio loop resolve the session
+                # through the contextvar).
+                set_current_session(session)
+
+                self.transcripts.add_turn(session.transcript_id, "assistant", message)
+                self._publish_admin_event(
+                    "assistant_turn", {"text": message}, session)
+
+                # Per-session realtime STT (no-op in batch mode).
+                await self.audio_pipeline.start_session_stt(
+                    session.audio_state)
+
+                # Ask if they need anything else
+                followup = self.get_random_followup()
+                log_event(logger, logging.INFO, f"Assistant: {followup}",
+                         event="assistant_response", text=followup)
+                await self._speak(followup)
+
+                # The callee has been talking over the message ("Hello? Who
+                # is this?") into the recording since answer; the reader
+                # would resume from the WAV header and replay that backlog as
+                # a stale late turn / false barge-in. Start from "now".
+                self._skip_recording_backlog(call_info)
+
+                # Start listening loop (runs until call ends)
+                logger.info("Listening...")
+                session.audio_loop_task = asyncio.create_task(
+                    self._audio_processing_loop(session))
+
+                # Wait for the audio loop to complete (call ends)
+                await session.audio_loop_task
+
+            except asyncio.CancelledError:
+                logger.info("Outbound call session cancelled")
+                # Our own cancellation (shutdown) must propagate; only the
+                # audio loop's (session torn down) is absorbed here.
+                _reraise_if_cancelling()
+            except Exception as e:
+                logger.error(f"Error in interactive session: {e}", exc_info=True)
+            finally:
+                # Clean up when session ends
+                if call_info.is_active:
+                    await self.sip_handler.hangup_call(call_info)
+                # Only detach THIS session's registry entry (identity
+                # match), so we don't clobber an inbound call that
+                # arrived meanwhile and replaced it. Synchronous, so no
+                # lock needed (see the audio-loop tail).
+                if session is not None:
+                    self._detach_session(session)
+
+            logger.info(f"Outbound call to {uri} completed")
+
+            # Record call end metrics
+            duration_ms = (time.time() - outbound_call_start_time) * 1000
+            Metrics.record_call_duration(duration_ms, "outbound")
+            Metrics.record_call_ended("outbound", "completed")
         except Exception as e:
             logger.error(f"Outbound call failed: {e}")
             raise
-        
-    async def schedule_callback(self, delay: int, message: str = "This is your scheduled callback.", destination: str = None):
-        """Schedule a callback to the caller."""
-        if destination == "CALLER_NUMBER" or destination is None:
-            # Get caller's number from current call
-            if self.current_call:
-                destination = getattr(self.current_call, 'remote_uri', None)
-                
-        if not destination:
-            logger.warning("No destination for callback")
+
+    @staticmethod
+    def _skip_recording_backlog(call_info) -> None:
+        """Advance the recording read position to the current end of file,
+        discarding audio captured before the listener starts."""
+        record_file = getattr(call_info, 'record_file', None)
+        if not record_file:
             return
-            
-        log_event(logger, logging.INFO, f"Callback scheduled: {delay}s to {destination}",
-                 event="callback_scheduled", delay=delay, destination=destination, message=message)
-        
-        # Use tool_manager's scheduler for proper task management
-        await self.tool_manager.schedule_task(
-            task_type="callback",
-            delay_seconds=delay,
-            message=message,
-            target_uri=destination
-        )
+        try:
+            if os.path.exists(record_file):
+                call_info.record_file_pos = max(
+                    os.path.getsize(record_file), WAV_HEADER_SIZE)
+        except OSError as e:
+            logger.debug(f"Could not skip recording backlog: {e}")
 
 
 def _api_bind_is_exposed(host: str) -> bool:
@@ -1764,12 +1958,21 @@ def _api_bind_is_exposed(host: str) -> bool:
     return ip.is_unspecified or not ip.is_loopback
 
 
+def _resolve_log_level(name: Optional[str]) -> int:
+    """Map a LOG_LEVEL name to a logging level; unknown -> INFO + warning."""
+    level = logging.getLevelName(str(name or "").strip().upper())
+    if isinstance(level, int):
+        return level
+    logger.warning(f"Invalid LOG_LEVEL {name!r}; falling back to INFO")
+    return logging.INFO
+
+
 async def main():
     """Main entry point."""
     config = get_config()
     
-    # Set log level
-    logging.getLogger().setLevel(getattr(logging, config.log_level.upper()))
+    # Set log level (an invalid LOG_LEVEL must not crash startup)
+    logging.getLogger().setLevel(_resolve_log_level(config.log_level))
     
     assistant = SIPAIAssistant(config)
     

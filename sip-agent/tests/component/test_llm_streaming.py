@@ -114,7 +114,7 @@ async def test_live_data_question_takes_non_streaming_path(engine):
     # Existing grounding behavior intact: original + nudged re-run.
     assert len(reqs) == 2
     assert any(mock_vllm.NUDGE_MARKER in str(m.get("content") or "")
-               for m in reqs[-1]["messages"] if m.get("role") == "system")
+               for m in reqs[-1]["messages"] if m.get("role") == "user")
     _, final = _check_invariant(events)
     assert re.search(r"\d{1,2}:\d{2} (AM|PM)", final), final
 
@@ -583,13 +583,17 @@ async def test_main_barge_in_mid_stream_truncates_and_closes_stream(
     with pytest.raises(asyncio.CancelledError):
         await turn
 
-    # History holds only the heard prefix, marked as interrupted.
+    # History holds only the heard prefix (unannotated; the marker goes to
+    # the transcript only).
     assistant_turns = [m for m in session.conversation_history
                        if m["role"] == "assistant"]
     assert len(assistant_turns) == 1
     content = assistant_turns[0]["content"]
-    assert content.endswith(MARKER)
-    heard = content[:-len(MARKER)]
+    assert MARKER not in content
+    record = a.transcripts.get(session.transcript_id)
+    assert [t["content"] for t in record["turns"]
+            if t["role"] == "assistant"] == [content + MARKER]
+    heard = content
     assert heard.startswith("This is endless sentence number 1")
     assert " ".join(a.spoken).startswith(heard)
 
@@ -661,3 +665,23 @@ async def test_main_barge_in_during_tts_requires_explicit_stream_aclose(
         await asyncio.sleep(0.05)
     assert mock_vllm.STREAM_ABORTS, (
         "backend stream not closed by main's explicit stream.aclose()")
+
+
+async def test_echoed_interrupted_marker_is_never_spoken(live_assistant):
+    """A model that copies the transcript annotation into its reply must not
+    have it spoken or stored (regression: live call 2026-10-06)."""
+    a = live_assistant
+    from main import scrub_markers
+    assert scrub_markers("Hi. [interrupted by caller]") == "Hi."
+    assert scrub_markers("A [Interrupted by caller] B [interrupted by caller]") == "A B"
+    assert scrub_markers("no marker here") == "no marker here"
+
+    session = a._begin_session(_call(), "inbound", "sip:1001@host")
+    turn = asyncio.create_task(a._handle_transcription(session, "please echo marker"))
+    await turn
+    assert a.spoken, "nothing was spoken"
+    assert all(MARKER.strip() not in t for t in a.spoken), a.spoken
+    assistant_turns = [m["content"] for m in session.conversation_history
+                       if m["role"] == "assistant"]
+    assert assistant_turns == ["Sure thing. What else can I do?"]
+    await a._teardown_session()
