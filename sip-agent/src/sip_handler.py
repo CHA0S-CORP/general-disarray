@@ -78,6 +78,10 @@ class CallInfo:
     stream_player: Any = None  # PlaylistPlayer
     record_file_pos: int = 0  # Track how much we've read from recording
     dtmf_buffer: deque = None  # Digits received via onDtmfDigit (PJSIP thread)
+    # Set on DISCONNECTED: lets the outbound ring loop stop on busy/decline
+    # instead of waiting out the ring timeout. Status is the SIP final code.
+    ended: bool = False
+    last_status_code: int = 0
 
     def __post_init__(self):
         if self.audio_buffer is None:
@@ -134,11 +138,25 @@ class SIPCall(pj.Call if PJSUA_AVAILABLE else object):
         elif ci.state == pj.PJSIP_INV_STATE_DISCONNECTED:
             if self.call_info:
                 self.call_info.is_active = False
+                # Let the outbound ring loop see busy/decline/no-answer now.
+                try:
+                    self.call_info.last_status_code = int(
+                        getattr(ci, "lastStatusCode", 0) or 0)
+                except (TypeError, ValueError):
+                    self.call_info.last_status_code = 0
+                self.call_info.ended = True
             self._cleanup_media()
             self.handler._on_call_ended(self)
             
     def onCallMediaState(self, prm):
-        """Called when media state changes (PJSIP thread)."""
+        """Called when media state changes (PJSIP thread).
+
+        Fires again on every re-INVITE / hold-resume / session-timer refresh,
+        not just once at answer. An existing recorder is re-attached to the
+        (possibly new) audio media and the SAME WAV keeps growing, so
+        receive_audio's read offset stays valid; a fresh recorder is only
+        created when none exists (or re-attaching fails).
+        """
         ci = self.getInfo()
         
         for mi in ci.media:
@@ -147,26 +165,60 @@ class SIPCall(pj.Call if PJSUA_AVAILABLE else object):
                 
                 self.aud_med = self.getAudioMedia(mi.index)
                 
-                # Set up recording
-                try:
-                    import tempfile
-                    fd, record_path = tempfile.mkstemp(suffix='.wav', prefix='sip_in_')
-                    os.close(fd)
-                    
-                    if self.call_info:
-                        self.call_info.record_file = record_path
-                    
-                    self.recorder = pj.AudioMediaRecorder()
-                    self.recorder.createRecorder(record_path)
-                    self.aud_med.startTransmit(self.recorder)
-                    
-                    logger.info(f"Recording to: {record_path}")
-                except Exception as e:
-                    logger.error(f"Failed to set up recording: {e}")
+                if self.recorder is not None:
+                    try:
+                        self.aud_med.startTransmit(self.recorder)
+                        logger.info("Media updated; recorder re-attached")
+                    except Exception as e:
+                        logger.warning(
+                            f"Re-attaching recorder failed ({e}); "
+                            "starting a new recording")
+                        self._start_recording()
+                else:
+                    self._start_recording()
                 
                 if self.call_info:
                     self.call_info.media_ready = True
                     logger.info("Audio media ready")
+
+    def _start_recording(self):
+        """Record the caller's audio to a fresh temp WAV (PJSIP thread only).
+
+        Replacing an existing recording resets the read offset to the new
+        file's header and removes the old file, so the reader neither goes
+        deaf (old offset past the new file's end) nor leaks the old WAV.
+        """
+        import tempfile
+        record_path = None
+        try:
+            fd, record_path = tempfile.mkstemp(suffix='.wav', prefix='sip_in_')
+            os.close(fd)
+
+            recorder = pj.AudioMediaRecorder()
+            recorder.createRecorder(record_path)
+            self.aud_med.startTransmit(recorder)
+            self.recorder = recorder
+
+            old_path = None
+            if self.call_info:
+                old_path = self.call_info.record_file
+                self.call_info.record_file = record_path
+                self.call_info.record_file_pos = WAV_HEADER_SIZE
+            if old_path and old_path != record_path:
+                try:
+                    os.unlink(old_path)
+                except OSError:
+                    pass
+
+            logger.info(f"Recording to: {record_path}")
+        except Exception as e:
+            logger.error(f"Failed to set up recording: {e}")
+            if record_path and not (self.call_info
+                                    and self.call_info.record_file == record_path):
+                try:
+                    os.unlink(record_path)
+                except OSError:
+                    pass
                 
     def onDtmfDigit(self, prm):
         """DTMF digit received (PJSIP thread). Buffered on the CallInfo so the
@@ -219,12 +271,21 @@ class SIPAccount(pj.Account if PJSUA_AVAILABLE else object):
         log_event(logger, logging.INFO, f"Registration state: {ai.regStatusText} (code={ai.regStatus})",
                  event="sip_registration", status=ai.regStatusText, code=ai.regStatus)
         
-        if ai.regStatus == 200:
+        # regIsActive is False after an unregister/expiry (which can still
+        # report 200), so a 200 alone doesn't mean we're registered.
+        active = bool(getattr(ai, "regIsActive", ai.regStatus == 200))
+        if ai.regStatus == 200 and active:
             logger.info(f"✓ Registered: {ai.uri}")
             self.handler._registered.set()
-        elif ai.regStatus >= 400:
-            logger.error(f"✗ Registration failed: {ai.regStatusText}")
-            Metrics.record_call_failed("registration", f"sip_{ai.regStatus}")
+        else:
+            if ai.regStatus >= 400:
+                logger.error(f"✗ Registration failed: {ai.regStatusText}")
+                Metrics.record_call_failed("registration", f"sip_{ai.regStatus}")
+            else:
+                logger.warning(f"Registration no longer active ({ai.regStatusText})")
+            # Keep /health truthful: a failed refresh or an expired
+            # registration means inbound calls won't reach us.
+            self.handler._registered.clear()
             
     def onIncomingCall(self, prm):
         """Called for incoming calls (PJSIP thread)."""
@@ -350,6 +411,8 @@ class PlaylistPlayer:
         ledger (see snapshot()). Untagged files never touch the ledger.
         """
         if self._stopped:
+            # Nothing will ever play or clean this file up.
+            self._unlink(file_path)
             return
 
         # Get duration
@@ -362,6 +425,27 @@ class PlaylistPlayer:
 
         self.file_queue.put((file_path, duration, tag))
         logger.debug(f"Enqueued: {file_path} ({duration:.2f}s, tag={tag})")
+        if self._stopped:
+            # stop_all() raced in between the check above and the put: it may
+            # already have drained the queue, so drain again.
+            self._drain_queue()
+
+    @staticmethod
+    def _unlink(file_path: Optional[str]):
+        if file_path:
+            try:
+                os.unlink(file_path)
+            except OSError:
+                pass
+
+    def _drain_queue(self):
+        """Drop and delete every queued file (thread-safe, any thread)."""
+        while True:
+            try:
+                file_path, _, _ = self.file_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._unlink(file_path)
 
     def snapshot(self) -> Tuple[List[int], Optional[int], float]:
         """Read the playback ledger (thread-safe, any thread).
@@ -389,18 +473,14 @@ class PlaylistPlayer:
             # The interrupted current file did not finish: its tag must never
             # land in _completed_tags.
             self._current_tag = None
+            # A stopped player is never polled again once its call is gone,
+            # so the in-progress file must be removed here or it leaks.
+            # (Unlinking a file the PJSIP player still has open is safe.)
+            self._delete_current_file()
 
         # Clear queue and delete files (queued-and-dropped tags are simply
         # never completed)
-        while True:
-            try:
-                file_path, _, _ = self.file_queue.get_nowait()
-                try:
-                    os.unlink(file_path)
-                except OSError:
-                    pass
-            except queue.Empty:
-                break
+        self._drain_queue()
 
     def clear(self):
         """Flush queued + in-progress playback WITHOUT terminating the player.
@@ -432,6 +512,8 @@ class PlaylistPlayer:
         """
         if self._stopped:
             self._cleanup_player(pj_call)
+            with self._lock:
+                self._delete_current_file()
             return
 
         # Transient barge-in flush: stop current playback and reset, but keep the
@@ -559,8 +641,15 @@ class SIPHandler:
         # Command queue for thread-safe operations
         self._cmd_queue: queue.Queue = queue.Queue()
         self._result_queues: Dict[int, queue.Queue] = {}
+        # Commands the PJSIP thread has started executing: a waiter that times
+        # out on one of these keeps waiting for its result instead of
+        # abandoning a command that is already running.
+        self._claimed_cmds: set = set()
         self._cmd_id = 0
         self._cmd_lock = threading.Lock()
+        self._cmd_timeout_s = 10.0
+        # Set when the PJSIP thread failed to initialize (start() reports it).
+        self.init_error: Optional[str] = None
 
     def _busy(self) -> bool:
         """Should a new inbound INVITE be declined 486 Busy Here?
@@ -615,6 +704,12 @@ class SIPHandler:
                 )
             return self._playlist_players[call_id]
         
+    # Commands whose LATE execution is harmful once the caller has given up
+    # on them (a late make_call places an orphan call nobody tracks). Expired
+    # ones are dropped when dequeued; hangup always runs — tearing a call
+    # down late is still what was wanted.
+    _DROP_WHEN_EXPIRED = frozenset({"make_call", "xfer", "answer", "play_file"})
+
     def _queue_command(self, cmd: str, *args, **kwargs) -> Any:
         """Queue a command to run in PJSIP thread and wait for result."""
         if not self._running:
@@ -626,10 +721,24 @@ class SIPHandler:
             result_queue = queue.Queue()
             self._result_queues[cmd_id] = result_queue
             
-        self._cmd_queue.put((cmd_id, cmd, args, kwargs))
+        deadline = time.monotonic() + self._cmd_timeout_s
+        self._cmd_queue.put((cmd_id, cmd, args, kwargs, deadline))
         
         try:
-            result = result_queue.get(timeout=10.0)
+            try:
+                result = result_queue.get(timeout=self._cmd_timeout_s)
+            except queue.Empty:
+                with self._cmd_lock:
+                    claimed = cmd_id in self._claimed_cmds
+                    if not claimed:
+                        # Abandon it: the PJSIP thread drops it on dequeue.
+                        self._result_queues.pop(cmd_id, None)
+                if not claimed:
+                    logger.error(f"Command timeout (not started, dropped): {cmd}")
+                    return None
+                # Already executing: its result is imminent and must not be
+                # lost (e.g. a placed call nobody would otherwise track).
+                result = result_queue.get(timeout=self._cmd_timeout_s)
             if isinstance(result, Exception):
                 raise result
             return result
@@ -638,8 +747,8 @@ class SIPHandler:
             return None
         finally:
             with self._cmd_lock:
-                if cmd_id in self._result_queues:
-                    del self._result_queues[cmd_id]
+                self._result_queues.pop(cmd_id, None)
+                self._claimed_cmds.discard(cmd_id)
                     
     def _process_commands(self):
         """Process pending commands (PJSIP thread only)."""
@@ -647,25 +756,42 @@ class SIPHandler:
         processed = 0
         while not self._cmd_queue.empty() and processed < 10:
             try:
-                cmd_id, cmd, args, kwargs = self._cmd_queue.get_nowait()
-                result = self._execute_command(cmd, args, kwargs)
-                
-                with self._cmd_lock:
-                    if cmd_id in self._result_queues:
-                        self._result_queues[cmd_id].put(result)
-                        
-                processed += 1
+                cmd_id, cmd, args, kwargs, deadline = self._cmd_queue.get_nowait()
             except queue.Empty:
                 break
-                
+            processed += 1
+
+            with self._cmd_lock:
+                waiter = self._result_queues.get(cmd_id)
+                expired = (waiter is None or time.monotonic() > deadline)
+                if expired and cmd in self._DROP_WHEN_EXPIRED:
+                    drop = True
+                else:
+                    drop = False
+                    self._claimed_cmds.add(cmd_id)
+            if drop:
+                log_event(logger, logging.WARNING,
+                          f"Dropping expired command: {cmd}",
+                          event="sip_command_expired", command=cmd)
+                if waiter is not None:
+                    waiter.put(None)  # unblock a waiter at its deadline
+                continue
+
+            result = self._execute_command(cmd, args, kwargs)
+
+            with self._cmd_lock:
+                waiter = self._result_queues.get(cmd_id)
+                if waiter is not None:
+                    waiter.put(result)
+                    
         # Poll playlist players (with lock to avoid race with get_playlist_player)
         with self._playlist_lock:
             players_to_poll = list(self._playlist_players.items())
             
         for call_id, player in players_to_poll:
-            if call_id in self.active_calls:
-                call = self.active_calls[call_id]
-                if call.aud_med:
+            call = self.active_calls.get(call_id)
+            if call is not None:
+                if getattr(call, "aud_med", None):
                     player._poll_and_update(call)
             else:
                 # Call ended, clean up player
@@ -708,8 +834,8 @@ class SIPHandler:
             elif cmd == "play_file":
                 call_id = args[0]
                 wav_path = args[1]
-                if call_id in self.active_calls:
-                    call = self.active_calls[call_id]
+                call = self.active_calls.get(call_id)
+                if call is not None:
                     return self._play_file_direct(call, wav_path)
                 return False
                 
@@ -755,9 +881,18 @@ class SIPHandler:
         )
         self._pj_thread.start()
         
-        if not self._initialized.wait(timeout=10.0):
+        # Wait off the event loop: a blocking 10s wait here would freeze
+        # every other coroutine during startup.
+        initialized = await asyncio.get_event_loop().run_in_executor(
+            None, self._initialized.wait, 10.0)
+        if not initialized:
             logger.error("PJSUA2 initialization timeout")
-            return
+            return False
+
+        if self.init_error is not None or not self._running:
+            logger.error(f"SIP handler failed to start: PJSIP initialization "
+                         f"error: {self.init_error}")
+            return False
             
         await asyncio.sleep(2)
         
@@ -765,6 +900,7 @@ class SIPHandler:
             logger.info("SIP handler ready and registered")
         else:
             logger.warning("SIP handler ready, registration pending")
+        return True
             
     def _pjsip_thread_main(self):
         """Main PJSIP thread function."""
@@ -796,6 +932,14 @@ class SIPHandler:
                 max_calls = slots_floor
             ep_cfg.uaConfig.maxCalls = max_calls
             ep_cfg.uaConfig.userAgent = "SIP-AI-Assistant/1.0"
+            # This thread drives pjsua by polling libHandleEvents(). The
+            # default threadCnt=1 ALSO runs a pjsua worker thread, so
+            # callbacks would land on two threads and race on active_calls
+            # (which is documented PJSIP-thread-only). No worker threads, and
+            # marshal any callback raised elsewhere (media/clock threads) onto
+            # this thread — the one that called libCreate/libHandleEvents.
+            ep_cfg.uaConfig.threadCnt = 0
+            ep_cfg.uaConfig.mainThreadOnly = True
             
             self.endpoint.libInit(ep_cfg)
             
@@ -929,6 +1073,11 @@ class SIPHandler:
             logger.error(f"PJSIP thread error: {e}")
             import traceback
             traceback.print_exc()
+            # Report the failure instead of "registration pending": nothing
+            # is processing commands, so _queue_command must stop accepting.
+            if not self._initialized.is_set():
+                self.init_error = str(e) or type(e).__name__
+            self._running = False
             self._initialized.set()
             
     def _create_account(self):
@@ -1156,7 +1305,7 @@ class SIPHandler:
                 
             now = time.time()
             if file_size != call_info._last_size_log and (now - call_info._last_size_log_time) > 2:
-                logger.info(f"Recording file size: {file_size} bytes, read pos: {call_info.record_file_pos}")
+                logger.debug(f"Recording file size: {file_size} bytes, read pos: {call_info.record_file_pos}")
                 call_info._last_size_log = file_size
                 call_info._last_size_log_time = now
                 

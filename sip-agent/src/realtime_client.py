@@ -17,6 +17,7 @@ import base64
 import json
 import logging
 import time
+from collections import deque
 from typing import Optional, Callable, Awaitable
 from dataclasses import dataclass
 from math import gcd
@@ -48,6 +49,11 @@ logger = logging.getLogger(__name__)
 # mono @ 24 kHz. The agent works at config.sample_rate (16 kHz), so audio must be
 # resampled up to this rate before it is base64-encoded onto the WebSocket.
 REALTIME_WIRE_SAMPLE_RATE = 24000
+
+# A connection must stay up this long before the reconnect backoff resets to
+# its base delay. A server that accepts and immediately drops the socket would
+# otherwise be hammered at the base delay forever.
+HEALTHY_CONNECTION_SECONDS = 10.0
 
 
 class _StreamingResampler:
@@ -128,6 +134,16 @@ class RealtimeWebSocketClient:
         self._pending_seq: Optional[int] = None
         self._inflight_item_id: Optional[str] = None
         self._committed_items: dict = {}
+        # Turn tokens of commits sent but not yet acknowledged by an
+        # input_audio_buffer.committed event, oldest first. The server acks
+        # commits in order, so each ack maps to the OLDEST outstanding token —
+        # not to whatever turn is current when a late ack finally arrives.
+        self._outstanding_commits: deque = deque()
+
+        # Reconnect backoff persists across reconnect cycles; it only resets
+        # once a connection has stayed healthy (HEALTHY_CONNECTION_SECONDS).
+        self._reconnect_backoff = RECONNECT_BASE_DELAY_SECONDS
+        self._connected_at: Optional[float] = None
 
         # Audio buffering for batch fallback
         self._audio_buffer = bytearray()
@@ -180,6 +196,11 @@ class RealtimeWebSocketClient:
         self._connection_attempts += 1
         Metrics.record_realtime_connection_attempt()
         
+        # Never leak a previous socket when (re)connecting.
+        await self._close_ws_quietly()
+        # A new server session has no memory of the old one's commits.
+        self._outstanding_commits.clear()
+
         try:
             ws_url = self._build_ws_url()
             logger.info(f"Connecting to Speaches realtime API: {ws_url}")
@@ -194,6 +215,7 @@ class RealtimeWebSocketClient:
             )
             
             self._connected = True
+            self._connected_at = time.monotonic()
             # Re-arm availability: a prior failed connect may have cleared this,
             # and a later successful (re)connect must restore it.
             self.available = True
@@ -260,11 +282,27 @@ class RealtimeWebSocketClient:
             self._connected = False
             Metrics.record_realtime_connection_state("disconnected")
             await self._handle_connection_failure()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"Error in receive loop: {e}")
             self._connected = False
             Metrics.record_realtime_connection_error(type(e).__name__)
+            # The socket may still be open (e.g. a handler bug, not a network
+            # drop): close it before reconnecting so it isn't leaked.
+            await self._close_ws_quietly()
             await self._handle_connection_failure()
+
+    async def _close_ws_quietly(self):
+        """Close and forget the current WebSocket, ignoring errors."""
+        ws = self._ws
+        self._ws = None
+        if ws is None:
+            return
+        try:
+            await ws.close()
+        except Exception as e:
+            logger.debug(f"Error closing stale realtime WebSocket: {e}")
             
     def _resolve_pending(self, value: str, item_id: Optional[str]):
         """Resolve the in-flight commit_and_wait() future, but only with a result
@@ -311,13 +349,19 @@ class RealtimeWebSocketClient:
             # turn_detection is None, so this commit produced exactly one item.
             # Record which turn token it belongs to so a slow transcript can later
             # be correlated back to its commit and not leak into a different turn.
+            # Map the item to the turn token captured when ITS commit was
+            # sent (oldest unacknowledged), so a late ack from a timed-out
+            # turn can't be attributed to the turn that's current now.
             item_id = data.get("item_id")
-            if item_id is not None and self._pending_seq is not None:
-                self._inflight_item_id = item_id
-                self._committed_items[item_id] = self._pending_seq
+            seq = (self._outstanding_commits.popleft()
+                   if self._outstanding_commits else None)
+            if item_id is not None and seq is not None:
+                if seq == self._pending_seq:
+                    self._inflight_item_id = item_id
+                self._committed_items[item_id] = seq
                 # Bound the map: only the current and a few recent turns matter.
                 if len(self._committed_items) > 8:
-                    cutoff = self._pending_seq - 4
+                    cutoff = (self._pending_seq or seq) - 4
                     self._committed_items = {
                         k: v for k, v in self._committed_items.items() if v >= cutoff
                     }
@@ -342,9 +386,6 @@ class RealtimeWebSocketClient:
 
                 log_event(logger, logging.DEBUG, f"Transcription received: {transcript[:50]}...",
                          event="realtime_transcription", text_length=len(transcript))
-
-                # Record metrics
-                Metrics.record_stt_latency(0, self.model)  # Latency tracked elsewhere
 
                 if self._transcription_callback:
                     await self._transcription_callback(result)
@@ -372,6 +413,14 @@ class RealtimeWebSocketClient:
             error_msg = error.get("message", "Unknown error")
             error_type = error.get("type", "unknown")
             logger.error(f"Realtime API error: {error_type} - {error_msg}")
+            # A rejected commit is never acknowledged: drop its token so the
+            # next ack isn't attributed to it.
+            failed_event = error.get("event_id") or data.get("event_id")
+            if isinstance(failed_event, str) and failed_event.startswith("commit-"):
+                try:
+                    self._outstanding_commits.remove(int(failed_event[7:]))
+                except ValueError:
+                    pass
             Metrics.record_stt_error(self.model, f"realtime_{error_type}")
             # A commit can fail server-side (e.g. buffer too short); don't make
             # commit_and_wait() block for the full timeout — resolve it empty.
@@ -386,15 +435,23 @@ class RealtimeWebSocketClient:
         """Handle WebSocket connection failure - attempt reconnect."""
         logger.warning("WebSocket connection failed, attempting reconnect...")
         self._connected = False
+        # Only a connection that stayed up a while proves the server healthy;
+        # accept-then-drop keeps backing off instead of resetting each cycle.
+        if (self._connected_at is not None
+                and time.monotonic() - self._connected_at >= HEALTHY_CONNECTION_SECONDS):
+            self._reconnect_backoff = RECONNECT_BASE_DELAY_SECONDS
+        self._connected_at = None
         
         if self._reconnect_task is None or self._reconnect_task.done():
             self._reconnect_task = asyncio.create_task(self._reconnect_loop())
             
     async def _reconnect_loop(self):
         """Attempt to reconnect with exponential backoff."""
-        backoff = RECONNECT_BASE_DELAY_SECONDS
-        
         while not self._connected:
+            backoff = self._reconnect_backoff
+            # Grow BEFORE connecting: if this connection is accepted and then
+            # drops quickly, the next cycle waits longer.
+            self._reconnect_backoff = min(backoff * 2, RECONNECT_MAX_DELAY_SECONDS)
             try:
                 await asyncio.sleep(backoff)
                 await self._connect()
@@ -402,10 +459,10 @@ class RealtimeWebSocketClient:
                     logger.info("WebSocket reconnection successful")
                     Metrics.record_realtime_reconnection()
                     return
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.warning(f"Reconnection attempt failed: {e}")
-                
-            backoff = min(backoff * 2, RECONNECT_MAX_DELAY_SECONDS)
             
     def set_transcription_callback(self, callback: Callable[[TranscriptionResult], Awaitable[None]]):
         """Set callback for receiving transcription results."""
@@ -489,10 +546,16 @@ class RealtimeWebSocketClient:
             self._pending_seq = self._commit_seq
             self._inflight_item_id = None
             self._pending_transcript = asyncio.get_running_loop().create_future()
-            message = {"type": "input_audio_buffer.commit"}
+            self._outstanding_commits.append(self._commit_seq)
+            message = {"type": "input_audio_buffer.commit",
+                       "event_id": f"commit-{self._commit_seq}"}
             await self._ws.send(json.dumps(message))
         except Exception as e:
             logger.error(f"Error committing audio buffer: {e}")
+            try:
+                self._outstanding_commits.remove(self._commit_seq)
+            except ValueError:
+                pass
             if self._pending_transcript and not self._pending_transcript.done():
                 self._pending_transcript.set_result("")
             
@@ -561,9 +624,7 @@ class RealtimeWebSocketClient:
             except asyncio.CancelledError:
                 pass
                 
-        if self._ws:
-            await self._ws.close()
-            self._ws = None
+        await self._close_ws_quietly()
             
         Metrics.record_realtime_connection_state("closed")
         logger.info("Realtime WebSocket client closed")
