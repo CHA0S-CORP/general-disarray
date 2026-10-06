@@ -126,9 +126,21 @@ def test_after_marker_everything_accumulates_silently():
     assert tail.endswith("normally emit.")
 
 
-def test_lowercase_marker_is_not_held():
-    text = ("This sentence mentions [tool:fake] in lowercase and is long. "
+@pytest.mark.parametrize("marker", ["[tool:weather]", "[TOOL: WEATHER]",
+                                    "[ Tool :WEATHER]"])
+def test_case_and_space_variant_markers_are_held(marker):
+    # The engine parser is case-insensitive and whitespace-tolerant, so the
+    # stream must hold these too or they would be spoken before parsing.
+    text = f"Checking now {marker} and more text that is long enough."
+    asm, emitted = _run(_pieces(text, 2))
+    assert emitted == []
+    assert asm.marker_seen
+    assert asm.flush() == text
+
+
+def test_bracketed_prose_is_released():
+    text = ("This sentence has [ see note ] inside and is long enough. "
             "Second sentence is long enough to be its own chunk too.")
-    assert _stream_chunks(text, 6) == split_into_sentences(text)
-    asm, _ = _run(_pieces(text, 6))
+    assert _stream_chunks(text, 3) == split_into_sentences(text)
+    asm, _ = _run(_pieces(text, 3))
     assert not asm.marker_seen

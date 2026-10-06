@@ -38,7 +38,7 @@ except ImportError:
 
 import grounding
 from config import Config
-from llm_engine import LLMEngine, ToolCall, TurnContext
+from llm_engine import LLMEngine, ToolCall, TurnContext, tool_choice_rejected
 from logging_utils import log_event
 from telemetry import create_span, Metrics
 
@@ -130,6 +130,11 @@ class LangChainEngine(LLMEngine):
         }
         if self.config.llm_frequency_penalty:
             chat_kwargs["frequency_penalty"] = self.config.llm_frequency_penalty
+        # Same per-request thinking switch the classic engine sends
+        # (chat_template_kwargs via the body); see LLMEngine._extra_body.
+        extra_body = self._extra_body()
+        if extra_body:
+            chat_kwargs["extra_body"] = extra_body
         chat = ChatOpenAI(**chat_kwargs)
 
         # Tools are bound only in native mode; in text mode the agent is a
@@ -156,16 +161,24 @@ class LangChainEngine(LLMEngine):
         for name, tool in self.tool_manager.tools.items():
             if not getattr(tool, "enabled", True):
                 continue
-            fields: Dict[str, Any] = {}
-            for pname, spec in (getattr(tool, "parameters", {}) or {}).items():
-                ptype = _PARAM_TYPES.get(spec.get("type", "string"), str)
-                desc = spec.get("description", "")
-                if spec.get("required"):
-                    fields[pname] = (ptype, Field(description=desc))
-                else:
-                    fields[pname] = (Optional[ptype],
-                                     Field(default=None, description=desc))
-            args_schema = create_model(f"{name}_args", **fields)
+            # A tool carrying a full JSON schema (e.g. an MCP inputSchema) is
+            # bound with it verbatim — same rule as _build_native_tools — so
+            # nested objects/arrays reach the model intact. Otherwise build a
+            # pydantic model from the flat parameters dict.
+            json_schema = getattr(tool, "json_schema", None)
+            if isinstance(json_schema, dict) and json_schema:
+                args_schema: Any = json_schema
+            else:
+                fields: Dict[str, Any] = {}
+                for pname, spec in (getattr(tool, "parameters", {}) or {}).items():
+                    ptype = _PARAM_TYPES.get(spec.get("type", "string"), str)
+                    desc = spec.get("description", "")
+                    if spec.get("required"):
+                        fields[pname] = (ptype, Field(description=desc))
+                    else:
+                        fields[pname] = (Optional[ptype],
+                                         Field(default=None, description=desc))
+                args_schema = create_model(f"{name}_args", **fields)
 
             async def _run(_tool_name: str = name, **kwargs) -> str:
                 params = {k: v for k, v in kwargs.items() if v is not None}
@@ -174,6 +187,7 @@ class LangChainEngine(LLMEngine):
                         ToolCall(name=_tool_name, params=params, raw=""))
                     ctx = _TURN_CTX.get()
                     if ctx is not None:
+                        ctx.record_tool(_tool_name)
                         self._collect_spoken_result(ctx, _tool_name, result)
                     return getattr(result, "message", "") or "Done."
                 except Exception as e:
@@ -251,8 +265,11 @@ class LangChainEngine(LLMEngine):
         ctx: TurnContext,
     ) -> str:
         """The agentic turn body (see generate_response, which owns ctx)."""
+        # Static prefix first, per-turn context second (prefix-cache friendly;
+        # see LLMEngine._build_system_messages).
         messages: List[Any] = [
-            SystemMessage(content=self._build_system_prompt(call_context))]
+            SystemMessage(content=m["content"])
+            for m in self._build_system_messages(call_context)]
         # Same windowing rule as the classic engine (see _history_window):
         # don't re-truncate history the rolling summary has already sliced.
         messages.extend(self._to_lc_messages(
@@ -322,15 +339,37 @@ class LangChainEngine(LLMEngine):
                 last_user = next(
                     (m.content for m in reversed(messages)
                      if isinstance(m, HumanMessage)), "")
+                ran = [tc.get("name", "") for m in out_messages
+                       if isinstance(m, AIMessage)
+                       for tc in (getattr(m, "tool_calls", None) or [])]
+                retry_messages = messages
                 if tool_rounds == 0:
                     category = grounding.grounding_category(
                         str(last_user), content)
                 elif grounding.trailing_promise(content):
                     category = "PROMISED_ACTION"
+                    # The retry must see what the agent already did (its
+                    # tool calls and results), not the bare original prompt —
+                    # otherwise it re-asks from scratch. The final promise
+                    # message itself is dropped so the forced round follows
+                    # the last tool result.
+                    retry_messages = list(out_messages)
+                    if (retry_messages and isinstance(retry_messages[-1], AIMessage)
+                            and not getattr(retry_messages[-1], "tool_calls", None)):
+                        retry_messages.pop()
                 else:
                     category = None
-                if category and self._category_tools_available(category):
-                    retried = await self._grounding_retry(messages, category, ctx)
+                if (category == "PROMISED_ACTION"
+                        and grounding.side_effects_ran(ran)):
+                    # Re-running after a timer/callback/transfer/... would
+                    # repeat its side effects; keep the reply as it is.
+                    log_event(logger, logging.INFO,
+                              f"Grounding retry ({category}): skipped_side_effects",
+                              event="grounding_retry", category=category,
+                              outcome="skipped_side_effects")
+                elif category and self._category_tools_available(category):
+                    retried = await self._grounding_retry(
+                        retry_messages, category, ctx)
                     if retried:
                         content = retried
 
@@ -379,6 +418,20 @@ class LangChainEngine(LLMEngine):
                   latency_ms=round((time.time() - start_time) * 1000))
         return result_text
 
+    @staticmethod
+    def _with_lc_nudge(messages: List[Any]) -> List[Any]:
+        """Copy of ``messages`` with the NUDGE appended to the last
+        HumanMessage (or added as one when there is none)."""
+        out = list(messages)
+        for i in range(len(out) - 1, -1, -1):
+            msg = out[i]
+            if isinstance(msg, HumanMessage) and isinstance(msg.content, str):
+                out[i] = HumanMessage(
+                    content=grounding.nudged_content(msg.content))
+                return out
+        out.append(HumanMessage(content=grounding.NUDGE))
+        return out
+
     async def _grounding_retry_inner(self, messages: List[Any],
                                      ctx: TurnContext):
         """Returns (result_text | None, outcome)."""
@@ -387,10 +440,11 @@ class LangChainEngine(LLMEngine):
                 forced = await self._chat.bind_tools(
                     self._lc_tools, tool_choice="required").ainvoke(messages)
             except Exception as e:
-                # vLLM without guided-decoding tool_choice answers 400; any
-                # BadRequest here means "not supported" — remember and fall
-                # back to the nudge path below.
-                if "400" not in str(e) and "BadRequest" not in type(e).__name__:
+                # vLLM without guided-decoding tool_choice answers 400 naming
+                # tool_choice — remember and fall back to the nudge path
+                # below. Any other error (including unrelated 400s) is an
+                # ordinary retry failure, not proof tool_choice is unsupported.
+                if not tool_choice_rejected(e):
                     raise
                 logger.warning(f"tool_choice=required rejected by backend: {e}")
                 self._tool_choice_supported = False
@@ -404,6 +458,7 @@ class LangChainEngine(LLMEngine):
                               if v is not None}
                     result = await self.tool_manager.execute_tool(
                         ToolCall(name=tc["name"], params=params, raw=""))
+                    ctx.record_tool(tc["name"])
                     self._collect_spoken_result(ctx, tc["name"], result)
                     tool_messages.append(ToolMessage(
                         content=getattr(result, "message", "") or "Done.",
@@ -414,10 +469,12 @@ class LangChainEngine(LLMEngine):
                     messages + [forced, *tool_messages])
                 return (self._extract_text(composed) or "").strip() or None, "tool_used"
 
-        # Fallback: strong instruction re-run through the normal agent.
-        nudge = SystemMessage(content=grounding.NUDGE)
+        # Fallback: strong instruction re-run through the normal agent. The
+        # nudge rides in the last user turn — a mid-conversation system
+        # message is rejected or dropped by some chat templates (see
+        # grounding.NUDGE).
         result = await self._agent.ainvoke(
-            {"messages": messages + [nudge]},
+            {"messages": self._with_lc_nudge(messages)},
             config={"recursion_limit": 5})
         out = result.get("messages", []) if isinstance(result, dict) else []
         text = self._extract_text(out[-1]) if out else ""

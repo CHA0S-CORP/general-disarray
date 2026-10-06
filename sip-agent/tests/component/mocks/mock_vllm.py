@@ -100,6 +100,15 @@ async def _stream_body(body: dict, last_user: str):
     try:
         yield _sse_chunk(body, {"role": "assistant"})
 
+        if "echo marker" in t:
+            # A model that copied the transcript annotation from history.
+            yield _sse_chunk(body, {"content": "Sure thing. [interrupted by caller] "})
+            yield _sse_chunk(body, {"content": "What else can I do? [interrupted by caller]"})
+            yield _sse_chunk(body, {}, finish_reason="stop")
+            yield "data: [DONE]\n\n"
+            done = True
+            return
+
         if "endless" in t:
             # Never finishes on its own: complete sentences forever, so the
             # client speaks some audio and then must CLOSE the stream.
@@ -223,9 +232,7 @@ def build_app() -> FastAPI:
                 if not tool_msgs:
                     return _tool_call_response(body, "DATETIME", {})
             # Nudge fallback re-run: obey the injected grounding instruction.
-            if not tool_msgs and any(
-                    NUDGE_MARKER in str(m.get("content") or "")
-                    for m in messages if m.get("role") == "system"):
+            if not tool_msgs and _nudged(messages):
                 return _tool_call_response(body, "DATETIME", {})
 
             # "loop forever": keeps demanding tools no matter what came back,
@@ -259,14 +266,19 @@ def build_app() -> FastAPI:
 
         # Text-mode nudge re-run: obey the injected grounding instruction by
         # emitting the marker the engine demanded.
-        if any(NUDGE_MARKER in str(m.get("content") or "")
-               for m in messages if m.get("role") == "system"):
+        if _nudged(messages):
             return _completion_response(body, "Checking. [TOOL:DATETIME]")
 
         content = _script(last_user)
         return _completion_response(body, content)
 
     return app
+
+
+def _nudged(messages: list) -> bool:
+    """Did the engine inject the grounding nudge (in any message — engines
+    append it to the last user turn)?"""
+    return any(NUDGE_MARKER in str(m.get("content") or "") for m in messages)
 
 
 def _completion_response(body: dict, content: str) -> dict:

@@ -96,10 +96,39 @@ async def test_text_mode_marker_fallback(text_engine):
     assert not mock_vllm.REQUESTS[before].get("tools")
 
 
-async def test_system_prompt_context_blocks(native_engine):
+async def test_system_prompt_context_blocks(assistant, config_factory,
+                                            vllm_url, speaches_url):
     """Caller memory + rolling summary reach the agent's system prompt."""
     import mock_vllm
-    await native_engine.generate_response(
+    native_engine = _make_engine(assistant, config_factory, vllm_url,
+                                 speaches_url, llm_tool_calling="native",
+                                 llm_split_system_prompt="true")
+    await native_engine.start()
+    try:
+        await _context_turn(native_engine)
+    finally:
+        await native_engine.stop()
+    msgs = mock_vllm.REQUESTS[-1]["messages"]
+    # Static prefix first, per-turn context second (prefix-cache layout).
+    assert [m["role"] for m in msgs[:3]] == ["system", "system", "user"]
+    assert msgs[0]["content"] == native_engine.config.system_prompt
+    system = msgs[1]["content"]
+    assert "Caller: 1001" in system
+    assert "Name is Bob" in system
+    assert "Bob asked about the weather earlier." in system
+
+
+async def test_system_prompt_unsplit_by_default(native_engine):
+    """Default (split off): one system message carrying everything."""
+    import mock_vllm
+    await _context_turn(native_engine)
+    msgs = mock_vllm.REQUESTS[-1]["messages"]
+    assert [m["role"] for m in msgs[:2]] == ["system", "user"]
+    assert "Name is Bob" in msgs[0]["content"]
+
+
+async def _context_turn(engine):
+    await engine.generate_response(
         [{"role": "user", "content": "hello there"}],
         {
             "remote_uri": "sip:1001@pbx.lan",
@@ -108,10 +137,28 @@ async def test_system_prompt_context_blocks(native_engine):
             "conversation_summary": "Bob asked about the weather earlier.",
         },
     )
-    system = mock_vllm.REQUESTS[-1]["messages"][0]["content"]
-    assert "Caller: 1001" in system
-    assert "Name is Bob" in system
-    assert "Bob asked about the weather earlier." in system
+
+
+async def test_thinking_switch_reaches_body(assistant, config_factory,
+                                            speaches_url, vllm_url):
+    """LLM_ENABLE_THINKING is forwarded through ChatOpenAI's extra_body."""
+    import mock_vllm
+    from langchain_engine import LangChainEngine
+    cfg = config_factory(
+        speaches_api_url=speaches_url,
+        llm_base_url=f"{vllm_url}/v1",
+        llm_model="mock-model",
+        llm_backend="langgraph",
+        llm_tool_calling="native",
+        llm_enable_thinking="false",
+    )
+    eng = LangChainEngine(cfg, assistant.tool_manager)
+    await eng.start()
+    try:
+        await eng.generate_response([{"role": "user", "content": "hello there"}])
+    finally:
+        await eng.stop()
+    assert mock_vllm.REQUESTS[-1]["chat_template_kwargs"] == {"enable_thinking": False}
 
 
 async def test_backend_error_falls_back_to_phrase(assistant, config_factory,
@@ -242,10 +289,15 @@ async def test_grounding_retry_nudge_fallback_on_400(native_engine):
         mock_vllm.REJECT_TOOL_CHOICE = False
 
     rounds = mock_vllm.REQUESTS[before:]
-    # A nudge re-run carried the grounding instruction as a system message.
+    # A nudge re-run carried the grounding instruction in the user turn
+    # (never as a mid-conversation system message).
     nudged = [r for r in rounds if any(
         mock_vllm.NUDGE_MARKER in str(m.get("content") or "")
-        for m in r.get("messages", []) if m.get("role") == "system")]
+        for m in r.get("messages", []) if m.get("role") == "user")]
+    assert not any(
+        mock_vllm.NUDGE_MARKER in str(m.get("content") or "")
+        for r in rounds for m in r.get("messages", [])
+        if m.get("role") == "system")
     assert nudged, "nudge fallback request never sent"
     import re
     assert re.search(r"\d{1,2}:\d{2} (AM|PM)", reply), reply
@@ -277,3 +329,135 @@ def test_invoke_with_budget_pauses_while_dtmf_collecting():
     assert asyncio.run(go(True)) == "done"
     with pytest.raises(asyncio.TimeoutError):
         asyncio.run(go(False))
+
+
+# --- grounding retry after tools already ran (stubbed graph) -------------------
+
+class _StubTM:
+    def __init__(self):
+        from types import SimpleNamespace
+        self.tools = {n: SimpleNamespace(name=n, enabled=True, parameters={},
+                                         speak_result=False, json_schema=None,
+                                         description=n)
+                      for n in ("WEATHER", "SET_TIMER")}
+        self.executed = []
+
+    def get_tool(self, name):
+        return self.tools.get(name.upper())
+
+    def get_tools_prompt(self):
+        return ""
+
+    async def execute_tool(self, tool_call):
+        from types import SimpleNamespace
+        self.executed.append(tool_call.name)
+        return SimpleNamespace(status="success", message="ok")
+
+
+class _StubAgent:
+    def __init__(self, tool_name):
+        self.tool_name = tool_name
+
+    async def ainvoke(self, state, config=None):
+        from langchain_core.messages import AIMessage, ToolMessage
+        return {"messages": list(state["messages"]) + [
+            AIMessage(content="", tool_calls=[
+                {"name": self.tool_name, "args": {}, "id": "t1"}]),
+            ToolMessage(content="ok", tool_call_id="t1"),
+            AIMessage(content="Done. Let me check on that for you."),
+        ]}
+
+
+def _stub_engine(config_factory, tool_name):
+    cfg = config_factory(llm_backend="langgraph", llm_tool_calling="native")
+    eng = LangChainEngine(cfg, _StubTM())
+    eng.client = object()
+    eng._agent = _StubAgent(tool_name)
+    eng._lc_tools = ["bound"]
+    calls = []
+
+    async def fake_retry(messages, category, ctx):
+        calls.append((messages, category))
+        return "Retried answer."
+
+    eng._grounding_retry = fake_retry
+    return eng, calls
+
+
+async def test_trailing_promise_after_side_effect_tool_skips_retry(config_factory):
+    """A forced retry after SET_TIMER already ran could set it twice."""
+    eng, calls = _stub_engine(config_factory, "SET_TIMER")
+    reply = await eng.generate_response([{"role": "user", "content": "timer"}])
+    assert calls == []
+    assert reply == "Done. Let me check on that for you."
+
+
+async def test_trailing_promise_retry_sees_agent_tool_results(config_factory):
+    """After read-only tools, the retry runs on the full graph state (the
+    agent's tool calls + results), minus the dangling promise message."""
+    from langchain_core.messages import AIMessage, ToolMessage
+    eng, calls = _stub_engine(config_factory, "WEATHER")
+    reply = await eng.generate_response([{"role": "user", "content": "hi"}])
+    assert reply == "Retried answer."
+    (messages, category), = calls
+    assert category == "PROMISED_ACTION"
+    assert isinstance(messages[-1], ToolMessage)
+    assert any(isinstance(m, AIMessage) and m.tool_calls for m in messages)
+
+
+async def test_unrelated_400_does_not_disable_tool_choice(config_factory):
+    """Only a 400 naming tool_choice marks it unsupported."""
+    from langchain_core.messages import HumanMessage
+
+    class _Bound:
+        async def ainvoke(self, messages):
+            raise Exception("Error code: 400 - maximum context length exceeded")
+
+    class _Chat:
+        def bind_tools(self, tools, tool_choice=None):
+            return _Bound()
+
+    cfg = config_factory(llm_backend="langgraph", llm_tool_calling="native")
+    eng = LangChainEngine(cfg, _StubTM())
+    eng._chat = _Chat()
+    eng._lc_tools = ["bound"]
+    from llm_engine import TurnContext
+    text = await eng._grounding_retry(
+        [HumanMessage(content="what time is it")], "DATETIME", TurnContext())
+    assert text is None
+    assert eng._tool_choice_supported is True
+
+
+def test_lc_nudge_rides_in_last_user_turn():
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+    import grounding
+    msgs = [SystemMessage(content="sys"), HumanMessage(content="what time"),
+            AIMessage(content="hmm")]
+    out = LangChainEngine._with_lc_nudge(msgs)
+    assert [type(m) for m in out] == [type(m) for m in msgs]
+    assert out[1].content.startswith("what time")
+    assert grounding.NUDGE in out[1].content
+    assert msgs[1].content == "what time"  # input untouched
+
+
+def test_lc_tools_use_json_schema_when_present(config_factory):
+    """MCP-style tools carrying a full JSON schema are bound with it
+    verbatim (nested objects survive), like _build_native_tools."""
+    from types import SimpleNamespace
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+    schema = {"type": "object",
+              "properties": {"query": {"type": "string"},
+                             "filters": {"type": "object", "properties": {
+                                 "tags": {"type": "array",
+                                          "items": {"type": "string"}}}}},
+              "required": ["query"]}
+    tm = _StubTM()
+    tm.tools = {"MCP_SEARCH": SimpleNamespace(
+        name="MCP_SEARCH", enabled=True, parameters={}, json_schema=schema,
+        description="search")}
+    cfg = config_factory(llm_backend="langgraph", llm_tool_calling="native")
+    eng = LangChainEngine(cfg, tm)
+    (tool,) = eng._build_lc_tools()
+    params = convert_to_openai_tool(tool)["function"]["parameters"]
+    assert params["properties"]["filters"]["properties"]["tags"]["type"] == "array"
+    assert params["required"] == ["query"]

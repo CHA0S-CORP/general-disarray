@@ -51,6 +51,45 @@ Preserve EVERY piece of information: numbers, names, identifiers, dates, times, 
 Output ONLY the rewritten message."""
 
 
+# --- [TOOL:...] marker grammar ------------------------------------------------
+# Case-insensitive and whitespace-tolerant around the punctuation
+# ("[tool: weather]" is unambiguous). A marker's params may hold one level of
+# balanced [...] (JSON arrays in "JSON object as a string" params, e.g. MCP
+# tools); the second alternative is the legacy fallback for a stray "[" inside
+# a value. Neither alternative may run across the start of ANOTHER marker, so
+# an unterminated marker can no longer swallow the valid one after it.
+_MARKER_START = r'\[\s*TOOL\s*:'
+_MARKER_RE = re.compile(
+    _MARKER_START + r'\s*([A-Za-z_]\w*)\s*'
+    r'(?::((?:(?!' + _MARKER_START + r')(?:[^\[\]]|\[[^\[\]]*\]))+'
+    r'|(?:(?!' + _MARKER_START + r')[^\]])+)?)?'
+    r'\]',
+    re.IGNORECASE)
+# Anything still marker-shaped after parsing (truncated at max_tokens,
+# unparseable names like GET-WEATHER...) — never let it reach TTS.
+_MARKER_RESIDUE_RE = re.compile(
+    _MARKER_START + r'(?:(?!' + _MARKER_START + r')[^\]\n])*\]?', re.IGNORECASE)
+# One left-to-right pass over both: a valid marker ("ok") or residue. A single
+# pass lets an unterminated fragment end where the next marker begins instead
+# of running on past it once that marker has been removed.
+_MARKER_ANY_RE = re.compile(
+    r'(?P<ok>' + _MARKER_RE.pattern + r')|' + _MARKER_RESIDUE_RE.pattern,
+    re.IGNORECASE)
+
+
+def tool_choice_rejected(error: Exception) -> bool:
+    """Is this a backend rejection of ``tool_choice`` specifically?
+
+    A 400 for some other reason (oversized context, bad schema...) is not
+    evidence that tool_choice="required" is unsupported, and caching it as
+    such would disable the forced retry for the rest of the process.
+    """
+    text = str(error)
+    is_bad_request = ("400" in text or "BadRequest" in type(error).__name__
+                      or getattr(error, "status_code", None) == 400)
+    return is_bad_request and bool(re.search(r"tool[_ ]choice", text, re.IGNORECASE))
+
+
 def _format_caller(remote_uri: str) -> str:
     """'sip:1001@pbx' / '"Bob" <sip:1001@pbx>' -> '1001'; falls back to raw."""
     m = re.search(r'sips?:([^@;>\s]+)', remote_uri or "")
@@ -83,6 +122,14 @@ class TurnContext:
     # Tool calls executed this turn (any engine path); drives the
     # text-mode grounding retry.
     tool_calls: int = 0
+    # Names (uppercased) of the tools executed this turn, in order. Lets the
+    # grounding retry refuse to re-run a turn whose tools had side effects.
+    tool_names: List[str] = field(default_factory=list)
+
+    def record_tool(self, name: str) -> None:
+        """Count one executed tool call (any engine path)."""
+        self.tool_calls += 1
+        self.tool_names.append((name or "").upper())
 
 
 class _StreamedToolCall:
@@ -121,7 +168,11 @@ class LLMEngine:
         # Per-turn tool bookkeeping lives in a TurnContext created at the top
         # of generate_response/stream_response and threaded explicitly —
         # never on the engine instance (see TurnContext).
-        
+        # Whether the backend accepts tool_choice="required" (native grounding
+        # retry). Flipped once when the backend rejects it, so later live-data
+        # turns go straight to the nudge instead of paying a failing request.
+        self._tool_choice_supported = True
+
     async def start(self):
         """Initialize the LLM client."""
         if not OPENAI_CLIENT_AVAILABLE:
@@ -164,9 +215,8 @@ class LLMEngine:
         """Generate a response to the conversation."""
         
         # Build messages with system prompt
-        messages = [
-            {"role": "system", "content": self._build_system_prompt(call_context)}
-        ]
+        messages: List[Dict[str, Any]] = list(
+            self._build_system_messages(call_context))
 
         messages.extend(self._history_window(conversation_history, call_context))
 
@@ -220,9 +270,8 @@ class LLMEngine:
                 yield event
             return
 
-        messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": self._build_system_prompt(call_context)}
-        ]
+        messages: List[Dict[str, Any]] = list(
+            self._build_system_messages(call_context))
         messages.extend(self._history_window(conversation_history, call_context))
 
         # Same per-turn bookkeeping as generate_response, owned by this turn.
@@ -356,6 +405,61 @@ class LLMEngine:
                       f"Grounding retry skipped (streaming): {category}",
                       event="grounding_skipped_streaming", category=category)
 
+    def _scrub_sentences(self, sentences: List[str]) -> List[str]:
+        """Strip marker-shaped text from sentences about to be spoken.
+
+        The SentenceAssembler only holds back the exact, case-sensitive
+        ``[TOOL:`` prefix, so a variant marker (``[tool:weather]``,
+        ``[TOOL: WEATHER]``) can reach a streamed sentence. Those can't be
+        executed any more (the sentence is going out now), but they must never
+        be read aloud. Sentences that scrub to nothing are dropped.
+        """
+        out: List[str] = []
+        for sentence in sentences:
+            if re.search(_MARKER_START, sentence, re.IGNORECASE):
+                sentence = self._scrub_marker_residue(sentence)
+            if sentence.strip():
+                out.append(sentence)
+        return out
+
+    @staticmethod
+    def _log_unparsed_markers(residue: List[str]) -> None:
+        log_event(logger, logging.WARNING,
+                  f"Unparsed tool marker scrubbed from reply: {residue[0][:80]!r}",
+                  event="marker_unparsed", count=len(residue),
+                  fragment=residue[0][:80])
+
+    @classmethod
+    def _scrub_marker_residue(cls, text: str) -> str:
+        """Remove every marker-shaped fragment (none will be executed) and
+        log it as ``marker_unparsed``."""
+        residue = _MARKER_RESIDUE_RE.findall(text)
+        if not residue:
+            return text
+        cls._log_unparsed_markers(residue)
+        text = _MARKER_RESIDUE_RE.sub("", text)
+        return re.sub(r"[ \t]{2,}", " ", text).strip()
+
+    @classmethod
+    def _strip_markers(cls, text: str) -> str:
+        """Remove parsed markers silently and unparseable residue loudly."""
+        residue: List[str] = []
+        removed = False
+
+        def _drop(match: "re.Match") -> str:
+            nonlocal removed
+            removed = True
+            if not match.group("ok"):
+                residue.append(match.group(0))
+            return ""
+
+        text = _MARKER_ANY_RE.sub(_drop, text)
+        if residue:
+            cls._log_unparsed_markers(residue)
+        if removed:
+            text = re.sub(r"[ \t]{2,}", " ", text)
+        return text.strip()
+
     async def _finalize_stream(self, assembler: SentenceAssembler,
                                emitted: List[str], finish_reason: Optional[str],
                                last_user: str, ctx: TurnContext):
@@ -438,7 +542,7 @@ class LLMEngine:
                         Metrics.record_llm_ttft(
                             (first_token_time - start_time) * 1000,
                             self.config.llm_model)
-                    for sentence in assembler.feed(content):
+                    for sentence in self._scrub_sentences(assembler.feed(content)):
                         emitted.append(sentence)
                         yield {"type": "sentence", "text": sentence}
             except Exception as e:
@@ -551,14 +655,16 @@ class LLMEngine:
                         # Tool round decided: accumulate silently.
                         continue
                     if released:
-                        for sentence in assembler.feed(content):
+                        for sentence in self._scrub_sentences(
+                                assembler.feed(content)):
                             emitted.append(sentence)
                             yield {"type": "sentence", "text": sentence}
                     else:
                         held.append(content)
                         if len(held) >= self._STREAM_HOLD_TOKENS:
                             released = True
-                            for sentence in assembler.feed("".join(held)):
+                            for sentence in self._scrub_sentences(
+                                    assembler.feed("".join(held))):
                                 emitted.append(sentence)
                                 yield {"type": "sentence", "text": sentence}
                             held = []
@@ -601,7 +707,7 @@ class LLMEngine:
 
         if held and not released:
             # Short pure-content answer: the stream ended inside the hold.
-            for sentence in assembler.feed("".join(held)):
+            for sentence in self._scrub_sentences(assembler.feed("".join(held))):
                 emitted.append(sentence)
                 yield {"type": "sentence", "text": sentence}
 
@@ -634,17 +740,31 @@ class LLMEngine:
         category = self._grounding_category(str(last_user), response_text, ctx)
         if not category or not self._category_tools_available(category):
             return response_text
+        if grounding.side_effects_ran(ctx.tool_names):
+            # A trailing promise after a timer/callback/transfer/... already
+            # ran: re-running the turn would execute those side effects twice.
+            log_event(logger, logging.INFO,
+                      f"Grounding retry ({category}): skipped_side_effects",
+                      event="grounding_retry", category=category,
+                      outcome="skipped_side_effects")
+            return response_text
 
         start_time = time.time()
         outcome = "error"
         retried: Optional[str] = None
+        # ctx.tool_calls is cumulative over the turn: judge the retry by the
+        # tools IT executed, not by the ones the original reply already ran.
+        calls_before = ctx.tool_calls
         try:
             retried = await asyncio.wait_for(
-                self._generate(messages + [
-                    {"role": "system", "content": grounding.NUDGE}]),
+                self._generate(self._with_nudge(messages)),
                 timeout=self.config.grounding_retry_timeout_s)
-            retried = await self._apply_marker_tools(retried, ctx)
-            outcome = "tool_used" if ctx.tool_calls else "no_tool_call"
+            if retried in self.config.phrases.errors:
+                outcome = "error"
+            else:
+                retried = await self._apply_marker_tools(retried, ctx)
+                outcome = ("tool_used" if ctx.tool_calls > calls_before
+                           else "no_tool_call")
         except asyncio.TimeoutError:
             outcome = "timeout"
         except Exception as e:
@@ -658,6 +778,22 @@ class LLMEngine:
             return retried
         return response_text
 
+    @staticmethod
+    def _with_nudge(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """A copy of ``messages`` carrying the grounding NUDGE in the last user
+        turn (never as a mid-conversation system message — see
+        grounding.NUDGE). The caller's history is not modified."""
+        out = list(messages)
+        for i in range(len(out) - 1, -1, -1):
+            msg = out[i]
+            if msg.get("role") == "user" and isinstance(
+                    msg.get("content") or "", str):
+                out[i] = {**msg,
+                          "content": grounding.nudged_content(msg.get("content") or "")}
+                return out
+        out.append({"role": "user", "content": grounding.NUDGE})
+        return out
+
     async def _apply_marker_tools(self, response_text: str,
                                   ctx: TurnContext) -> str:
         """Execute [TOOL:...] markers in a reply and fold in spoken results.
@@ -667,7 +803,8 @@ class LLMEngine:
         the caller's TurnContext.
         """
         response_text, tool_results = await self._process_tool_calls(response_text)
-        ctx.tool_calls += len(tool_results)
+        for result in tool_results:
+            ctx.record_tool(result.get("tool", ""))
 
         # Append results from informational tools (like WEATHER)
         # These tools return data that should be spoken to the user
@@ -802,17 +939,48 @@ class LLMEngine:
         return list(conversation_history)
 
     def _build_system_prompt(self, call_context: Optional[Dict[str, Any]] = None) -> str:
-        """Build system prompt with dynamic context and tools."""
+        """The full system prompt as one string (static part + per-turn part)."""
+        static, dynamic = self._build_system_prompt_parts(call_context)
+        return static + dynamic
+
+    def _build_system_messages(
+            self, call_context: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, str]]:
+        """The system message(s) that open every request.
+
+        With LLM_SPLIT_SYSTEM_PROMPT (and native tool calling active) the
+        static part (base prompt, location) travels alone as the first system
+        message and the per-turn context as a second one. The first message
+        is then byte-identical on every turn of every call — and since chat
+        templates emit the native tool schemas directly after it, so is the
+        whole ~2K-token prefix, which the server's prefix cache can reuse
+        instead of re-prefilling on each request.
+
+        Opt-in because NOT every chat template accepts a second system
+        message: Qwen3/Hermes-style templates render it as a plain system
+        turn, but Qwen3.5's template raises on any system message after
+        position 0 and gpt-oss's harmony template silently drops it (losing
+        the clock, caller and memory context). Only enable it for a template
+        known to render it. Text-marker mode never splits: without native
+        tool schemas after the first message there is no large stable prefix
+        to gain.
+        """
+        static, dynamic = self._build_system_prompt_parts(call_context)
+        if (self.config.llm_split_system_prompt
+                and self._native_tools_active() and dynamic.strip()):
+            return [{"role": "system", "content": static},
+                    {"role": "system", "content": dynamic.strip()}]
+        return [{"role": "system", "content": static + dynamic}]
+
+    def _build_system_prompt_parts(
+            self, call_context: Optional[Dict[str, Any]] = None
+    ) -> Tuple[str, str]:
+        """(static, dynamic): the cacheable prefix and the per-turn context.
+
+        Keep anything that changes between turns or callers (the clock, the
+        caller, memory, summary, knowledge...) OUT of the static part.
+        """
         prompt = self.config.system_prompt
-        
-        # Add time context in the configured local timezone (the container
-        # clock may be UTC; a naive now() here told callers UTC times).
-        try:
-            from zoneinfo import ZoneInfo
-            now = datetime.now(ZoneInfo(self.config.local_timezone))
-        except Exception:
-            now = datetime.now()
-        prompt += f"\n\nCurrent time: {now.strftime('%I:%M %p %Z on %A, %B %d, %Y')}"
 
         # Static home/base address so "here", "home", and directions questions
         # have a fixed reference point. The MAP tool routes from this location.
@@ -821,6 +989,26 @@ class LLMEngine:
             prompt += (
                 f"\n\nYour location (where \"here\" and \"home\" are): "
                 f"{location.strip()}")
+
+        # Dynamic tools section from ToolManager. In native mode the tool
+        # schemas travel in the request's `tools` param instead — including the
+        # [TOOL:...] marker instructions there would just confuse the model.
+        if not self._native_tools_active():
+            tools_prompt = self.tool_manager.get_tools_prompt()
+            if tools_prompt:
+                prompt += f"\n\n{tools_prompt}"
+
+        static = prompt
+        prompt = ""
+
+        # Add time context in the configured local timezone (the container
+        # clock may be UTC; a naive now() here told callers UTC times).
+        try:
+            from zoneinfo import ZoneInfo
+            now = datetime.now(ZoneInfo(self.config.local_timezone))
+        except Exception:
+            now = datetime.now()
+        prompt += f"\n\nCurrent time: {now.strftime('%I:%M %p %Z on %A, %B %d, %Y')}"
 
         # Caller-chosen demeanor for this call, layered over the base prompt.
         # Placed right after the base persona and before the call facts so it
@@ -883,15 +1071,7 @@ class LLMEngine:
                         " keypad — do not ask them to say it aloud).")
 
 
-        # Add dynamic tools section from ToolManager. In native mode the tool
-        # schemas travel in the request's `tools` param instead — including the
-        # [TOOL:...] marker instructions there would just confuse the model.
-        if not self._native_tools_active():
-            tools_prompt = self.tool_manager.get_tools_prompt()
-            if tools_prompt:
-                prompt += f"\n\n{tools_prompt}"
-
-        return prompt
+        return static, prompt
 
     def _sampling_kwargs(self) -> Dict[str, Any]:
         """Sampling params shared by both generation paths.
@@ -907,7 +1087,23 @@ class LLMEngine:
         }
         if self.config.llm_frequency_penalty:
             kwargs["frequency_penalty"] = self.config.llm_frequency_penalty
+        extra = self._extra_body()
+        if extra:
+            kwargs["extra_body"] = extra
         return kwargs
+
+    def _extra_body(self) -> Optional[Dict[str, Any]]:
+        """Non-OpenAI request fields (sent at the top level of the JSON body).
+
+        Only the thinking switch for now: with LLM_ENABLE_THINKING set, every
+        chat completion carries chat_template_kwargs so a thinking model
+        (Ling, Qwen3...) is told per request, independent of the server's
+        --default-chat-template-kwargs. None when nothing is configured.
+        """
+        if self.config.llm_enable_thinking is None:
+            return None
+        return {"chat_template_kwargs": {
+            "enable_thinking": bool(self.config.llm_enable_thinking)}}
 
     def _fallback_error(self) -> str:
         """A configurable spoken fallback for generic LLM failures."""
@@ -939,6 +1135,10 @@ class LLMEngine:
             "model": self.config.llm_model,
             "max_tokens": max(self.config.llm_max_tokens, 2048),
         }
+        # The thinking switch applies to every completion, utilities included.
+        extra = self._extra_body()
+        if extra:
+            kwargs["extra_body"] = extra
         try:
             response = await asyncio.wait_for(
                 self.client.chat.completions.create(
@@ -959,7 +1159,7 @@ class LLMEngine:
             return text
 
         if (not result or not result.strip()
-                or "[TOOL:" in result):
+                or re.search(_MARKER_START, result, re.IGNORECASE)):
             log_event(logger, logging.WARNING,
                       "Message reformat produced no usable rewrite; using original",
                       event="message_reformat", outcome="rejected",
@@ -988,6 +1188,10 @@ class LLMEngine:
             "model": self.config.llm_model,
             "max_tokens": max(self.config.llm_max_tokens, 2048),
         }
+        # The thinking switch applies to every completion, utilities included.
+        extra = self._extra_body()
+        if extra:
+            kwargs["extra_body"] = extra
         try:
             response = await asyncio.wait_for(
                 self.client.chat.completions.create(
@@ -1006,7 +1210,8 @@ class LLMEngine:
                       event="summarize_text", outcome="error",
                       chars_in=len(text))
             return None
-        if not result or not result.strip() or "[TOOL:" in result:
+        if (not result or not result.strip()
+                or re.search(_MARKER_START, result, re.IGNORECASE)):
             return None
         return result.strip()
 
@@ -1105,7 +1310,12 @@ class LLMEngine:
                     # live-data question (or a promise to check) gets ONE
                     # forced-tool retry; the replacement msg falls through to
                     # the normal dispatch below.
+                    # Never with the budget already spent
+                    # (LLM_MAX_TOOL_ROUNDS=0): that request went out without
+                    # tools, and forcing one now would run a tool the operator
+                    # disabled (mirrors the streaming path's guard).
                     if (not tool_calls and round_no == 0 and tools
+                            and not budget_spent
                             and not grounding_retried
                             and self.config.grounding_retry_enabled):
                         category = grounding.grounding_category(
@@ -1123,10 +1333,9 @@ class LLMEngine:
                                 msg = forced
                                 tool_calls = forced.tool_calls
                             elif outcome == "unsupported":
-                                # Backend rejected tool_choice: nudge and loop.
-                                messages.append({
-                                    "role": "system",
-                                    "content": grounding.NUDGE})
+                                # Backend rejected tool_choice: nudge (in the
+                                # last user turn) and loop.
+                                messages = self._with_nudge(messages)
                                 continue
                             # timeout/no_tool_call/error: keep the original
                             # reply rather than stacking more latency.
@@ -1156,6 +1365,7 @@ class LLMEngine:
                                 raw=tc.function.arguments or "",
                             ))
                             result_text = getattr(result, "message", "") or ""
+                            ctx.record_tool(tc.function.name)
                             self._collect_spoken_result(
                                 ctx, tc.function.name, result)
                         except Exception as e:
@@ -1189,8 +1399,12 @@ class LLMEngine:
         """One completion with tool_choice="required".
 
         Returns (message, outcome): outcome "tool_used"/"no_tool_call" with a
-        message, or (None, "unsupported"/"timeout"/"error").
+        message, or (None, "unsupported"/"timeout"/"error"). A backend that
+        rejected tool_choice once is remembered (_tool_choice_supported), so
+        later turns skip straight to "unsupported" without a request.
         """
+        if not self._tool_choice_supported:
+            return None, "unsupported"
         try:
             response = await asyncio.wait_for(
                 self.client.chat.completions.create(
@@ -1204,8 +1418,10 @@ class LLMEngine:
             logger.warning("Grounding retry timed out (native)")
             return None, "timeout"
         except Exception as e:
-            if "400" in str(e) or "BadRequest" in type(e).__name__:
-                logger.warning(f"tool_choice=required rejected by backend: {e}")
+            if tool_choice_rejected(e):
+                logger.warning(f"tool_choice=required rejected by backend "
+                               f"(not retried this process): {e}")
+                self._tool_choice_supported = False
                 return None, "unsupported"
             logger.error(f"Grounding retry error (native): {e}")
             return None, "error"
@@ -1310,40 +1526,40 @@ class LLMEngine:
             return "I understand. Is there anything specific I can help you with?"
             
     async def _process_tool_calls(self, response: str) -> Tuple[str, List[Dict]]:
-        """Parse and execute tool calls from response."""
+        """Parse and execute [TOOL:...] markers in a reply.
+
+        Markers are ``[TOOL:NAME]`` or ``[TOOL:NAME:param=value,...]``
+        (case-insensitive, whitespace-tolerant; see _MARKER_RE) and execute
+        in the order they appear. Every marker is stripped from the returned
+        text, and any marker-shaped residue that could not be parsed
+        (truncated at max_tokens, an invalid name) is scrubbed too and logged
+        as ``marker_unparsed`` — it must never be read aloud.
+        """
         tool_results = []
-        
-        # Find tool calls in format: [TOOL:name:param1=val1,param2=val2] or [TOOL:name]
-        # The first alternative tolerates one level of balanced [...] inside a
-        # value (JSON arrays in "JSON object as a string" params, e.g. MCP
-        # tools); the second is the legacy fallback so anything else behaves
-        # exactly as before.
-        pattern_with_params = r'\[TOOL:(\w+):((?:[^\[\]]|\[[^\[\]]*\])+|[^\]]+)\]'
-        pattern_no_params = r'\[TOOL:(\w+)\]'
-        
-        # Process tools with parameters
-        matches = list(re.finditer(pattern_with_params, response))
-        for match in matches:
-            tool_name = match.group(1)
-            params_str = match.group(2)
-            
-            # Parse parameters
+        if not response:
+            return response, tool_results
+
+        for match in _MARKER_RE.finditer(response):
+            tool_name = match.group(1).upper()
+            params_str = match.group(2) or ""
+
             # Split only on commas that immediately precede a `key=` token, so
             # commas inside a value (e.g. timer/callback messages) are preserved
             # rather than truncating the value and dropping trailing fragments.
-            params = {}
+            params: Dict[str, Any] = {}
             for param in re.split(r',(?=\s*\w+=)', params_str):
                 if '=' in param:
                     key, value = param.split('=', 1)
-                    value = self._parse_param_value(value)
-                    params[key.strip()] = value
-                    
+                    key = key.strip()
+                    params[key] = self._coerce_param(
+                        value, self._declared_param_type(tool_name, key))
+
             tool_call = ToolCall(
                 name=tool_name,
                 params=params,
                 raw=match.group(0)
             )
-            
+
             try:
                 result = await self.tool_manager.execute_tool(tool_call)
                 tool_results.append({
@@ -1358,42 +1574,71 @@ class LLMEngine:
                     "params": params,
                     "error": str(e)
                 })
-        
-        # Process tools without parameters (e.g., HANGUP)
-        # Remove already-matched sections first to avoid double-matching
-        temp_response = re.sub(pattern_with_params, '', response)
-        matches_no_params = list(re.finditer(pattern_no_params, temp_response))
-        
-        for match in matches_no_params:
-            tool_name = match.group(1)
-            
-            tool_call = ToolCall(
-                name=tool_name,
-                params={},
-                raw=match.group(0)
-            )
-            
-            try:
-                result = await self.tool_manager.execute_tool(tool_call)
-                tool_results.append({
-                    "tool": tool_name,
-                    "params": {},
-                    "result": result
-                })
-            except Exception as e:
-                logger.error(f"Tool execution error: {e}")
-                tool_results.append({
-                    "tool": tool_name,
-                    "params": {},
-                    "error": str(e)
-                })
-                
-        # Remove all tool calls from response text
-        clean_response = re.sub(pattern_with_params, '', response)
-        clean_response = re.sub(pattern_no_params, '', clean_response).strip()
-        
+
+        # Remove all tool calls from the response text, plus any residue.
+        clean_response = self._strip_markers(response)
+
         return clean_response, tool_results
-        
+
+    def _declared_param_type(self, tool_name: str, param: str) -> Optional[str]:
+        """The JSON type a tool declares for ``param`` (``None`` if unknown).
+
+        Reads the tool's full JSON schema when it carries one (MCP tools),
+        else the flat ``parameters`` dict every BaseTool declares.
+        """
+        tool_manager = getattr(self, "tool_manager", None)
+        if tool_manager is None:
+            return None
+        try:
+            tool = tool_manager.get_tool(tool_name)
+        except Exception:
+            return None
+        if tool is None:
+            return None
+        json_schema = getattr(tool, "json_schema", None)
+        if isinstance(json_schema, dict):
+            spec = (json_schema.get("properties") or {}).get(param)
+        else:
+            spec = (getattr(tool, "parameters", None) or {}).get(param)
+        if not isinstance(spec, dict):
+            return None
+        ptype = spec.get("type")
+        if isinstance(ptype, list):  # e.g. ["string", "null"]
+            ptype = next((t for t in ptype if t != "null"), None)
+        return ptype if isinstance(ptype, str) else None
+
+    def _coerce_param(self, value: str, declared_type: Optional[str]) -> Any:
+        """Convert a marker param value according to the tool's schema.
+
+        Only boolean/integer/number params are coerced. A string (or any
+        other declared type) keeps the raw text: SIMON_SAYS text=yes must say
+        "yes", not "True", and CALC expression=42 must stay a string. Params
+        the tool doesn't declare fall back to the legacy heuristic.
+        """
+        raw = value.strip()
+        if declared_type is None:
+            return self._parse_param_value(raw)
+        if declared_type == "boolean":
+            low = raw.lower()
+            if low in ("true", "yes", "1"):
+                return True
+            if low in ("false", "no", "0"):
+                return False
+            return raw
+        if declared_type == "integer":
+            parsed = self._parse_param_value(raw)
+            if isinstance(parsed, bool):
+                return raw
+            if isinstance(parsed, float) and parsed.is_integer():
+                return int(parsed)
+            return parsed if isinstance(parsed, int) else raw
+        if declared_type == "number":
+            parsed = self._parse_param_value(raw)
+            if isinstance(parsed, (int, float)) and not isinstance(parsed, bool):
+                return parsed
+            return raw
+        return raw
+
     def _parse_param_value(self, value: str) -> Any:
         """Parse parameter value to appropriate type."""
         value = value.strip()

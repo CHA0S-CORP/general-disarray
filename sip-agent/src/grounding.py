@@ -15,7 +15,7 @@ Pure module: no config, no I/O — unit-testable like speech_text.
 """
 
 import re
-from typing import Dict, Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 # A live-data category fires only when the utterance also looks like a
 # question/request. Guards against topical small talk ("nice weather we're
@@ -70,10 +70,37 @@ CATEGORY_TOOLS: Dict[str, Tuple[str, ...]] = {
 }
 
 # The forced-retry instruction, shared by every engine path (native, agent,
-# text-marker) so the wording can't drift between them.
+# text-marker) so the wording can't drift between them. Engines append it to
+# the LAST USER message (see nudged_content) rather than sending it as a
+# mid-conversation system message: some chat templates reject a system
+# message after position 0 (Qwen3.5 raises) and others silently drop it
+# (gpt-oss), which would make the retry a no-op.
 NUDGE = ("You must answer the caller's last question using your tools. "
          "Call the right tool now; do not answer from memory and do not "
          "promise to check later.")
+
+
+def nudged_content(content: str) -> str:
+    """A user message's content with the grounding NUDGE appended."""
+    content = (content or "").rstrip()
+    return f"{content}\n\n({NUDGE})" if content else NUDGE
+
+
+# Tools that only READ — re-running them has no effect beyond latency. A
+# turn that already executed anything else (timers, callbacks, transfers,
+# hangup, workflows, memory/persona writes, container control, games, MCP
+# tools of unknown effect...) must never be re-run by a PROMISED_ACTION
+# retry: the retry would execute its side effects a second time.
+READ_ONLY_TOOLS = frozenset({
+    "WEATHER", "FORECAST", "DATETIME", "CALC", "JOKE", "SIMON_SAYS",
+    "QUAKES", "KP_INDEX", "ALERTS", "GPU_STATUS", "WEB_SEARCH", "KNOWLEDGE",
+    "DRINK_RECIPE", "MAP", "STATUS", "STORY", "DICE", "COIN",
+})
+
+
+def side_effects_ran(tool_names: Iterable[str]) -> bool:
+    """True when any executed tool is not known to be read-only."""
+    return any((n or "").upper() not in READ_ONLY_TOOLS for n in tool_names)
 
 # Reply phrases that promise an action instead of performing it. The turn is
 # over when the caller hears this — there is no "later".

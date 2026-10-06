@@ -132,3 +132,27 @@ async def test_disabled_is_unavailable(config_factory, tmp_path, knowledge_dir):
                          knowledge_enabled="false")
     kb = KnowledgeBase(cfg, embeddings=FakeEmbeddings())
     assert not kb.available
+
+async def test_available_is_memoized(kb, monkeypatch):
+    """`available` walks the knowledge dir; the KNOWLEDGE tool reads it per
+    call on the event loop, so it must be computed once."""
+    calls = []
+    real = kb._compute_available
+    monkeypatch.setattr(kb, "_compute_available",
+                        lambda: (calls.append(1), real())[1])
+    assert kb.available and kb.available and kb.available
+    assert len(calls) == 1
+    await kb.start()          # start() re-evaluates once
+    assert kb.available
+    assert len(calls) == 2
+
+
+async def test_knowledge_tool_skips_availability_check_when_ready(kb):
+    from types import SimpleNamespace
+    from plugins.knowledge_tool import KnowledgeTool
+    await kb.start()
+    tool = KnowledgeTool(SimpleNamespace(config=None, knowledge_base=kb))
+    kb._compute_available = lambda: pytest.fail("availability re-checked")
+    kb._available = None
+    result = await tool.execute({"query": "refund order purchase"})
+    assert "returns.md" in result.message

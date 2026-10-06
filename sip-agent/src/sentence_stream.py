@@ -23,8 +23,30 @@ _SENTENCE_SPLIT = re.compile(r'(?<=[.!?])\s+')
 
 _DEFAULT_MIN_CHARS = 25
 
-# Text-marker tool-call prefix (case-sensitive, matching the parser regex in
-# llm_engine._process_tool_calls).
+
+def _match_marker_prefix(buf: str, j: int) -> str:
+    """Match ``\\s*TOOL\\s*:`` (case-insensitive) in ``buf`` from index ``j``.
+
+    Returns "full" on a complete match, "partial" when the buffer ends while
+    the text so far could still become one, and "no" otherwise.
+    """
+    n = len(buf)
+    while j < n and buf[j].isspace():
+        j += 1
+    for ch in "tool":
+        if j >= n:
+            return "partial"
+        if buf[j].lower() != ch:
+            return "no"
+        j += 1
+    while j < n and buf[j].isspace():
+        j += 1
+    if j >= n:
+        return "partial"
+    return "full" if buf[j] == ":" else "no"
+
+# Text-marker tool-call prefix. Matched case-insensitively with optional
+# whitespace around the word (``[ tool :``), mirroring llm_engine._MARKER_RE.
 TOOL_MARKER_PREFIX = "[TOOL:"
 
 
@@ -121,19 +143,19 @@ class SentenceAssembler:
     def _scan_marker(self) -> Tuple[int, bool]:
         """(first index emission may not cross, full-marker-start present).
 
-        Case-sensitive: only the exact ``[TOOL:`` prefix holds; anything that
-        diverges from it (``[Total``, ``[tool:``) is ordinary text.
+        Case-insensitive and whitespace-tolerant (``[TOOL:``, ``[tool:``,
+        ``[ TOOL :``), like the engine's marker parser; anything that diverges
+        from that shape (``[Total``, ``[ see``) is ordinary text.
         """
-        n = len(TOOL_MARKER_PREFIX)
         pos = 0
         while True:
             i = self._buf.find("[", pos)
             if i == -1:
                 return len(self._buf), False
-            seg = self._buf[i:i + n]
-            if seg == TOOL_MARKER_PREFIX:
+            state = _match_marker_prefix(self._buf, i + 1)
+            if state == "full":
                 return i, True
-            if len(seg) < n and TOOL_MARKER_PREFIX.startswith(seg):
+            if state == "partial":
                 # Partial prefix at the end of the buffer: hold until more
                 # text proves whether it is a marker.
                 return i, False

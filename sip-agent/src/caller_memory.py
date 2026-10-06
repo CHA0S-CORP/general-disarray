@@ -17,7 +17,9 @@ call.
 import asyncio
 import json
 import logging
+import os
 import re
+import weakref
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -51,11 +53,26 @@ Respond with ONLY a JSON object, no other text:
 {"facts": ["fact one", "fact two"], "last_call_summary": "one sentence"}"""
 
 
+# User parts that identify NO ONE: withheld/blocked caller ID. Every such
+# caller would otherwise share one memory file (and one verification record),
+# leaking one stranger's facts to the next.
+_ANONYMOUS_CALLER_IDS = frozenset({
+    "anonymous", "unknown", "restricted", "private", "unavailable",
+    "withheld", "blocked", "anonymous.invalid",
+})
+
+
 def caller_id_from_uri(remote_uri: str) -> Optional[str]:
-    """'sip:1001@pbx' / '"Bob" <sip:1001@pbx>' -> '1001'; None when unusable."""
-    m = re.search(r'sips?:([^@;>\s]+)', remote_uri or "")
+    """'sip:1001@pbx' / '"Bob" <sip:1001@pbx>' -> '1001'.
+
+    None when unusable: unsafe as a filename, empty, or an anonymous /
+    withheld caller ID (no per-caller memory for callers we can't tell apart).
+    """
+    m = re.search(r'sips?:([^@;>\s]*)', remote_uri or "")
     caller = m.group(1) if m else (remote_uri or "").strip()
-    if caller and _SAFE_CALLER_ID.fullmatch(caller):
+    if not caller or caller.lower() in _ANONYMOUS_CALLER_IDS:
+        return None
+    if _SAFE_CALLER_ID.fullmatch(caller):
         return caller
     return None
 
@@ -70,7 +87,10 @@ class CallerMemoryStore:
         # One lock per caller: update_from_call holds it across the LLM
         # extraction so two overlapping post-call updates for the same caller
         # can't each write from their own stale snapshot.
-        self._locks: Dict[str, asyncio.Lock] = {}
+        # Weak values: a lock lives only while some update holds or awaits
+        # it, so the map can't grow by one entry per caller ever seen.
+        self._locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = (
+            weakref.WeakValueDictionary())
 
     def _lock_for(self, caller_id: str) -> asyncio.Lock:
         lock = self._locks.get(caller_id)
@@ -269,5 +289,10 @@ class CallerMemoryStore:
         if path is None:
             return
         tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(record, indent=2))
-        tmp.rename(path)
+        # fsync before the rename: otherwise a crash can leave the renamed
+        # file empty/truncated (rename durable, data not yet flushed).
+        with open(tmp, "w") as f:
+            f.write(json.dumps(record, indent=2))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
