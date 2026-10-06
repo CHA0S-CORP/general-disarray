@@ -366,8 +366,13 @@ class VirtualNumberRegistry:
     def _persist(self):
         try:
             tmp = self._store_file.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(
-                [e.to_dict() for e in self._entries.values()], indent=2))
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(json.dumps(
+                    [e.to_dict() for e in self._entries.values()], indent=2))
+                f.flush()
+                # Durable before the rename: a crash right after os.replace
+                # must not leave an empty/truncated store behind.
+                os.fsync(f.fileno())
             os.replace(tmp, self._store_file)
         except Exception as e:
             logger.error(f"Failed to persist virtual numbers: {e}")
@@ -378,7 +383,17 @@ class VirtualNumberRegistry:
         try:
             raw = json.loads(self._store_file.read_text())
         except Exception as e:
-            logger.error(f"Failed to load virtual numbers: {e}")
+            # Move the unreadable file aside rather than letting the next
+            # _persist() silently overwrite it — the operator can recover it.
+            backup = self._store_file.with_name(
+                f"{self._store_file.name}.corrupt-{int(time.time())}")
+            try:
+                os.replace(self._store_file, backup)
+                logger.error(f"Failed to load virtual numbers ({e}); "
+                             f"corrupt store moved to {backup}")
+            except OSError as move_err:
+                logger.error(f"Failed to load virtual numbers: {e} "
+                             f"(and could not back it up: {move_err})")
             return
         now = time.time()
         loaded = 0

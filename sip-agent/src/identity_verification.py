@@ -36,7 +36,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -254,9 +254,127 @@ class IdentityVerifier:
     factors apply only to callers with no per-caller factor of that kind.
     """
 
+    # Bound on the in-memory lockout/replay maps (attacker-chosen caller ids
+    # must not grow them without limit).
+    _MAX_TRACKED = 10_000
+
     def __init__(self, config, store: VerificationStore):
         self.config = config
         self.store = store
+        # Cross-call brute-force guard (process-wide, shared by every path:
+        # the in-call VERIFY tool, POST /verify and POST /verify/call).
+        self._guard_lock = threading.Lock()
+        self._failures: Dict[str, List[float]] = {}   # caller -> monotonic fail times
+        self._locked_until: Dict[str, float] = {}     # caller -> monotonic unlock time
+        # TOTP replay guard: last accepted time-step per secret fingerprint, so
+        # an observed code can't be replayed within its validity window — not
+        # even under a different caller id sharing the global secret.
+        self._last_totp_step: Dict[str, int] = {}
+
+    # -- brute-force lockout ----------------------------------------------
+    def _lockout_limits(self) -> Tuple[int, float]:
+        failures = int(getattr(self.config, "verify_lockout_failures", 5) or 0)
+        window = float(getattr(self.config, "verify_lockout_s", 900) or 0)
+        return failures, window
+
+    def lockout_remaining_s(self, caller_id: str) -> int:
+        """Seconds until ``caller_id`` may attempt verification again (0 = not locked)."""
+        key = caller_id or ""
+        with self._guard_lock:
+            until = self._locked_until.get(key)
+            if until is None:
+                return 0
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                self._locked_until.pop(key, None)
+                return 0
+            return max(1, int(remaining + 0.999))
+
+    def is_locked_out(self, caller_id: str) -> bool:
+        return self.lockout_remaining_s(caller_id) > 0
+
+    def _prune_guard_maps(self, now: float, window: float) -> None:
+        if len(self._failures) > self._MAX_TRACKED:
+            self._failures = {k: v for k, v in self._failures.items()
+                              if v and now - v[-1] < window}
+        if len(self._locked_until) > self._MAX_TRACKED:
+            self._locked_until = {k: v for k, v in self._locked_until.items() if v > now}
+
+    def _record_failure(self, caller_id: str) -> None:
+        max_failures, window = self._lockout_limits()
+        if max_failures <= 0 or window <= 0:
+            return
+        key = caller_id or ""
+        now = time.monotonic()
+        with self._guard_lock:
+            self._prune_guard_maps(now, window)
+            recent = [t for t in self._failures.get(key, []) if now - t < window]
+            recent.append(now)
+            if len(recent) >= max_failures:
+                self._locked_until[key] = now + window
+                self._failures.pop(key, None)
+                logger.warning("Verification locked out for %s after %d failures",
+                               key or "<global>", len(recent))
+            else:
+                self._failures[key] = recent
+
+    def _record_success(self, caller_id: str) -> None:
+        key = caller_id or ""
+        with self._guard_lock:
+            self._failures.pop(key, None)
+
+    def _guarded(self, caller_id: str, candidate: str,
+                 check: Callable[[], Tuple[bool, Optional[str]]]) -> Tuple[bool, Optional[str]]:
+        """Run one verification attempt under the cross-call lockout.
+
+        Locked-out callers are refused without evaluating the code (fail
+        closed, and no PBKDF2 work for a brute-forcer). A blank candidate is
+        not a guess and doesn't count against the caller.
+        """
+        if self.is_locked_out(caller_id):
+            logger.info("Verification attempt refused for %s: locked out",
+                        caller_id or "<global>")
+            return False, None
+        if not (candidate or "").strip():
+            return False, None
+        ok, used = check()
+        if ok:
+            self._record_success(caller_id)
+        else:
+            self._record_failure(caller_id)
+        return ok, used
+
+    # -- TOTP matching with replay protection ------------------------------
+    @staticmethod
+    def _secret_fingerprint(secret: str) -> str:
+        return hashlib.sha256(secret.encode("utf-8")).hexdigest()[:32]
+
+    def _totp_match(self, secret: str, candidate: str, params: Dict[str, Any],
+                    window: int) -> bool:
+        """True when ``candidate`` is the code for a time-step within
+        ``window`` of now that is NEWER than the last one accepted for this
+        secret; records the step on success (single use per step)."""
+        totp = build_totp(secret, params)
+        period = int(params["period"])
+        base = int(time.time()) // period
+        matched: Optional[int] = None
+        # Check every step in the window (no early exit) with a constant-time
+        # compare; keep the newest matching step.
+        for offset in range(-max(0, int(window)), max(0, int(window)) + 1):
+            if _const_eq(totp.generate_otp(base + offset), candidate):
+                matched = base + offset
+        if matched is None:
+            return False
+        fp = self._secret_fingerprint(secret)
+        with self._guard_lock:
+            last = self._last_totp_step.get(fp)
+            if last is not None and matched <= last:
+                logger.info("Rejected replayed TOTP code (step already used)")
+                return False
+            if len(self._last_totp_step) > self._MAX_TRACKED:
+                self._last_totp_step.clear()
+            self._last_totp_step[fp] = matched
+        return True
 
     # -- resolution helpers ---------------------------------------------
     def _resolve_totp_secret(self, caller_id: str) -> Optional[str]:
@@ -280,7 +398,30 @@ class IdentityVerifier:
         return self.is_configured() or self.has_any_credentials(caller_id)
 
     # -- checks ----------------------------------------------------------
+    # Public checks run under the lockout (_guarded); the _check_* helpers are
+    # the raw factor comparisons, so one user-visible attempt that tries
+    # several factors counts as ONE failure.
     def verify_pin(self, caller_id: str, candidate: str) -> bool:
+        return self._guarded(caller_id, candidate, lambda: (
+            (True, "pin") if self._check_pin(caller_id, candidate) else (False, None)))[0]
+
+    def verify_totp(self, caller_id: str, candidate: str) -> bool:
+        return self._guarded(caller_id, candidate, lambda: (
+            (True, "otp") if self._check_totp(caller_id, candidate) else (False, None)))[0]
+
+    def verify_factors(self, caller_id: str, pin: Optional[str] = None,
+                       otp: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+        """One out-of-band attempt with an optional OTP and/or PIN (OTP tried
+        first). Counts as a single attempt against the lockout."""
+        def _check() -> Tuple[bool, Optional[str]]:
+            if otp and self._check_totp(caller_id, otp):
+                return True, "otp"
+            if pin and self._check_pin(caller_id, pin):
+                return True, "pin"
+            return False, None
+        return self._guarded(caller_id, (otp or "") + (pin or ""), _check)
+
+    def _check_pin(self, caller_id: str, candidate: str) -> bool:
         candidate = (candidate or "").strip()
         if not candidate:
             return False
@@ -299,7 +440,7 @@ class IdentityVerifier:
             return False
         return _const_eq(candidate, global_pin)
 
-    def verify_totp(self, caller_id: str, candidate: str) -> bool:
+    def _check_totp(self, caller_id: str, candidate: str) -> bool:
         candidate = (candidate or "").strip()
         if not candidate or pyotp is None:
             return False
@@ -308,8 +449,7 @@ class IdentityVerifier:
             return False
         try:
             window = int(getattr(self.config, "verify_totp_window", 1))
-            totp = build_totp(secret, totp_params(self.config))
-            return bool(totp.verify(candidate, valid_window=window))
+            return self._totp_match(secret, candidate, totp_params(self.config), window)
         except Exception as e:
             logger.warning(f"verify_totp failed for {caller_id}: {e}")
             return False
@@ -322,18 +462,22 @@ class IdentityVerifier:
         either — it tries OTP first when a TOTP secret is available, then the PIN.
         """
         method = (method or "auto").lower()
-        if method == "pin":
-            ok = self.verify_pin(caller_id, candidate)
-            return ok, ("pin" if ok else None)
-        if method == "otp":
-            ok = self.verify_totp(caller_id, candidate)
-            return ok, ("otp" if ok else None)
-        # auto: prefer OTP when a secret exists, then PIN.
-        if self._resolve_totp_secret(caller_id) and self.verify_totp(caller_id, candidate):
-            return True, "otp"
-        if self.verify_pin(caller_id, candidate):
-            return True, "pin"
-        return False, None
+
+        def _check() -> Tuple[bool, Optional[str]]:
+            if method == "pin":
+                ok = self._check_pin(caller_id, candidate)
+                return ok, ("pin" if ok else None)
+            if method == "otp":
+                ok = self._check_totp(caller_id, candidate)
+                return ok, ("otp" if ok else None)
+            # auto: prefer OTP when a secret exists, then PIN.
+            if self._resolve_totp_secret(caller_id) and self._check_totp(caller_id, candidate):
+                return True, "otp"
+            if self._check_pin(caller_id, candidate):
+                return True, "pin"
+            return False, None
+
+        return self._guarded(caller_id, candidate, _check)
 
     def verify_explicit(self, candidate: str, pin: Optional[str] = None,
                         totp_secret: Optional[str] = None,
@@ -365,8 +509,7 @@ class IdentityVerifier:
                           else int(getattr(self.config, "verify_totp_window", 1)))
                 params = totp_params(self.config, digits=totp_digits,
                                      period=totp_period, algorithm=totp_algorithm)
-                return bool(build_totp(totp_secret, params).verify(
-                    candidate, valid_window=window))
+                return self._totp_match(totp_secret, candidate, params, window)
             except Exception as e:
                 logger.warning(f"verify_explicit TOTP check failed: {e}")
                 return False
@@ -395,6 +538,10 @@ class IdentityVerifier:
 
     async def averify_totp(self, caller_id: str, candidate: str) -> bool:
         return await asyncio.to_thread(self.verify_totp, caller_id, candidate)
+
+    async def averify_factors(self, caller_id: str, pin: Optional[str] = None,
+                              otp: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+        return await asyncio.to_thread(self.verify_factors, caller_id, pin, otp)
 
     async def averify_explicit(self, candidate: str, **kwargs) -> Tuple[bool, Optional[str]]:
         return await asyncio.to_thread(lambda: self.verify_explicit(candidate, **kwargs))

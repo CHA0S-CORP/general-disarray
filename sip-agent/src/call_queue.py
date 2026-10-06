@@ -31,6 +31,19 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+class DuplicateCallError(Exception):
+    """enqueue() refused a call_id that is already queued or processing."""
+
+    def __init__(self, call_id: str):
+        super().__init__(f"call_id '{call_id}' is already queued or in progress")
+        self.call_id = call_id
+
+
+# Statuses that make a call_id unavailable for reuse (finished records linger
+# 24h but their ids may legitimately be reused).
+_ACTIVE_STATUSES = ("queued", "processing")
+
+
 class QueuedCallStatus(str, Enum):
     """Status of a queued call."""
     QUEUED = "queued"
@@ -77,6 +90,10 @@ class CallQueue:
     
     QUEUE_KEY = "sip:call_queue"
     PROCESSING_KEY = "sip:call_processing"
+    # Crash-safe hand-off list: the worker BLMOVEs ids here atomically from
+    # QUEUE_KEY, so a call is never "popped but not marked processing" (a
+    # crash between BLPOP and SADD used to lose it). Recovery requeues both.
+    INFLIGHT_KEY = "sip:call_inflight"
     CALL_PREFIX = "sip:call:"
     
     def __init__(
@@ -154,8 +171,8 @@ class CallQueue:
                 pass
 
         # Cancel and await any in-flight call-processing tasks BEFORE the
-        # caller disconnects Redis, so each task's finally-block can clear the
-        # PROCESSING_KEY entry and persist final status while Redis is still up.
+        # caller disconnects Redis. A cancelled call stays in PROCESSING_KEY
+        # (see _process_call) so the next start() requeues it.
         if self._tasks:
             pending = list(self._tasks)
             for task in pending:
@@ -165,23 +182,44 @@ class CallQueue:
         logger.info("Call queue stopped")
         
     async def enqueue(self, call_id: str, request: 'OutboundCallRequest') -> QueuedCall:
-        """Add a call to the queue."""
+        """Add a call to the queue.
+
+        The duplicate check, the record write and the RPUSH run as one
+        optimistic (WATCH/MULTI) transaction, so two concurrent requests with
+        the same call_id can't both enqueue. Raises DuplicateCallError when the
+        id is already queued or processing.
+        """
         queued_call = QueuedCall(
             call_id=call_id,
             request_json=request.model_dump_json(),
             status=QueuedCallStatus.QUEUED,
             queued_at=_utcnow_iso()
         )
-        
-        # Store call data
-        await self.redis.set(
-            f"{self.CALL_PREFIX}{call_id}",
-            json.dumps(queued_call.to_dict()),
-            ex=86400  # Expire after 24 hours
-        )
-        
-        # Add to queue - rpush returns new list length (our position)
-        position = await self.redis.rpush(self.QUEUE_KEY, call_id)
+        key = f"{self.CALL_PREFIX}{call_id}"
+        payload = json.dumps(queued_call.to_dict())
+
+        async with self.redis.pipeline(transaction=True) as pipe:
+            while True:
+                try:
+                    await pipe.watch(key)
+                    existing = await pipe.get(key)
+                    if existing:
+                        try:
+                            existing_status = json.loads(existing).get("status")
+                        except (ValueError, AttributeError):
+                            existing_status = None
+                        if existing_status in _ACTIVE_STATUSES:
+                            await pipe.unwatch()
+                            raise DuplicateCallError(call_id)
+                    pipe.multi()
+                    pipe.set(key, payload, ex=86400)  # Expire after 24 hours
+                    # rpush returns the new list length (our position)
+                    pipe.rpush(self.QUEUE_KEY, call_id)
+                    _, position = await pipe.execute()
+                    break
+                except redis.WatchError:
+                    # The record changed between WATCH and EXEC — re-check.
+                    continue
         queued_call.position = position
         
         # Record queue metrics
@@ -212,14 +250,16 @@ class CallQueue:
         }
         
     async def _recover_processing_calls(self):
-        """Requeue calls that were processing during shutdown."""
-        processing = await self.redis.smembers(self.PROCESSING_KEY)
-        
+        """Requeue calls that were processing (or mid hand-off) during shutdown."""
+        processing = set(await self.redis.smembers(self.PROCESSING_KEY))
+        processing.update(await self.redis.lrange(self.INFLIGHT_KEY, 0, -1))
+
         for call_id in processing:
             logger.warning(f"Recovering interrupted call: {call_id}")
             # Move back to queue
             await self.redis.lpush(self.QUEUE_KEY, call_id)
             await self.redis.srem(self.PROCESSING_KEY, call_id)
+            await self.redis.lrem(self.INFLIGHT_KEY, 0, call_id)
             
             # Update status
             call = await self.get_call(call_id)
@@ -234,8 +274,15 @@ class CallQueue:
                 
     async def _worker_loop(self):
         """Process calls from the queue."""
+        idle = False
         while self._running:
             try:
+                if idle:
+                    # Brief pause after an empty poll so the loop can't spin
+                    # against a backend whose BLMOVE returns immediately
+                    # (e.g. fakeredis). Outside the slot-holding section.
+                    idle = False
+                    await asyncio.sleep(0.1)
                 # Acquire a processing slot BEFORE pulling a call from the queue
                 # so a call is only popped (and marked processing) when a slot is
                 # actually free. This keeps the PROCESSING_KEY count accurate and
@@ -245,15 +292,16 @@ class CallQueue:
                 wait_time = time.monotonic() - slot_start
 
                 try:
-                    # Try to get a call from queue (blocking with timeout)
-                    result = await self.redis.blpop(self.QUEUE_KEY, timeout=1)
+                    # Atomically move the next call into the in-flight list
+                    # (blocking with timeout): it is never in neither place.
+                    call_id = await self.redis.blmove(
+                        self.QUEUE_KEY, self.INFLIGHT_KEY, 1, "LEFT", "RIGHT")
 
-                    if result is None:
+                    if call_id is None:
                         # No call available; release the slot and retry.
                         self._semaphore.release()
+                        idle = True
                         continue
-
-                    _, call_id = result
 
                     # Mark as processing
                     await self.redis.sadd(self.PROCESSING_KEY, call_id)
@@ -300,6 +348,7 @@ class CallQueue:
     async def _process_call(self, call_id: str):
         """Process a single call."""
         call = None
+        interrupted = False
         try:
             # Get call data
             call = await self.get_call(call_id)
@@ -338,21 +387,37 @@ class CallQueue:
                 call.error = error or f"Call ended with status '{final_status.value}'"
             call.completed_at = _utcnow_iso()
             
+        except asyncio.CancelledError:
+            # Graceful stop mid-call. CancelledError is not an Exception, so
+            # without this the finally below would drop the call from the
+            # processing set while persisting status=processing — stranding
+            # it (and its call_id) for 24h. Leave it in PROCESSING_KEY so the
+            # next start() requeues it, and re-raise.
+            interrupted = True
+            log_event(logger, logging.WARNING,
+                      f"Call {call_id} interrupted by shutdown; will be requeued on restart",
+                      event="call_interrupted", call_id=call_id)
+            raise
+
         except Exception as e:
             logger.error(f"Call {call_id} failed: {e}", exc_info=True)
             if call:
                 call.status = QueuedCallStatus.FAILED
-                call.error = str(e)
+                # Exposed via GET /call/{id}: keep internals in the log only.
+                call.error = "Internal error during call"
                 call.completed_at = _utcnow_iso()
-                
+
         finally:
-            # Remove from processing set
-            await self.redis.srem(self.PROCESSING_KEY, call_id)
-            
-            # Update final status
-            if call:
-                await self.redis.set(
-                    f"{self.CALL_PREFIX}{call_id}",
-                    json.dumps(call.to_dict()),
-                    ex=86400
-                )
+            if not interrupted:
+                await self._finish_call(call_id, call)
+
+    async def _finish_call(self, call_id: str, call: Optional[QueuedCall]):
+        """Clear the processing markers and persist the final status."""
+        await self.redis.srem(self.PROCESSING_KEY, call_id)
+        await self.redis.lrem(self.INFLIGHT_KEY, 0, call_id)
+        if call:
+            await self.redis.set(
+                f"{self.CALL_PREFIX}{call_id}",
+                json.dumps(call.to_dict()),
+                ex=86400
+            )
