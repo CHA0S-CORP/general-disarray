@@ -37,7 +37,7 @@ Call flow: PJSIP receives RTP audio → VAD/STT (Speaches) → LLM (vLLM) → to
 - `caller_memory.py` — `CallerMemoryStore`: cross-call memory per caller (`data/caller_memory/<caller>.json`, keyed by the SIP URI user part). Facts are LLM-extracted from the transcript after each call (fire-and-forget from both teardown paths in `main.py`) and injected into the system prompt at call start. `CALLER_MEMORY_ENABLED` (default on); fail-open everywhere.
 - `knowledge_base.py` + `plugins/knowledge_tool.py` — RAG: `.txt`/`.md` files in `data/knowledge/` are chunked and embedded locally (fastembed ONNX on CPU; model cached under `data/models/fastembed`) into a persisted langchain `InMemoryVectorStore` (`data/knowledge_index/`), retrievable via the `KNOWLEDGE` tool in every tool-calling mode (plus optional `KNOWLEDGE_AUTO_INJECT` prompt injection). The tool registers only when the KB is `available` (enabled + deps + documents present); restart to reindex changed documents.
 - `context_manager.py` — rolling conversation summary: when a call outgrows `MAX_CONVERSATION_TURNS`, overflow turns are folded into `session.rolling_summary` by a background task (never on the speaking path) and injected as a "Conversation so far" block instead of being silently dropped. `CONVERSATION_SUMMARY_ENABLED` (default on).
-- `tool_manager.py` — Loads the built-in tool set, runs the background scheduler for timers/callbacks/scheduled-calls (`_run_scheduler`; callbacks and scheduled calls persist across restarts via `data/scheduled_tasks.json`), and executes tool calls. Outbound-call tasks are serialized by `_outbound_call_lock` (one live call session). The `CALLBACK` tool is special-cased here so it defaults to the current caller's number.
+- `tool_manager.py` — Loads the built-in tool set, runs the background scheduler for timers/callbacks/scheduled-calls (`_run_scheduler`; callbacks and scheduled calls persist across restarts via `data/scheduled_tasks.json`), and executes tool calls. Outbound-call tasks are serialized by `_outbound_call_lock` (one live call session). `CALLBACK` (`plugins/callback_tool.py`) defaults to the current caller's number and enforces the voice-dial policy (`plugins/helpers.check_voice_dial_allowed`) itself, so REST paths get the same rules; voice CANCEL/STATUS only see timers/callbacks owned by the current call or caller (`ScheduledTask.owner_*`).
 - `tool_plugins.py` — `BaseTool` / `ToolResult` / `ToolStatus` base classes plus `PluginLoader`/`ToolRegistry` for filesystem plugin discovery.
 - `api.py` — FastAPI app (`create_api`): outbound calls, tool listing/execution, TTS `/speak`, scheduling CRUD.
 - `call_queue.py` — Redis-backed, concurrency-limited outbound call queue.
@@ -70,9 +70,9 @@ Built-in tools live in `sip-agent/src/plugins/`. Each subclasses `BaseTool` and 
 
 ```bash
 # --- Run the stack (from repo root) ---
-cp sip-agent/.env.example sip-agent/.env     # then edit SIP_*, LLM_MODEL, etc.
+cp .env.example .env     # root .env (compose reads it); then edit SIP_*, LLM_MODEL, OPEN_TERMINAL_API_KEY, etc.
 docker compose up -d                                                              # base stack
-docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d   # + Grafana/Prometheus/Loki/Tempo
+docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d   # + Grafana/Prometheus/Loki/Tempo (published on 127.0.0.1; see OBSERVABILITY_BIND_ADDRESS / GRAFANA_BIND_ADDRESS)
 docker compose -f docker-compose.dgx.yml up -d                                   # DGX Spark variant (its own self-contained compose)
 
 # Health check
@@ -99,7 +99,9 @@ cd speaches   # ruff format/check, pyright, pytest
 
 ## Conventions & constraints
 
-- **Configuration is entirely env-var driven** through `config.py`. Add new settings there as `field(default_factory=lambda: os.getenv(...))` and surface them in the compose files + `.env.example`. Don't hardcode values in component modules.
+- **Configuration is entirely env-var driven** through `config.py`. Add new settings there as `field(default_factory=lambda: os.getenv(...))` (booleans: `_env_bool("NAME", default)`, which accepts true/false, 1/0, yes/no, on/off and keeps the default on blank/garbage — never `.lower() == "true"`) and surface them in **both** compose files + `.env.example`. `tests/unit/test_config_drift.py` fails if a var config.py reads is missing from `.env.example` (internal-only vars go in its `EXEMPT` set). Don't hardcode values in component modules.
+- The sip-agent service loads the root `.env` via an optional `env_file` (compose ≥ 2.24), so any `.env` setting reaches the container even if it isn't in the compose `environment:` list; that list still wins on conflicts (it pins `DATA_DIR=/app/data`, `API_PORT=8080`, service URLs, and blanks other services' secrets). `OPEN_TERMINAL_API_KEY` is required by the base compose (`${...:?}`) — `docker compose config` fails without it.
+- Tool switches: `ENABLE_TIMER_TOOL`, `ENABLE_CALLBACK_TOOL`, `ENABLE_WEATHER_TOOL` (default on) gate those built-ins in `tool_manager._should_enable_tool`. Voice-initiated dialing (CALLBACK to another number, TRANSFER) is policed by `VOICE_DIAL_ALLOW_PATTERN` (optional allowlist regex) and `VOICE_DIAL_DENY_PATTERN` (blank = built-in international/premium-rate deny-list; `(?!)` disables), plus `CALLBACK_MAX_PER_CALL` / `CALLBACK_MAX_DELAY_S`.
 - The agent targets Python 3.11 and uses `List`/`Dict` typing. The `speaches` submodule mandates modern `list`/`dict` typing and other rules in its own `CLAUDE.md` — apply those only inside `speaches/`.
 - TTS for common phrases (greetings, acknowledgments, etc.) is pre-cached at startup from `config.phrases` (see `PhrasesConfig.get_all_phrases_for_cache`); new fixed phrases should flow through that path for instant playback. Phrases can be overridden via `PHRASES_*` env vars (JSON array or comma-separated) or a `data/phrases.json` file.
 - Commit style uses emoji-prefixed conventional commits (e.g. `✨ feat:`, `fix:`).

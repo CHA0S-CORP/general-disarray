@@ -19,3 +19,18 @@ data/verify_credentials.tmp
 data/knowledge/*
 !data/knowledge/example-house-notes.md
 sip-agent/tests/e2e/reports/
+
+# Env files: only the template is tracked (.env.bak.*, .env.local, ... hold secrets)
+.env.*
+!.env.example
+
+# Hand-made backups (docker-compose.yml.bak-*, .env.bak.pre-*,
+# searxng/settings.yml.bak.pre-engines, ...)
+*.bak
+*.bak.*
+*.bak-*
+
+# TLS private keys (the public .crt and nginx/openssl configs may be tracked)
+tls/*.key
+tls/*.pem
+*.key

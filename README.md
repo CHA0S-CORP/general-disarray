@@ -153,8 +153,8 @@ git clone https://github.com/your-org/sip-agent.git
 cd sip-agent
 
 # Configure environment
-cp sip-agent/.env.example sip-agent/.env
-nano sip-agent/.env
+cp .env.example .env
+nano .env
 
 # Start services
 docker compose up -d

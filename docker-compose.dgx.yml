@@ -132,6 +132,13 @@ services:
     #   dockerfile: Dockerfile
     container_name: sip-agent
     image:  ghcr.io/cha0s-corp/sip-agent:latest
+    # Forward every .env setting into the container (PHRASES_*, API_RETRY_*,
+    # API_TIMEOUT_S, SIP_TRANSPORT, REDIS_PASSWORD/SSL, ...), not just the ones
+    # listed under environment: below. Entries in environment: take precedence.
+    # Optional so a fresh checkout without .env still starts (compose >= 2.24).
+    env_file:
+      - path: .env
+        required: false
     depends_on:
       redis:
         condition: service_healthy
@@ -140,6 +147,18 @@ services:
       speaches:
         condition: service_healthy
     environment:
+      # env_file above forwards ALL of .env, including other services'
+      # secrets. Blank the ones the agent never uses so they don't sit in the
+      # environment of the call-facing, tool-running container.
+      - HF_TOKEN=
+      - OPEN_TERMINAL_API_KEY=
+      - WEBUI_SECRET_KEY=
+      - MICROSOFT_CLIENT_ID=
+      - MICROSOFT_CLIENT_SECRET=
+      - MICROSOFT_CLIENT_TENANT_ID=
+      # Pin the data dir to the bind mount below (a host-style DATA_DIR in
+      # .env for local runs must not redirect the container's data).
+      - DATA_DIR=/app/data
       # Redis settings
       - REDIS_URL=redis://redis:6379/0
       # Call queue settings
@@ -155,6 +174,8 @@ services:
       - LLM_TOOL_CALLING=${LLM_TOOL_CALLING:-text}
       - LLM_STREAMING=${LLM_STREAMING:-true}
       - LLM_FREQUENCY_PENALTY=${LLM_FREQUENCY_PENALTY:-0.0}
+      - LLM_ENABLE_THINKING=${LLM_ENABLE_THINKING:-}
+      - LLM_SPLIT_SYSTEM_PROMPT=${LLM_SPLIT_SYSTEM_PROMPT:-false}
       - LLM_MAX_TOOL_ROUNDS=${LLM_MAX_TOOL_ROUNDS:-5}
       - LLM_AGENT_TIMEOUT_S=${LLM_AGENT_TIMEOUT_S:-30.0}
       - MESSAGE_REFORMAT_TIMEOUT_S=${MESSAGE_REFORMAT_TIMEOUT_S:-20.0}
@@ -206,6 +227,9 @@ services:
       - VERIFY_TOTP_WINDOW=${VERIFY_TOTP_WINDOW:-1}
       - VERIFY_REQUIRED_TOOLS=${VERIFY_REQUIRED_TOOLS:-}
       - VERIFY_MAX_ATTEMPTS=${VERIFY_MAX_ATTEMPTS:-3}
+      # Cross-call brute-force lockout: N failures -> locked out for S seconds.
+      - VERIFY_LOCKOUT_FAILURES=${VERIFY_LOCKOUT_FAILURES:-5}
+      - VERIFY_LOCKOUT_S=${VERIFY_LOCKOUT_S:-900}
       - VERIFY_DTMF_TIMEOUT_S=${VERIFY_DTMF_TIMEOUT_S:-20.0}
       - VERIFY_DTMF_INTERDIGIT_S=${VERIFY_DTMF_INTERDIGIT_S:-3.0}
       - VERIFY_ISSUER=${VERIFY_ISSUER:-General Disarray}
@@ -234,13 +258,16 @@ services:
       - WHISPER_MODEL=${WHISPER_MODEL:-Systran/faster-distil-whisper-small.en}
       - WHISPER_LANGUAGE=${WHISPER_LANGUAGE:-en}
       - MIN_SPEECH_DURATION_MS=${MIN_SPEECH_DURATION_MS:-200}
-      - MAX_SPEECH_DURATION_S=${MAX_SPEECH_DURATION_S:-8.0}
+      - MAX_SPEECH_DURATION_S=${MAX_SPEECH_DURATION_S:-10.0}
       - SILENCE_TIMEOUT_MS=${SILENCE_TIMEOUT_MS:-750}
       # Endpointing: fixed | adaptive | speculative (see ENDPOINT_MODE docs)
       - ENDPOINT_MODE=${ENDPOINT_MODE:-fixed}
       - ENDPOINT_MIN_SILENCE_MS=${ENDPOINT_MIN_SILENCE_MS:-350}
       - ENDPOINT_MAX_SILENCE_MS=${ENDPOINT_MAX_SILENCE_MS:-1500}
       - BARGE_IN_MIN_DURATION=${BARGE_IN_MIN_DURATION:-400}
+      # RMS energy floor for a chunk to count toward a barge-in run (was not
+      # passed through before 2026-10-06, so .env values were silently ignored).
+      - BARGE_IN_ENERGY_THRESHOLD=${BARGE_IN_ENERGY_THRESHOLD:-2000}
       # Gap (ms) of VAD-negative audio tolerated INSIDE a barge-in speech run.
       # Real speech is not VAD-positive end to end (syllable gaps, unvoiced
       # consonants); without this the run resets on the first negative chunk
@@ -248,6 +275,10 @@ services:
       - BARGE_IN_MAX_GAP_MS=${BARGE_IN_MAX_GAP_MS:-250}
       - STT_MODE=${STT_MODE:-batch}
       - REALTIME_COMMIT_TIMEOUT_S=${REALTIME_COMMIT_TIMEOUT_S:-5.0}
+      # Per-request batch STT timeout; re-probe interval for STT/TTS found
+      # unavailable at boot (instead of staying latched off).
+      - STT_TIMEOUT_S=${STT_TIMEOUT_S:-15.0}
+      - SPEECH_REPROBE_INTERVAL_S=${SPEECH_REPROBE_INTERVAL_S:-15.0}
       # TTS settings (Kokoro via Speaches - auto-downloaded on first use)
       - TTS_MODEL=${TTS_MODEL:-speaches-ai/Kokoro-82M-v1.0-ONNX}
       - TTS_VOICE=${TTS_VOICE:-af_heart}
@@ -281,6 +312,16 @@ services:
       # Tools
       - CALLBACK_RING_TIMEOUT=${CALLBACK_RING_TIMEOUT:-30}
       - ENABLE_PLUGIN_AUTODISCOVERY=${ENABLE_PLUGIN_AUTODISCOVERY:-true}
+      - ENABLE_TIMER_TOOL=${ENABLE_TIMER_TOOL:-true}
+      - ENABLE_CALLBACK_TOOL=${ENABLE_CALLBACK_TOOL:-true}
+      - ENABLE_WEATHER_TOOL=${ENABLE_WEATHER_TOOL:-true}
+      # Voice-initiated dial policy (CALLBACK to another number, TRANSFER).
+      # Empty DENY falls back to the built-in international/premium-rate
+      # deny-list (see config.py); ALLOW empty = no allowlist.
+      - VOICE_DIAL_ALLOW_PATTERN=${VOICE_DIAL_ALLOW_PATTERN:-}
+      - VOICE_DIAL_DENY_PATTERN=${VOICE_DIAL_DENY_PATTERN:-}
+      - CALLBACK_MAX_PER_CALL=${CALLBACK_MAX_PER_CALL:-3}
+      - CALLBACK_MAX_DELAY_S=${CALLBACK_MAX_DELAY_S:-86400}
       # API settings. The container always listens on 8080; API_PORT selects
       # only the HOST-side port it is published on (see ports: below).
       - API_PORT=8080
@@ -297,6 +338,7 @@ services:
       - API_BIND_ADDRESS=${API_BIND_ADDRESS:-127.0.0.1}
       - API_AUTH_TOKEN=${API_AUTH_TOKEN:-}
       - ALLOW_UNAUTHENTICATED=${ALLOW_UNAUTHENTICATED:-false}
+      - API_ALLOWED_HOSTS=${API_ALLOWED_HOSTS:-}
       # Operator dashboard page at GET /admin (data endpoints stay auth-gated)
       - ADMIN_UI_ENABLED=${ADMIN_UI_ENABLED:-true}
       - WEBHOOK_ALLOW_PRIVATE=${WEBHOOK_ALLOW_PRIVATE:-false}

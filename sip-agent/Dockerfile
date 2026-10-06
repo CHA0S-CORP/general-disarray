@@ -113,12 +113,21 @@ ENV FASTEMBED_CACHE_PATH=/app/data/models/fastembed
 # Create directories
 RUN mkdir -p /app/data/recordings /app/data/logs /app/data/voices /app/data/models/fastembed
 
-# Expose ports
-EXPOSE 5060/udp 5060/tcp 10000-10100/udp
+# Expose ports: SIP, RTP range, REST API
+EXPOSE 5060/udp 5060/tcp 10000-10100/udp 8080/tcp
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD python3 -c "import sys; sys.exit(0)"
+# Health check: the REST API's /health must answer 2xx. Uses python urllib so
+# it doesn't depend on curl being present. API_PORT is the in-container port
+# (the compose files pin it to 8080 and remap only the host side).
+# start-period covers startup (TTS phrase pre-cache, knowledge indexing).
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD python3 -c "import os,sys,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('API_PORT', '8080'), timeout=8); sys.exit(0)" || exit 1
+
+# NOTE: runs as root on purpose. /app/data is a host bind mount (./data) whose
+# existing files are owned by whoever created them; switching to a non-root
+# USER here would break reads/writes of transcripts, schedules, caller memory
+# etc. on existing installs. Revisit together with a data-dir ownership
+# migration (chown or a uid/gid build arg) before adding `USER`.
 
 # Run
 CMD ["python3", "main.py"]

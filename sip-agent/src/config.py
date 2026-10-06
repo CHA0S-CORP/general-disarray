@@ -7,6 +7,7 @@ All ML inference offloaded to dedicated API services:
 """
 
 import os
+import logging
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -52,6 +53,32 @@ def _load_phrases_from_env_or_default(env_var: str, defaults: List[str]) -> List
                 return phrases
     return defaults
 
+
+
+def _parse_optional_bool(raw: str) -> Optional[bool]:
+    """"true"/"false" (any case, also 1/0, yes/no, on/off) -> bool; blank -> None."""
+    v = (raw or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Boolean env var accepting true/false, 1/0, yes/no, on/off (any case).
+
+    Blank or unrecognised values fall back to ``default`` (with a warning for
+    the latter) instead of silently flipping a default-on flag off.
+    """
+    raw = os.getenv(name)
+    parsed = _parse_optional_bool(raw)
+    if parsed is None:
+        if raw and raw.strip():
+            logging.getLogger(__name__).warning(
+                "Unrecognised boolean %s=%r; using default %s", name, raw, default)
+        return default
+    return parsed
 
 @dataclass
 class PhrasesConfig:
@@ -164,6 +191,8 @@ class Config:
     
     # Barge-in
     barge_in_min_duration_ms: int = field(default_factory=lambda: int(os.getenv("BARGE_IN_MIN_DURATION", "400")))
+    # NOTE: currently unused -- barge-in is VAD-run based (min duration + max
+    # gap below). Kept so existing BARGE_IN_ENERGY_THRESHOLD settings parse.
     barge_in_energy_threshold: int = field(default_factory=lambda: int(os.getenv("BARGE_IN_ENERGY_THRESHOLD", "2000")))
     # How much VAD-negative audio may fall INSIDE a barge-in speech run before
     # the run is abandoned. Real speech is not VAD-positive end to end — gaps
@@ -218,6 +247,13 @@ class Config:
     api_retry_base_delay_s: float = field(default_factory=lambda: float(os.getenv("API_RETRY_BASE_DELAY_S", "0.5")))
     api_retry_max_delay_s: float = field(default_factory=lambda: float(os.getenv("API_RETRY_MAX_DELAY_S", "5.0")))
     api_timeout_s: float = field(default_factory=lambda: float(os.getenv("API_TIMEOUT_S", "30.0")))
+    # Per-request STT timeout. Batch STT runs on the speaking path, so a hung
+    # Speaches must fail fast rather than stall the call for minutes.
+    stt_timeout_s: float = field(default_factory=lambda: float(os.getenv("STT_TIMEOUT_S", "15.0")))
+    # When STT/TTS were found unavailable (e.g. Speaches still booting), how
+    # often to re-probe instead of staying latched off for the process life.
+    speech_reprobe_interval_s: float = field(
+        default_factory=lambda: float(os.getenv("SPEECH_REPROBE_INTERVAL_S", "15.0")))
     
     # TTS settings (Piper/Kokoro via Speaches)
     # Default to Kokoro which is well-supported by Speaches
@@ -229,7 +265,7 @@ class Config:
     # Stream long responses sentence-by-sentence: the first sentence starts
     # playing while the rest are still being synthesized.
     tts_sentence_streaming: bool = field(
-        default_factory=lambda: os.getenv("TTS_SENTENCE_STREAMING", "true").lower() == "true")
+        default_factory=lambda: _env_bool("TTS_SENTENCE_STREAMING", True))
 
     # Per-turn acknowledgment before the LLM answer: "chime" plays a short
     # in-memory earcon (instant, no TTS round-trip), "phrase" speaks a random
@@ -242,7 +278,7 @@ class Config:
     # ("bye", "okay thanks, goodbye"): speak a goodbye phrase and end the call
     # without relying on the LLM to invoke HANGUP.
     farewell_hangup_enabled: bool = field(
-        default_factory=lambda: os.getenv("FAREWELL_HANGUP_ENABLED", "true").lower() == "true")
+        default_factory=lambda: _env_bool("FAREWELL_HANGUP_ENABLED", True))
 
     # "Still thinking" earcon: when the LLM response takes longer than the
     # delay, play a soft tick every interval so the caller knows to wait.
@@ -291,7 +327,7 @@ class Config:
     # TTS_SENTENCE_STREAMING (streaming exists to speak per sentence; with
     # whole-text TTS requested the turn takes the non-streaming path).
     llm_streaming: bool = field(
-        default_factory=lambda: os.getenv("LLM_STREAMING", "true").lower() == "true")
+        default_factory=lambda: _env_bool("LLM_STREAMING", True))
 
     # Generation
     llm_max_tokens: int = field(default_factory=lambda: int(os.getenv("LLM_MAX_TOKENS", "512")))
@@ -302,6 +338,25 @@ class Config:
     # so backends that reject the param are unaffected.
     llm_frequency_penalty: float = field(
         default_factory=lambda: float(os.getenv("LLM_FREQUENCY_PENALTY", "0.0")))
+    # Per-request override of a thinking model's reasoning switch, sent as
+    # chat_template_kwargs {"enable_thinking": ...} on every chat completion
+    # (vLLM/SGLang honor it; others ignore unknown body fields). Unset = send
+    # nothing and take the server's default. On a phone call reasoning tokens
+    # are pure dead air (never spoken), so "false" is the setting for Ling.
+    llm_enable_thinking: Optional[bool] = field(
+        default_factory=lambda: _parse_optional_bool(os.getenv("LLM_ENABLE_THINKING", "")))
+    # Send the system prompt as two messages: the static base prompt (plus,
+    # in text mode, the tool instructions) first, then the per-call/per-turn
+    # context (clock, caller, memory, summary...). Chat templates render the
+    # tool schemas right after the FIRST system message, so this keeps the
+    # ~2K-token prompt+tools prefix byte-identical across turns and callers,
+    # which is what lets the server's prefix cache skip re-prefilling it.
+    # Off by default: some chat templates reject or drop a second system
+    # message (Qwen3.5 errors on a non-leading system message; gpt-oss
+    # silently drops it). Only worth enabling in native tool mode on a
+    # template known to accept it.
+    llm_split_system_prompt: bool = field(
+        default_factory=lambda: _env_bool("LLM_SPLIT_SYSTEM_PROMPT", False))
     # Max seconds to wait for the opt-in reformat_for_speech LLM rewrite of an
     # outbound message before falling back to the original text. Generous
     # default: reasoning models (e.g. gpt-oss) think before answering, and the
@@ -338,7 +393,7 @@ class Config:
     # quakes, GPU, alerts, search) ends with zero tool calls — or the reply
     # merely promises to check — re-run once forcing tool use (grounding.py).
     grounding_retry_enabled: bool = field(
-        default_factory=lambda: os.getenv("GROUNDING_RETRY_ENABLED", "true").lower() == "true")
+        default_factory=lambda: _env_bool("GROUNDING_RETRY_ENABLED", True))
     grounding_retry_timeout_s: float = field(
         default_factory=lambda: float(os.getenv("GROUNDING_RETRY_TIMEOUT_S", "15.0")))
 
@@ -349,7 +404,7 @@ class Config:
     # user part of their SIP URI) between calls, stored under
     # data/caller_memory/. Fail-open: any failure just skips the memory.
     caller_memory_enabled: bool = field(
-        default_factory=lambda: os.getenv("CALLER_MEMORY_ENABLED", "true").lower() == "true")
+        default_factory=lambda: _env_bool("CALLER_MEMORY_ENABLED", True))
     caller_memory_max_facts: int = field(
         default_factory=lambda: int(os.getenv("CALLER_MEMORY_MAX_FACTS", "15")))
     caller_memory_max_chars: int = field(
@@ -362,7 +417,7 @@ class Config:
     # call and save/recall named profiles. Profiles persist in persona_file
     # (resolved in __post_init__ to <data_dir>/personas.json).
     enable_persona_tool: bool = field(
-        default_factory=lambda: os.getenv("ENABLE_PERSONA_TOOL", "true").lower() == "true")
+        default_factory=lambda: _env_bool("ENABLE_PERSONA_TOOL", True))
     persona_file: Optional[Path] = field(
         default_factory=lambda: Path(os.getenv("PERSONA_FILE")) if os.getenv("PERSONA_FILE") else None)
 
@@ -370,7 +425,7 @@ class Config:
     # expose retrieval as the KNOWLEDGE tool. No-ops when the directory is
     # empty or the embedding dependencies are missing.
     knowledge_enabled: bool = field(
-        default_factory=lambda: os.getenv("KNOWLEDGE_ENABLED", "true").lower() == "true")
+        default_factory=lambda: _env_bool("KNOWLEDGE_ENABLED", True))
     # Resolved in __post_init__: defaults to <data_dir>/knowledge.
     knowledge_dir: Optional[Path] = field(
         default_factory=lambda: Path(os.getenv("KNOWLEDGE_DIR")) if os.getenv("KNOWLEDGE_DIR") else None)
@@ -386,12 +441,12 @@ class Config:
     # chunks into the system prompt (zero extra LLM rounds). Default off: the
     # KNOWLEDGE tool lets the model decide when to look something up.
     knowledge_auto_inject: bool = field(
-        default_factory=lambda: os.getenv("KNOWLEDGE_AUTO_INJECT", "false").lower() == "true")
+        default_factory=lambda: _env_bool("KNOWLEDGE_AUTO_INJECT", False))
 
     # Rolling conversation summary: when a call outgrows the history window,
     # fold the overflow into a summary block instead of silently dropping it.
     summary_enabled: bool = field(
-        default_factory=lambda: os.getenv("CONVERSATION_SUMMARY_ENABLED", "true").lower() == "true")
+        default_factory=lambda: _env_bool("CONVERSATION_SUMMARY_ENABLED", True))
     summary_timeout_s: float = field(
         default_factory=lambda: float(os.getenv("CONVERSATION_SUMMARY_TIMEOUT_S", "20.0")))
 
@@ -399,22 +454,36 @@ class Config:
     # ===================
     # Tools
     # ===================
-    enable_timer_tool: bool = True
-    enable_callback_tool: bool = True
-    enable_weather_tool: bool = True
+    enable_timer_tool: bool = field(default_factory=lambda: _env_bool("ENABLE_TIMER_TOOL", True))
+    enable_callback_tool: bool = field(default_factory=lambda: _env_bool("ENABLE_CALLBACK_TOOL", True))
+    enable_weather_tool: bool = field(default_factory=lambda: _env_bool("ENABLE_WEATHER_TOOL", True))
     enable_drink_tool: bool = field(
-        default_factory=lambda: os.getenv("ENABLE_DRINK_TOOL", "true").lower() == "true")
+        default_factory=lambda: _env_bool("ENABLE_DRINK_TOOL", True))
     # MAP tool: driving distance/time + directions via OpenStreetMap (Nominatim
     # geocoding + OSRM routing, both keyless). Needs WEATHER_LATITUDE/LONGITUDE
     # for the "from home" origin; self-disables without them.
     enable_map_tool: bool = field(
-        default_factory=lambda: os.getenv("ENABLE_MAP_TOOL", "true").lower() == "true")
-    enable_search_tool: bool = False
-    enable_calendar_tool: bool = False
+        default_factory=lambda: _env_bool("ENABLE_MAP_TOOL", True))
     max_timer_duration_hours: int = 24
     callback_retry_attempts: int = 3
     callback_retry_delay_s: int = 60
     callback_ring_timeout_s: int = field(default_factory=lambda: int(os.getenv("CALLBACK_RING_TIMEOUT", "30")))
+    # Voice-initiated dialing (CALLBACK to a number other than the caller's
+    # own, TRANSFER). A target must match VOICE_DIAL_ALLOW_PATTERN when set,
+    # and must never match VOICE_DIAL_DENY_PATTERN (default: international
+    # and premium-rate prefixes) -- guards against toll fraud by any caller.
+    voice_dial_allow_pattern: str = field(
+        default_factory=lambda: os.getenv("VOICE_DIAL_ALLOW_PATTERN", ""))
+    # Set-but-empty falls back to the default (a blank compose/.env value must
+    # not silently drop the toll-fraud guard); use "(?!)" to disable it.
+    voice_dial_deny_pattern: str = field(
+        default_factory=lambda: os.getenv("VOICE_DIAL_DENY_PATTERN")
+        or r"^(\+(?!1)|00|011|\+?1?(900|976))")
+    # Per-call cap on voice-scheduled callbacks, and the longest allowed delay.
+    callback_max_per_call: int = field(
+        default_factory=lambda: int(os.getenv("CALLBACK_MAX_PER_CALL", "3")))
+    callback_max_delay_s: int = field(
+        default_factory=lambda: int(os.getenv("CALLBACK_MAX_DELAY_S", "86400")))
     
     # Home coordinates for location-aware tools (NWS WEATHER/FORECAST,
     # QUAKES "near"). Empty disables those tools/filters.
@@ -435,7 +504,7 @@ class Config:
     # the file format). Disabled by default; fail-open when the file or the
     # optional `mcp` package is missing.
     mcp_enabled: bool = field(
-        default_factory=lambda: os.getenv("MCP_ENABLED", "false").lower() == "true")
+        default_factory=lambda: _env_bool("MCP_ENABLED", False))
     # Resolved in __post_init__: defaults to <data_dir>/mcp_servers.json.
     mcp_servers_file: Optional[Path] = field(
         default_factory=lambda: Path(os.getenv("MCP_SERVERS_FILE")) if os.getenv("MCP_SERVERS_FILE") else None)
@@ -463,7 +532,7 @@ class Config:
 
     # TRANSFER tool (SIP REFER to another extension; same outbound dial policy).
     enable_transfer_tool: bool = field(
-        default_factory=lambda: os.getenv("ENABLE_TRANSFER_TOOL", "true").lower() == "true")
+        default_factory=lambda: _env_bool("ENABLE_TRANSFER_TOOL", True))
 
     # ===================
     # Caller identity verification (optional)
@@ -474,7 +543,7 @@ class Config:
     # the global values below. Empty PIN + empty secret + no enrolled caller =
     # feature off (nothing changes). Fail-open, except tool-gating (fails closed).
     enable_verify_tool: bool = field(
-        default_factory=lambda: os.getenv("ENABLE_VERIFY_TOOL", "true").lower() == "true")
+        default_factory=lambda: _env_bool("ENABLE_VERIFY_TOOL", True))
     # Global fallback factors (shared across all callers). Empty = no global factor.
     verify_pin: str = field(default_factory=lambda: os.getenv("VERIFY_PIN", ""))
     verify_totp_secret: str = field(default_factory=lambda: os.getenv("VERIFY_TOTP_SECRET", ""))
@@ -493,6 +562,11 @@ class Config:
         default_factory=lambda: os.getenv("VERIFY_REQUIRED_TOOLS", ""))
     # Wrong-code attempts allowed per call before VERIFY refuses further tries.
     verify_max_attempts: int = field(default_factory=lambda: int(os.getenv("VERIFY_MAX_ATTEMPTS", "3")))
+    # Cross-call brute-force guard: after this many failed verifications for
+    # one caller (any path: voice, DTMF, REST), lock them out for the window.
+    verify_lockout_failures: int = field(
+        default_factory=lambda: int(os.getenv("VERIFY_LOCKOUT_FAILURES", "5")))
+    verify_lockout_s: int = field(default_factory=lambda: int(os.getenv("VERIFY_LOCKOUT_S", "900")))
     # How long to wait for the caller to START keying in a code (seconds).
     verify_dtmf_timeout_s: float = field(
         default_factory=lambda: float(os.getenv("VERIFY_DTMF_TIMEOUT_S", "20.0")))
@@ -538,14 +612,14 @@ class Config:
     # Auto-discover extra tools from plugins/ directories and data/plugins
     # (mounted volume) in addition to the explicitly registered builtins.
     enable_plugin_autodiscovery: bool = field(
-        default_factory=lambda: os.getenv("ENABLE_PLUGIN_AUTODISCOVERY", "true").lower() == "true")
+        default_factory=lambda: _env_bool("ENABLE_PLUGIN_AUTODISCOVERY", True))
 
     # Answering-machine detection for outbound notification calls (heuristic:
     # a human answers briefly then waits; a machine keeps talking). When
     # enabled, sustained speech right after answer marks the call
     # machine_answered=true in the webhook payload. Off by default.
     amd_enabled: bool = field(
-        default_factory=lambda: os.getenv("AMD_ENABLED", "false").lower() == "true")
+        default_factory=lambda: _env_bool("AMD_ENABLED", False))
     # How long to listen after answer before playing the message.
     amd_window_s: float = field(default_factory=lambda: float(os.getenv("AMD_WINDOW_S", "2.5")))
     # Continuous speech longer than this classifies the answerer as a machine.
@@ -560,20 +634,24 @@ class Config:
     # Escape hatch: permit an externally-bound API with no auth token. Off by
     # default so the insecure combination fails closed at startup.
     allow_unauthenticated: bool = field(
-        default_factory=lambda: os.getenv("ALLOW_UNAUTHENTICATED", "false").lower() == "true")
+        default_factory=lambda: _env_bool("ALLOW_UNAUTHENTICATED", False))
+    # Extra Host header values accepted when API_AUTH_TOKEN is unset (DNS-
+    # rebinding guard; loopback, IP literals and single-label names like
+    # "sip-agent" are always allowed). Comma-separated; "*.suffix" or "*".
+    api_allowed_hosts: str = field(default_factory=lambda: os.getenv("API_ALLOWED_HOSTS", ""))
 
     # Operator dashboard: GET /admin serves a self-contained static page (the
     # data endpoints it calls are auth-gated separately). Set false to remove
     # the page (404) entirely.
     admin_ui_enabled: bool = field(
-        default_factory=lambda: os.getenv("ADMIN_UI_ENABLED", "true").lower() == "true")
+        default_factory=lambda: _env_bool("ADMIN_UI_ENABLED", True))
 
     # SSRF guard for callback_url webhooks. When False, callback URLs that resolve
     # to loopback/private/link-local/reserved addresses are rejected.
     webhook_allow_private: bool = field(
-        default_factory=lambda: os.getenv("WEBHOOK_ALLOW_PRIVATE", "false").lower() == "true")
+        default_factory=lambda: _env_bool("WEBHOOK_ALLOW_PRIVATE", False))
     webhook_require_https: bool = field(
-        default_factory=lambda: os.getenv("WEBHOOK_REQUIRE_HTTPS", "false").lower() == "true")
+        default_factory=lambda: _env_bool("WEBHOOK_REQUIRE_HTTPS", False))
     # Optional HMAC-SHA256 secret for outgoing webhooks. When set, each webhook
     # POST carries X-Timestamp plus X-Signature: sha256=<HMAC(secret,
     # "<timestamp>.<body>")> so receivers can verify authenticity and freshness.
@@ -591,13 +669,13 @@ class Config:
         default_factory=lambda: os.getenv("CALL_EVENTS", "call.started,call.ended"))
     # Include the finished transcript in call.ended payloads.
     call_event_include_transcript: bool = field(
-        default_factory=lambda: os.getenv("CALL_EVENT_INCLUDE_TRANSCRIPT", "true").lower() == "true")
+        default_factory=lambda: _env_bool("CALL_EVENT_INCLUDE_TRANSCRIPT", True))
 
     # One live call at a time: decline a second inbound INVITE with 486 Busy
     # Here instead of evicting the current caller mid-conversation. Set false
     # to restore the old replace-the-call behavior.
     sip_busy_reject: bool = field(
-        default_factory=lambda: os.getenv("SIP_BUSY_REJECT", "true").lower() == "true")
+        default_factory=lambda: _env_bool("SIP_BUSY_REJECT", True))
 
     # Maximum simultaneous live calls. The default of 1 keeps the shipped
     # single-call behavior; raising it lets additional inbound INVITEs run
@@ -641,7 +719,7 @@ class Config:
     # agent answers a call dialed to one with per-number context, webhooks the
     # outcome, and clears the number. Disabled by default.
     virtual_numbers_enabled: bool = field(
-        default_factory=lambda: os.getenv("VIRTUAL_NUMBERS_ENABLED", "false").lower() == "true")
+        default_factory=lambda: _env_bool("VIRTUAL_NUMBERS_ENABLED", False))
     virtual_number_default_ttl_s: int = field(
         default_factory=lambda: int(os.getenv("VIRTUAL_NUMBER_DEFAULT_TTL_S", "900")))
     virtual_number_max_ttl_s: int = field(
@@ -657,7 +735,7 @@ class Config:
     # arbitrary external SIP domains); the target is always built as
     # `sip:<extension>@<sip_domain>`. Optional regex further restricts extensions.
     outbound_allow_sip_uri: bool = field(
-        default_factory=lambda: os.getenv("OUTBOUND_ALLOW_SIP_URI", "false").lower() == "true")
+        default_factory=lambda: _env_bool("OUTBOUND_ALLOW_SIP_URI", False))
     outbound_extension_pattern: str = field(
         default_factory=lambda: os.getenv("OUTBOUND_EXTENSION_PATTERN", ""))
 
