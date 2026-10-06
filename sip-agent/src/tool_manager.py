@@ -866,10 +866,16 @@ class ToolManager:
     def _owned_by(self, task: ScheduledTask, owner: Tuple[Optional[str], Optional[str]]) -> bool:
         """Whether a caller may see/cancel ``task`` by voice. Only voice-type
         tasks, and only those owned by this call or this caller — never REST
-        /schedule calls or unowned (REST / legacy) tasks."""
+        /schedule calls or unowned (REST / legacy) tasks. With no live call
+        (REST/operator use) every timer/callback is visible."""
         if task.task_type not in self.VOICE_TASK_TYPES:
             return False
         call_id, caller = owner
+        if not call_id and not caller:
+            # No live call: an (authenticated) REST/operator invocation, not
+            # a caller — it sees every timer/callback, still never /schedule
+            # calls (those are cancelled by id via DELETE /schedule).
+            return True
         if call_id and task.owner_call_id == call_id:
             return True
         return bool(caller) and task.owner_caller == caller

@@ -935,11 +935,10 @@ class SIPHandler:
             # This thread drives pjsua by polling libHandleEvents(). The
             # default threadCnt=1 ALSO runs a pjsua worker thread, so
             # callbacks would land on two threads and race on active_calls
-            # (which is documented PJSIP-thread-only). No worker threads, and
-            # marshal any callback raised elsewhere (media/clock threads) onto
-            # this thread — the one that called libCreate/libHandleEvents.
+            # (which is documented PJSIP-thread-only). No worker threads.
+            # (Not mainThreadOnly: with it, pjsua2 objects released on the
+            # asyncio thread abort the process in pj_thread_this().)
             ep_cfg.uaConfig.threadCnt = 0
-            ep_cfg.uaConfig.mainThreadOnly = True
             
             self.endpoint.libInit(ep_cfg)
             
@@ -1148,10 +1147,16 @@ class SIPHandler:
             if call_id in self.active_calls:
                 del self.active_calls[call_id]
             with self._playlist_lock:
-                if call_id in self._playlist_players:
-                    self._playlist_players[call_id].stop_all()
-                    del self._playlist_players[call_id]
-            
+                player = self._playlist_players.pop(call_id, None)
+            if player is not None:
+                player.stop_all()
+                # Release the pjsua2 player HERE, on the PJSIP thread. The
+                # PlaylistPlayer outlives the call via CallInfo.stream_player,
+                # so leaving it set would destroy the AudioMediaPlayer
+                # wherever the session is finally dropped — the asyncio
+                # thread, which pjlib rejects with an abort().
+                player._cleanup_player(call)
+
             # Clear circular references to allow garbage collection
             call.call_info.pj_call = None
             call.call_info = None

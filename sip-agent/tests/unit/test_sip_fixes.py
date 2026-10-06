@@ -227,3 +227,27 @@ def test_enqueue_on_stopped_player_unlinks_file(tmp_path):
     player.enqueue_file(late)
     assert not os.path.exists(late)
     assert player.file_queue.empty()
+
+
+def test_call_end_releases_pj_player_on_pjsip_thread(config):
+    """Regression (e2e crash): the PlaylistPlayer outlives the call through
+    CallInfo.stream_player, so its pjsua2 AudioMediaPlayer was destroyed when
+    the session was dropped on the asyncio thread -> pjlib abort(). It must be
+    released in _on_call_ended, which runs on the PJSIP thread."""
+    handler = SIPHandler(config, lambda *a: None)
+    call = SIPCall(None, 0, handler)
+    call.call_info = CallInfo(call_id="c1", remote_uri="sip:a@b",
+                              is_active=False, start_time=time.time())
+    player = PlaylistPlayer(handler, "c1")
+    player._pj_player = object()
+    call.call_info.stream_player = player
+    handler.active_calls["c1"] = call
+    handler._playlist_players["c1"] = player
+    info = call.call_info
+
+    handler._on_call_ended(call)
+
+    assert player._pj_player is None
+    assert player._stopped
+    assert "c1" not in handler._playlist_players
+    assert info.stream_player is player  # the session may still hold it

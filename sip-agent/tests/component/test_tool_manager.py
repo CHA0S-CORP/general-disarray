@@ -301,13 +301,24 @@ async def test_voice_cancel_and_status_only_see_own_tasks(assistant):
     assert tm.cancel_task(rest_id) is True
 
 
-async def test_voice_cancel_with_no_call_cancels_nothing(assistant):
+async def test_cancel_with_no_live_call_is_operator_scope(assistant):
+    """No live call means a REST/operator invocation (e.g. cleaning up after a
+    call, as the e2e suite does): every timer/callback is visible, REST
+    /schedule calls never are. Regression: owner scoping made REST CANCEL a
+    no-op once the call that set the timer had ended."""
     tm = assistant.tool_manager
-    await tm.schedule_task("callback", 3600, "x", target_uri="2001")
+    rest_id = await tm.schedule_task("scheduled_call", 3600, "briefing",
+                                     target_uri="1001", metadata={"extension": "1001"})
+    assistant.current_call = _caller(uri="sip:1001@host", call_id="call-A")
+    await tm.execute_tool(_call("SET_TIMER", duration=600))
+    await tm.schedule_task("callback", 3600, "x", target_uri="2001")  # unowned
+
     assistant.current_call = None
-    result = await tm.execute_tool(_call("CANCEL"))
-    assert result.message == "No tasks to cancel"
-    assert len(_callbacks(tm)) == 1
+    status = await tm.execute_tool(_call("STATUS"))
+    assert status.data["pending_count"] == 2
+    result = await tm.execute_tool(_call("CANCEL", task_type="all"))
+    assert result.data["cancelled_count"] == 2
+    assert list(tm.scheduled_tasks) == [rest_id]
 
 
 async def test_owner_fields_persist_and_legacy_records_load(assistant, comp_config):
