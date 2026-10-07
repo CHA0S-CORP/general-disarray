@@ -1,0 +1,193 @@
+# Refusal-subspace ablation overlay for the `vllm` service.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.ablate.yml up -d vllm
+#
+# ROLLBACK IS DROPPING THE SECOND -f. Nothing in docker-compose.yml or .env is
+# modified by this file, so `docker compose up -d vllm` on its own restores the
+# stock, un-ablated server. That is deliberate: this changes what the SIP agent
+# says to inbound callers, and the way back has to be one flag, not a git diff.
+#
+# WHAT IT DOES
+# Swaps in sglang-ling-ablate:local (a thin layer over sglang-ling-fp4:local --
+# same fp4-experts and structural-tag patches underneath) and turns on a runtime
+# rank-16 projection of the refusal subspace out of the residual stream over
+# layers 26-41. No weights are modified; the checkpoint on disk is untouched.
+#
+# MEASURED, on this checkpoint, thinking-off (~/code-llm/ling-ablate/README.md):
+#     AdvBench held-out   0.0% -> 72.7% comply
+#     XSTest-safe canary 92.0% -> 100.0% comply   (collateral canary, held)
+#
+# WHY --mem-fraction-static IS RESTATED HERE
+# The whole `command` list has to be repeated because compose REPLACES list
+# values rather than merging them -- there is no way to override one flag. Since
+# it is repeated anyway, it uses LING_ABLATE_MEM_FRACTION (default 0.85) instead
+# of LLM_MEM_FRACTION, so .env's 0.74 is left exactly as it is.
+#
+# 0.74 does not start any more, ablated or not: --mem-fraction-static is a
+# fraction of TOTAL memory, GPU and host memory are one pool on GB10, and every
+# other resident process is charged against it. comfyui (6.9 GB, appeared
+# 2026-08-15) pushed the sum past the budget:
+#     comfyui 6.9 + code-llm-embed 13.0 + speaches 0.6 + weights 71 = 91.5 GiB
+#     vs a 0.74 budget of 88.6 GiB  ->  total_rest_memory = -6.6 GB
+# The service survived for days at 0.74 only because it claimed its pool before
+# comfyui existed. Do not go above ~0.92: driver allocations are not charged to
+# any process RSS, so the global OOM killer takes the desktop and sip-agent
+# instead of the offender.
+#
+# KEEP THE COMMAND IN SYNC. If docker-compose.yml's flag list changes, this copy
+# must change with it. Only two things differ from the base list: the
+# mem-fraction variable, and nothing else. Diff them before blaming the ablation
+# for a behaviour change.
+services:
+  vllm:
+    image: sglang-ling-ablate:local
+
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      # ablate | harvest | off. `off` installs no hooks at all, so leaving this
+      # overlay in place with LING_ABLATE_MODE=off is a valid way to A/B without
+      # changing images.
+      - LING_ABLATE_MODE=${LING_ABLATE_MODE:-ablate}
+      - LING_ABLATE_BASIS=/opt/ling/refusal_basis.npz
+      # Half-open, 0-indexed. From build_subspace.py's own suggestion: the first
+      # contributing layer through the end.
+      - LING_ABLATE_LAYERS=${LING_ABLATE_LAYERS:-28:42}
+      # 1.0 = exact projection. If the XSTest-safe canary ever drops, come DOWN
+      # from here, never up.
+      - LING_ABLATE_SCALE=${LING_ABLATE_SCALE:-1.0}
+
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+      - ./docker/ling/chat_template.jinja:/opt/ling/chat_template.jinja:ro
+      # The basis. If this is missing the server REFUSES TO START rather than
+      # coming up looking healthy and silently un-ablated -- which is
+      # indistinguishable from a working one until you read a bench.
+      - ~/code-llm/ling-ablate/out/refusal_basis.npz:/opt/ling/refusal_basis.npz:ro
+
+    command:
+      - python3
+      - -m
+      - sglang.launch_server
+      - --model-path=${LLM_MODEL_PATH:-inclusionAI/Ling-3.0-flash-int4}
+      - --served-model-name=${LLM_MODEL:-ling-3.0-flash}
+      - --host=0.0.0.0
+      - --port=8000
+      - --tp=1
+      # 0.87, raised from 0.85 when NEXTN was enabled 2026-08-17. NEXTN needs
+      # 5 KDA state slots per request instead of 1, and at 0.85 the server first
+      # refused to start ("max_mamba_cache_size=3, mamba_ratio=5, resulting
+      # max_num_reqs=0") and on retry came up with max_running_requests=1 and an
+      # 88,784-token KV pool - one caller at a time, nothing left for OpenCode.
+      # Measured cost of budget here, from the 0.85 and 0.88 data points: 3.6 GB
+      # buys ~19 state slots (~1.5 GB) plus ~159K KV tokens, i.e. KV runs about
+      # 13.6 KB/token. So 5 slots cannot be bought at 0.85 by re-splitting - the
+      # KV pool is only worth ~1.2 GB and would go negative.
+      # 0.87 is the minimum that restores useful concurrency while leaving
+      # comfyui (6.9 GB) and code-llm-embed (13.0 GB) their space. Do not go
+      # above ~0.92 (see above), and prefer capping --max-running-requests or
+      # --max-mamba-cache-size over raising this further.
+      - --mem-fraction-static=${LING_ABLATE_MEM_FRACTION:-0.87}
+      # 32768 (lowered from 65536 on 2026-08-20), not .env's MAX_MODEL_LEN=262144.
+      # Its own variable so this does not
+      # disturb the base compose or sip-agent, which both read MAX_MODEL_LEN.
+      # Context length is the dominant concurrency lever on this box: the KV pool
+      # must reserve against it at ~13.6 KB/token, and dropping 262144 -> 65536
+      # took max_running_requests 4 -> 16 and the KV pool 212K -> 446K tokens at
+      # the SAME mem-fraction. That, not any speculative or scheduler flag, is
+      # what makes many parallel agents possible. The live client's prompts run
+      # 49-1407 tokens and its conversations reach ~2.4K, so 32768 is ~13x its
+      # observed ceiling. Requests above this are REJECTED, so raise it back if
+      # anything starts stuffing large documents into prompts.
+      - --context-length=${LING_ABLATE_CTX:-32768}
+      - --moe-runner-backend=triton
+      - --disable-shared-experts-fusion
+      - --chunked-prefill-size=32768
+      - --max-prefill-tokens=65536
+      # Capped at 6 on 2026-08-20. Left unset, this is an EMERGENT number - it
+      # falls out of the mamba state cache (79 slots / ~5.3 per request = 15)
+      # and silently moved between 3, 15, 22 and 32 as memory conditions
+      # changed. Pinning it makes capacity a decision instead of a side effect.
+      # Each running request costs ~281 MB of mamba state, so 15 -> 6 frees
+      # ~2.5 GB for the co-resident image model. Measured aggregate at this
+      # cap: ~106 tok/s across 6 streams (~17.7 each).
+      # The live client peaks at 4 concurrent and has never queued, so 6 is
+      # headroom, not a squeeze. NOTE --max-queued-requests is unset, so
+      # overload past 6 shows up as latency, never as errors.
+      - --max-running-requests=6
+      # KV pool capped 2026-08-20 to make room for the co-resident image
+      # model. Left uncapped the pool sized itself to 666,422 tokens (~5.7 GB
+      # at ~9 KB/token) - far more than this workload uses: the live client's
+      # conversations reach ~2.4K tokens, so 250K still holds ~104 of them, or
+      # 41K tokens each across all 6 running slots. Freeing ~3.7 GB took
+      # generation-time headroom from 2 GiB (inside the host-lockup zone) back
+      # to a safe margin and let torch.compile be re-enabled in imagegen.
+      # Raise this if prompts ever grow large - see the 65K column in
+      # ling-fp4/README.md.
+      - --max-total-tokens=250000
+      - --schedule-policy=lpm
+      - --enable-mixed-chunk
+      - --mamba-ssm-dtype=bfloat16
+      # NEXTN speculative decoding via the checkpoint's own MTP draft layer
+      # (layer 42; num_nextn_predict_layers=1).
+      #
+      # HISTORY, because this flag has flipped three times and the reasons matter:
+      #   2026-08-09  rejected ("halves throughput"). WRONG - see the analysis in
+      #               docker-compose.yml and ling-fp4/README.md. The likely cause
+      #               was passing a bare --speculative-algorithm and letting the
+      #               other three params default.
+      #   2026-08-17  enabled as steps2/draft3 (20.67 -> 33.8 tok/s single-stream).
+      #   2026-08-17  disabled again when the goal became "many parallel agents":
+      #               it costs 5 KDA state slots per request instead of 1, so it
+      #               loses badly past ~4 concurrent streams.
+      #   2026-08-20  re-enabled as steps1/draft2 after measuring the REAL client
+      #               instead of the hypothetical fleet. 25 min of SGLang logs
+      #               showed peak 4 concurrent, peak 0 QUEUED, prompts 49-1407
+      #               tokens - nowhere near the 8-stream regime the disable
+      #               assumed.
+      #
+      # ALL FOUR PARAMS ARE LOAD-BEARING. Passing only --speculative-algorithm
+      # leaves --speculative-num-draft-tokens None, which reaches
+      # allocation_sizing.py as max(steps*topk, None) -> TypeError.
+      #
+      # Round 4 measurements (ctx 65536, thinking on, mem-fraction 0.87):
+      #
+      #   config        slots   N=1     N=4      N=8
+      #   no spec        16    20.71   80.46   154.00   wins only above ~8 streams
+      #   NEXTN 1/2       4    36.05  111.10   110.15   <- THIS: best across 1-4
+      #   NEXTN 2/3       3    38.65   64.97    87.29   best at N=1, queues at N=4
+      #
+      # steps1/draft2 is 1.74x at N=1 and 1.38x at N=4. steps2/draft3 is faster
+      # single-stream but had only 3 slots and already queued at N=4 - use it only
+      # if traffic is strictly one request at a time.
+      #
+      # WATCH THE SLOT COUNT - this is how the config turns into a loss. NEXTN 1/2
+      # measured 4 slots and the app peaks at 4, with imagegen (SDXL, ~11.5 GB)
+      # now co-resident. If max_running_requests falls below the app's actual
+      # concurrency, requests queue and no-spec would be better. Check with:
+      #   docker logs sip-ai-vllm | grep -o 'max_running_requests=[0-9]*' | tail -1
+      # If it is under 4: stop imagegen, or comment these four lines back out.
+      - --speculative-algorithm=NEXTN
+      - --speculative-num-steps=1
+      - --speculative-eagle-topk=1
+      - --speculative-num-draft-tokens=2
+      # THINKING ON as of 2026-08-17, requested for the agent workload.
+      #
+      # !! ABLATION RISK, NOT YET MEASURED !!
+      # The refusal subspace was harvested at answer-onset with thinking OFF, and
+      # the previous note here called thinking-off "load-bearing for the ablation,
+      # not just for latency": with reasoning on, the model can reason its way
+      # back into a refusal. The 0.0% -> 72.7% AdvBench / 100% XSTest-safe numbers
+      # at the top of this file were ALL measured thinking-off and cannot be
+      # assumed to hold here. Re-run the harness in ~/code-llm/ling-ablate before
+      # trusting this server's compliance behaviour. To revert just this, set
+      # LING_ABLATE_THINKING=false.
+      #
+      # Verified thinking-on on int4 (round 4, all four arms): reasoning_content
+      # is populated (~750-790 chars) AND tool calling still fires correctly.
+      # That combination is documented as broken on FP4 - it is not on int4.
+      - '--default-chat-template-kwargs={"enable_thinking": ${LING_ABLATE_THINKING:-true}}'
+      - --reasoning-parser=ling3
+      - --tool-call-parser=ling3
+      - --chat-template=/opt/ling/chat_template.jinja
+      - --trust-remote-code

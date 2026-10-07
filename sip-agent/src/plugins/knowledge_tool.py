@@ -39,7 +39,10 @@ class KnowledgeTool(BaseTool):
                               message="I need something to search for.")
 
         kb = getattr(self.assistant, "knowledge_base", None)
-        if kb is None or not kb.available:
+        # `ready` (a plain flag) implies `available`; only an index that
+        # isn't ready needs the availability check (memoized by the KB — it
+        # walks the knowledge dir, so it must not run per call).
+        if kb is None or (not kb.ready and not kb.available):
             return ToolResult(status=ToolStatus.FAILED,
                               message="The knowledge base isn't available right now.")
         if not kb.ready:

@@ -17,8 +17,10 @@ import logging
 
 from enum import Enum
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+from dataclasses import fields as dataclass_fields
+from datetime import date, datetime, time as dt_time, timedelta, timezone
+from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 if TYPE_CHECKING:
     from main import SIPAIAssistant
@@ -26,7 +28,8 @@ if TYPE_CHECKING:
 from config import Config
 from call_session import get_current_session, set_current_session
 from telemetry import create_span, Metrics
-from logging_utils import log_event, format_duration, HANGUP_DELAY_SECONDS
+from logging_utils import log_event, HANGUP_DELAY_SECONDS
+from caller_memory import caller_id_from_uri
 
 # Import plugin system base classes
 from tool_plugins import (
@@ -35,11 +38,12 @@ from tool_plugins import (
     ToolStatus as PluginToolStatus,
 )
 
-# Shared request-security helpers (dial-target policy + webhook SSRF pinning)
-# live in api.py and are reused here so the voice CALLBACK path and the
-# scheduler enforce exactly the same rules as the REST endpoints. api.py imports
+# Shared request-security helpers (webhook SSRF pinning) live in api.py and are
+# reused here so the scheduler enforces exactly the same rules as the REST
+# endpoints. The voice dial-target policy lives in plugins.helpers
+# (check_voice_dial_allowed, used by CALLBACK and TRANSFER). api.py imports
 # neither tool_manager nor main at module load, so this is not an import cycle.
-from api import check_extension_allowed, deliver_webhook, tool_result_success
+from api import deliver_webhook, tool_result_success
 
 # Alias for backwards compatibility and internal use
 BaseTool = PluginBaseTool
@@ -61,6 +65,14 @@ class ToolResult:
     status: ToolStatus
     message: str
     data: Optional[Dict[str, Any]] = None
+    # What the CALLER hears (see tool_plugins.ToolResult.spoken_message):
+    # carried through from the plugin result so llm_engine's to_speech()
+    # path speaks e.g. WEB_SEARCH's summary instead of raw scraped results.
+    spoken_message: str = ""
+
+    def to_speech(self) -> str:
+        """Speech-friendly text: spoken_message, falling back to message."""
+        return self.spoken_message or self.message
 
 
 @dataclass
@@ -80,6 +92,12 @@ class ScheduledTask:
     # ended, the announcement expires instead of leaking into another
     # caller's call. Never persisted (to_dict omits it; timers are in-memory).
     session: Optional[Any] = None
+    # Who scheduled it, for the voice CANCEL/STATUS scope: the originating
+    # call (CallSession.transcript_id) and caller (SIP URI user part). None
+    # for tasks created via the REST API (and for records predating these
+    # fields) — those are never visible to, or cancellable by, a caller.
+    owner_call_id: Optional[str] = None
+    owner_caller: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -93,12 +111,16 @@ class ScheduledTask:
             "target_uri": self.target_uri,
             "metadata": self.metadata,
             "completed": self.completed,
+            "owner_call_id": self.owner_call_id,
+            "owner_caller": self.owner_caller,
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'ScheduledTask':
-        data = dict(data)
-        data.pop("clock", None)
+        # Keep only known persisted fields: old records lack the owner keys
+        # (dataclass defaults apply) and unknown/future keys are ignored.
+        known = {f.name for f in dataclass_fields(cls)} - {"session"}
+        data = {k: v for k, v in dict(data).items() if k in known}
         data["execute_at"] = datetime.fromisoformat(data["execute_at"])
         return cls(**data)
 
@@ -340,7 +362,8 @@ class ToolManager:
                 return ToolResult(
                     status=status_map.get(result.status, ToolStatus.FAILED),
                     message=result.message,
-                    data=result.data
+                    data=result.data,
+                    spoken_message=getattr(result, "spoken_message", "") or "",
                 )
                 
             def validate_params(wrapper_self, params: Dict[str, Any]) -> Optional[str]:
@@ -391,16 +414,27 @@ class ToolManager:
         Reload all plugin tools from the plugins directory.
         
         This allows adding new tools without restarting the service.
-        Returns the number of plugins loaded.
+        Returns the number of tools loaded. The new set is built aside and
+        swapped in only on success, so a failed reload keeps the old tools.
+        Externally registered instances (MCP tools) are carried over.
         """
-        # Clear all tools
-        old_count = len(self.tools)
-        self.tools.clear()
-        logger.info(f"Cleared {old_count} existing tools")
-        
-        # Reload plugins
-        self._load_plugins()
-        
+        old_tools = self.tools
+        self.tools = {}
+        try:
+            self._load_tools()
+        except Exception as e:
+            logger.error(f"Plugin reload failed, keeping existing tools: {e}",
+                         exc_info=True)
+            self.tools = old_tools
+            return len(self.tools)
+        if not self.tools:
+            logger.error("Plugin reload produced no tools, keeping existing tools")
+            self.tools = old_tools
+            return len(self.tools)
+        for key, wrapper in old_tools.items():
+            if key not in self.tools and getattr(wrapper, "_external", False):
+                self.tools[key] = wrapper
+        logger.info(f"Reloaded tools: {len(old_tools)} -> {len(self.tools)}")
         return len(self.tools)
         
     def list_tools(self) -> List[Dict[str, Any]]:
@@ -506,18 +540,12 @@ class ToolManager:
 
         Returns False for unsupported patterns (task should be dropped).
         """
-        pattern = (task.metadata or {}).get("recurring")
-        if pattern not in ("daily", "weekdays", "weekends"):
+        next_time = self._next_occurrence(task, self._local_now())
+        if next_time is None:
+            logger.warning(f"Unsupported recurring pattern "
+                           f"{(task.metadata or {}).get('recurring')!r} for task {task.id}")
             return False
-        while task.execute_at <= self._local_now():
-            nxt = task.execute_at + timedelta(days=1)
-            if pattern == "weekdays":
-                while nxt.weekday() >= 5:
-                    nxt += timedelta(days=1)
-            elif pattern == "weekends":
-                while nxt.weekday() < 5:
-                    nxt += timedelta(days=1)
-            task.execute_at = nxt
+        task.execute_at = next_time
         return True
 
     def _load_persisted_tasks(self):
@@ -592,7 +620,10 @@ class ToolManager:
                 "skipping (never overriding built-ins)")
             return False
         try:
-            self.tools[key] = self._wrap_tool_instance(instance)
+            wrapper = self._wrap_tool_instance(instance)
+            # Not reproducible by _load_tools: reload_plugins carries it over.
+            wrapper._external = True
+            self.tools[key] = wrapper
         except Exception as e:
             logger.error(f"Failed to register tool instance {key}: {e}")
             return False
@@ -688,18 +719,21 @@ class ToolManager:
         # Log tool invocation (convert params to simple dict for JSON)
         try:
             params_dict = {k: str(v) for k, v in tool_call.params.items()}
-        except:
+        except Exception:
             params_dict = {}
         log_event(logger, logging.INFO, f"Tool called: {tool_name}",
                  event="tool_call", tool=tool_name, params=params_dict)
         
-        # Record tool call metric
-        Metrics.record_tool_call(tool_name)
-        
         if tool_name not in self.tools:
-            Metrics.record_tool_error(tool_name, "unknown_tool")
+            # Hallucinated names must not mint new Prometheus series: the
+            # tool_name label is bounded to registered tools + "unknown".
+            Metrics.record_tool_call("unknown")
+            Metrics.record_tool_error("unknown", "unknown_tool")
             return ToolResult(status=ToolStatus.FAILED, message=f"Unknown tool: {tool_name}")
-            
+
+        # Record tool call metric (validated name only)
+        Metrics.record_tool_call(tool_name)
+
         tool = self.tools[tool_name]
         if not tool.enabled:
             Metrics.record_tool_error(tool_name, "disabled")
@@ -729,73 +763,10 @@ class ToolManager:
             "tool.params": str(params_dict)
         }) as span:
             try:
-                # --- INTERCEPT CALLBACK TOOL ---
-                # Handle callback manually to ensure caller's number is used by default
-                if tool_name == "CALLBACK":
-                    delay = int(tool_call.params.get("delay", 60))
-                    message = tool_call.params.get("message", "This is your scheduled callback")
-                    destination = tool_call.params.get("destination") or tool_call.params.get("uri")
-                    
-                    # Sanitize destination
-                    if destination:
-                        destination = str(destination).strip()
-                    
-                    # Use caller's number if not specified or if explicitly "CALLER_NUMBER"
-                    if not destination or destination.upper() == "CALLER_NUMBER":
-                        if self.assistant.current_call:
-                            destination = getattr(self.assistant.current_call, 'remote_uri', None)
-                            logger.info(f"Using caller's number for callback: {destination}")
-                        if not destination:
-                            latency_ms = (time.time() - start_time) * 1000
-                            Metrics.record_tool_latency(latency_ms, tool_name)
-                            Metrics.record_tool_error(tool_name, "no_callback_number")
-                            span.set_attribute("tool.error", "no_callback_number")
-                            return ToolResult(
-                                status=ToolStatus.FAILED,
-                                message="No callback number available - please specify a number"
-                            )
-                    else:
-                        # An explicit destination was supplied by the (untrusted)
-                        # caller via the LLM. Enforce the same dial-target policy as
-                        # the REST path so the voice path can't be abused to dial
-                        # arbitrary numbers / SIP domains (toll fraud). On a policy
-                        # violation, fall back to the verified current caller rather
-                        # than the attacker-chosen target.
-                        policy_error = check_extension_allowed(destination, self.config)
-                        if policy_error:
-                            caller_uri = getattr(self.assistant.current_call, 'remote_uri', None) \
-                                if self.assistant.current_call else None
-                            log_event(logger, logging.WARNING,
-                                     f"CALLBACK destination rejected by policy: {policy_error}",
-                                     event="callback_destination_blocked",
-                                     destination=destination, reason=policy_error,
-                                     fallback=caller_uri)
-                            Metrics.record_tool_error(tool_name, "destination_blocked")
-                            span.set_attribute("tool.error", "destination_blocked")
-                            if not caller_uri:
-                                return ToolResult(
-                                    status=ToolStatus.FAILED,
-                                    message="I can only call you back at your own number."
-                                )
-                            destination = caller_uri
-
-                    logger.debug(f"Processing CALLBACK: delay={delay}, dest={destination}")
-                    
-                    # Schedule the callback
-                    await self.assistant.schedule_callback(delay, message, destination)
-                    
-                    latency_ms = (time.time() - start_time) * 1000
-                    Metrics.record_tool_latency(latency_ms, tool_name)
-                    span.set_attribute("tool.latency_ms", latency_ms)
-                    span.set_attribute("tool.status", "success")
-                    
-                    return ToolResult(
-                        status=ToolStatus.SUCCESS,
-                        message=f"I'll call you back in {format_duration(delay)}"
-                    )
-                # -------------------------------
-
-                # For other tools, run normally
+                # CALLBACK needs no interception: CallbackTool itself defaults
+                # to the current caller's number and enforces the voice-dial
+                # policy, delay bounds and per-call cap — so the REST paths
+                # (/tools/CALLBACK/execute, /webhook/call) get them too.
                 result = await tool.execute(tool_call.params)
                 
                 latency_ms = (time.time() - start_time) * 1000
@@ -809,14 +780,17 @@ class ToolManager:
                 return result
                 
             except Exception as e:
-                logger.error(f"Tool execution error: {e}")
-                import traceback
-                traceback.print_exc()
+                # Details go to the log/trace only: str(e) can carry internal
+                # hosts, paths or stack details that must never be spoken.
+                logger.error(f"Tool execution error in {tool_name}: {e}", exc_info=True)
                 latency_ms = (time.time() - start_time) * 1000
                 Metrics.record_tool_latency(latency_ms, tool_name)
                 Metrics.record_tool_error(tool_name, type(e).__name__)
                 span.record_exception(e)
-                return ToolResult(status=ToolStatus.FAILED, message=str(e))
+                return ToolResult(
+                    status=ToolStatus.FAILED,
+                    message=f"Sorry, the {tool_name.lower().replace('_', ' ')} "
+                            "tool ran into a problem.")
             
     async def schedule_task(
         self,
@@ -824,9 +798,17 @@ class ToolManager:
         delay_seconds: int,
         message: str,
         target_uri: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        owner_call_id: Optional[str] = None,
+        owner_caller: Optional[str] = None,
     ) -> str:
-        """Schedule a task for later execution."""
+        """Schedule a task for later execution.
+
+        Timers and callbacks are owned by the call scheduling them (taken
+        from the live session when no owner is passed) so voice CANCEL/STATUS
+        only ever see the caller's own tasks. scheduled_call tasks (REST
+        /schedule) are never auto-owned.
+        """
         task_id = str(uuid.uuid4())[:8]
 
         # Timers announce into the call that set them: capture the scheduling
@@ -834,6 +816,10 @@ class ToolManager:
         # scheduler — whose own context is unbound — can route the
         # announcement to the right call even with several calls live.
         session = get_current_session() if task_type == "timer" else None
+
+        if (owner_call_id is None and owner_caller is None
+                and task_type in self.VOICE_TASK_TYPES):
+            owner_call_id, owner_caller = self.current_owner()
 
         task = ScheduledTask(
             id=task_id,
@@ -843,6 +829,8 @@ class ToolManager:
             target_uri=target_uri,
             metadata=metadata or {},
             session=session,
+            owner_call_id=owner_call_id,
+            owner_caller=owner_caller,
         )
         
         self.scheduled_tasks[task_id] = task
@@ -854,31 +842,82 @@ class ToolManager:
 
         return task_id
         
+    # Task types a caller can create by voice (and therefore see/cancel).
+    VOICE_TASK_TYPES = ("timer", "callback")
+
+    def current_owner(self) -> Tuple[Optional[str], Optional[str]]:
+        """(call id, caller id) of the call the current task acts for.
+
+        Resolved through assistant.session (the bound session, else the sole
+        live one); falls back to assistant.current_call for minimal
+        assistants. (None, None) when no call is live.
+        """
+        session = getattr(self.assistant, "session", None)
+        if session is not None:
+            call = getattr(session, "call_info", None)
+        else:
+            call = getattr(self.assistant, "current_call", None)
+        call_id = getattr(session, "transcript_id", None) or getattr(call, "call_id", None)
+        remote = getattr(call, "remote_uri", None)
+        caller = getattr(session, "caller_id", "") or (
+            caller_id_from_uri(remote) if remote else None)
+        return (str(call_id) if call_id else None), (caller or None)
+
+    def _owned_by(self, task: ScheduledTask, owner: Tuple[Optional[str], Optional[str]]) -> bool:
+        """Whether a caller may see/cancel ``task`` by voice. Only voice-type
+        tasks, and only those owned by this call or this caller — never REST
+        /schedule calls or unowned (REST / legacy) tasks. With no live call
+        (REST/operator use) every timer/callback is visible."""
+        if task.task_type not in self.VOICE_TASK_TYPES:
+            return False
+        call_id, caller = owner
+        if not call_id and not caller:
+            # No live call: an (authenticated) REST/operator invocation, not
+            # a caller — it sees every timer/callback, still never /schedule
+            # calls (those are cancelled by id via DELETE /schedule).
+            return True
+        if call_id and task.owner_call_id == call_id:
+            return True
+        return bool(caller) and task.owner_caller == caller
+
     def get_pending_tasks(self) -> List[ScheduledTask]:
-        """Get all pending (not completed) tasks."""
+        """Get all pending (not completed) tasks (admin/REST view)."""
         now = self._local_now()
         return [
             task for task in self.scheduled_tasks.values()
             if not task.completed and task.execute_at > now
         ]
+
+    def get_owned_pending_tasks(self) -> List[ScheduledTask]:
+        """Pending tasks the current caller owns (the voice STATUS view)."""
+        owner = self.current_owner()
+        return [t for t in self.get_pending_tasks() if self._owned_by(t, owner)]
         
-    async def cancel_tasks(self, task_type: str = 'all') -> int:
-        """Cancel tasks by type. Returns number cancelled."""
-        cancelled = 0
+    async def cancel_tasks(self, task_type: str = 'all', owned_only: bool = False) -> int:
+        """Cancel tasks by type. Returns number cancelled.
+
+        ``owned_only`` (the voice CANCEL path) restricts it to timers and
+        callbacks owned by the current call/caller; REST-scheduled calls are
+        never touched that way (cancel those by id via DELETE /schedule).
+        """
+        owner = self.current_owner() if owned_only else None
         to_remove = []
-        
+
         for task_id, task in self.scheduled_tasks.items():
-            if not task.completed:
-                if task_type == 'all' or task.task_type == task_type:
-                    to_remove.append(task_id)
-                    cancelled += 1
-                    
+            if task.completed:
+                continue
+            if task_type != 'all' and task.task_type != task_type:
+                continue
+            if owner is not None and not self._owned_by(task, owner):
+                continue
+            to_remove.append(task_id)
+
         for task_id in to_remove:
             del self.scheduled_tasks[task_id]
 
-        if cancelled:
+        if to_remove:
             self._persist_tasks()
-        return cancelled
+        return len(to_remove)
 
     def cancel_task(self, task_id: str) -> bool:
         """Cancel a single task by id. Returns True if it existed."""
@@ -1013,14 +1052,43 @@ class ToolManager:
         logger.error(f"Callback {task.id} failed after {self.config.callback_retry_attempts} attempts")
 
     async def _execute_scheduled_call(self, task: ScheduledTask):
-        """Execute a scheduled call - optionally run a tool, then make outbound call."""
+        """Execute a scheduled call - optionally run a tool, then make outbound call.
+
+        A recurring schedule is rescheduled (same id) whatever this
+        occurrence's outcome — failure, exception or cancellation — so one
+        unanswered morning call never silently ends the series.
+        """
         metadata = task.metadata or {}
         extension = metadata.get("extension") or task.target_uri
         
         if not extension:
             logger.error(f"Scheduled call {task.id} has no extension")
             return
-        
+
+        call_succeeded = False
+        try:
+            call_succeeded = await self._place_scheduled_call(task, metadata, extension)
+        except Exception as e:
+            logger.error(f"Scheduled call {task.id} failed: {e}", exc_info=True)
+        finally:
+            if metadata.get("recurring"):
+                try:
+                    await self._reschedule_recurring_call(task, metadata)
+                except Exception as e:
+                    logger.error(f"Scheduled call {task.id} reschedule failed: {e}",
+                                 exc_info=True)
+
+        if metadata.get("callback_url"):
+            try:
+                await self._send_scheduled_call_webhook(
+                    task, metadata, "completed" if call_succeeded else "failed")
+            except Exception as e:
+                logger.error(f"Scheduled call {task.id} webhook failed: {e}")
+
+    async def _place_scheduled_call(self, task: ScheduledTask, metadata: dict,
+                                    extension: str) -> bool:
+        """Build the scheduled call's message and dial it (with retries).
+        Returns True when the call was placed."""
         log_event(logger, logging.INFO, f"Executing scheduled call to {extension}",
                  event="scheduled_call_execute", task_id=task.id, extension=extension)
         
@@ -1072,95 +1140,137 @@ class ToolManager:
                 full_message = await engine.reformat_for_speech(
                     full_message, self.config.message_reformat_timeout_s)
 
-        # Make the call
-        call_succeeded = False
+        # Make the call. make_outbound_call raises on dial failure / no
+        # answer / busy, so every exception counts as a failed attempt.
         for attempt in range(self.config.callback_retry_attempts):
             try:
                 await self.assistant.make_outbound_call(extension, full_message)
 
                 log_event(logger, logging.INFO, f"Scheduled call completed: {task.id}",
                          event="scheduled_call_complete", task_id=task.id, extension=extension)
-
-                call_succeeded = True
-                break
+                return True
 
             except Exception as e:
                 logger.warning(f"Scheduled call attempt {attempt + 1} failed: {e}")
                 if attempt < self.config.callback_retry_attempts - 1:
                     await asyncio.sleep(self.config.callback_retry_delay_s)
 
-        if not call_succeeded:
-            logger.error(f"Scheduled call {task.id} failed after {self.config.callback_retry_attempts} attempts")
+        logger.error(f"Scheduled call {task.id} failed after {self.config.callback_retry_attempts} attempts")
+        return False
 
-            if metadata.get("callback_url"):
-                await self._send_scheduled_call_webhook(task, metadata, "failed")
-            return
+    # Recurrence patterns the scheduler understands (cron is not supported).
+    RECURRING_PATTERNS = ("daily", "weekdays", "weekends")
+    # The API's default timezone for at_time / recurring schedules.
+    DEFAULT_SCHEDULE_TZ = "America/Los_Angeles"
 
-        # Post-success work runs in a SEPARATE try so that a failure here
-        # (e.g. a bad timezone while rescheduling, or a webhook error) does
-        # NOT re-trigger the already-placed outbound call, which would cause
-        # duplicate calls and lose the recurrence.
-        try:
-            # Handle recurring
-            if metadata.get("recurring"):
-                await self._reschedule_recurring_call(task, metadata)
+    def _zone(self, name: Optional[str], fallback: str) -> ZoneInfo:
+        for candidate in (name, fallback, "UTC"):
+            if not candidate:
+                continue
+            try:
+                return ZoneInfo(candidate)
+            except Exception:
+                logger.warning(f"Unknown timezone {candidate!r}; falling back")
+        return ZoneInfo("UTC")
 
-            # Send callback webhook if specified
-            if metadata.get("callback_url"):
-                await self._send_scheduled_call_webhook(task, metadata, "completed")
-        except Exception as e:
-            logger.error(f"Scheduled call {task.id} post-call handling failed: {e}")
-    
+    def _recurrence_anchor(self, task: ScheduledTask, tz: ZoneInfo, local_tz: ZoneInfo) -> dt_time:
+        """The schedule's wall-clock time of day in its own timezone.
+
+        From ``at_time`` (HH:MM, or an ISO datetime) when present, else from
+        the first occurrence's execute_at. Cached in metadata["anchor_time"]
+        so every later occurrence lands on the same wall-clock time — no
+        drift by call duration, stable across DST changes.
+        """
+        metadata = task.metadata
+        anchor = metadata.get("anchor_time")
+        if anchor:
+            try:
+                return dt_time.fromisoformat(anchor)
+            except ValueError:
+                pass
+        result: Optional[dt_time] = None
+        at_time = str(metadata.get("at_time") or "").strip()
+        if at_time:
+            try:
+                if "T" in at_time or "-" in at_time:
+                    parsed = datetime.fromisoformat(at_time.replace("Z", "+00:00"))
+                    if parsed.tzinfo is not None:
+                        parsed = parsed.astimezone(tz)
+                    result = parsed.time().replace(microsecond=0, tzinfo=None)
+                else:
+                    hour, minute = map(int, at_time.split(":")[:2])
+                    result = dt_time(hour, minute)
+            except (ValueError, TypeError):
+                result = None
+        if result is None:
+            result = (task.execute_at.replace(tzinfo=local_tz).astimezone(tz)
+                      .time().replace(microsecond=0, tzinfo=None))
+        metadata["anchor_time"] = result.isoformat()
+        return result
+
+    def _next_occurrence(self, task: ScheduledTask, after: datetime) -> Optional[datetime]:
+        """Next run of a recurring task strictly after ``after`` (naive
+        LOCAL_TIMEZONE wall clock, like execute_at), or None for unsupported
+        patterns.
+
+        Computed from the schedule's original wall-clock time in ITS timezone
+        and localised properly (zoneinfo), so a 07:00 America/New_York call
+        stays at 07:00 local across DST and never drifts by call duration.
+        """
+        metadata = task.metadata if task.metadata is not None else {}
+        task.metadata = metadata
+        pattern = metadata.get("recurring")
+        if pattern not in self.RECURRING_PATTERNS:
+            return None
+        local_tz = self._zone(self.config.local_timezone, "UTC")
+        tz = self._zone(metadata.get("timezone"), self.DEFAULT_SCHEDULE_TZ)
+        anchor = self._recurrence_anchor(task, tz, local_tz)
+
+        after_aware = after.replace(tzinfo=local_tz)
+        day: date = task.execute_at.replace(tzinfo=local_tz).astimezone(tz).date()
+        for _ in range(3660):  # bounded: ~10 years of days
+            day += timedelta(days=1)
+            if pattern == "weekdays" and day.weekday() >= 5:
+                continue
+            if pattern == "weekends" and day.weekday() < 5:
+                continue
+            candidate = datetime.combine(day, anchor, tzinfo=tz)
+            # Round-trip through UTC so a non-existent wall time (inside a
+            # spring-forward gap) resolves to the real instant.
+            candidate = candidate.astimezone(timezone.utc).astimezone(tz)
+            if candidate > after_aware:
+                return candidate.astimezone(local_tz).replace(tzinfo=None)
+        return None
+
     async def _reschedule_recurring_call(self, task: ScheduledTask, metadata: dict):
-        """Reschedule a recurring call."""
-        import pytz
-        
+        """Re-arm a recurring call for its next occurrence IN PLACE.
+
+        Reuses task.id so DELETE /schedule/{id} keeps working for the whole
+        series. A task cancelled while its call was running (removed from
+        scheduled_tasks) is not resurrected.
+        """
         recurring = metadata.get("recurring")
         if not recurring:
             return
-        
-        tz = pytz.timezone(metadata.get("timezone", "America/Los_Angeles"))
-        now = datetime.now(tz)
-        next_time = None
-        
-        if recurring == "daily":
-            # Same time tomorrow
-            next_time = now + timedelta(days=1)
-        elif recurring == "weekdays":
-            # Next weekday (Mon-Fri)
-            next_time = now + timedelta(days=1)
-            while next_time.weekday() >= 5:  # Saturday=5, Sunday=6
-                next_time += timedelta(days=1)
-        elif recurring == "weekends":
-            # Next weekend day
-            next_time = now + timedelta(days=1)
-            while next_time.weekday() < 5:
-                next_time += timedelta(days=1)
-        else:
-            # TODO: Support cron expressions
-            logger.warning(f"Unsupported recurring pattern: {recurring}")
+        if self.scheduled_tasks.get(task.id) is not task:
+            log_event(logger, logging.INFO,
+                      f"Recurring call {task.id} was cancelled; not rescheduling",
+                      event="scheduled_call_series_cancelled", task_id=task.id)
             return
-        
-        # If at_time was specified, use that time on the next day
-        at_time = metadata.get("at_time")
-        if at_time and ':' in at_time and 'T' not in at_time:
-            hour, minute = map(int, at_time.split(':'))
-            next_time = next_time.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        
-        delay_seconds = int((next_time - now).total_seconds())
-        
-        # Schedule next occurrence
-        new_task_id = await self.schedule_task(
-            task_type="scheduled_call",
-            delay_seconds=delay_seconds,
-            message=task.message,
-            target_uri=metadata.get("extension"),
-            metadata=metadata
-        )
-        
-        log_event(logger, logging.INFO, f"Rescheduled recurring call: {new_task_id}",
-                 event="scheduled_call_rescheduled", 
-                 task_id=new_task_id, 
+
+        next_time = self._next_occurrence(task, self._local_now())
+        if next_time is None:
+            logger.warning(f"Unsupported recurring pattern {recurring!r} for "
+                           f"scheduled call {task.id}; not rescheduling")
+            return
+
+        task.execute_at = next_time
+        task.completed = False
+        self._persist_tasks()
+
+        log_event(logger, logging.INFO, f"Rescheduled recurring call: {task.id}",
+                 event="scheduled_call_rescheduled",
+                 task_id=task.id,
                  recurring=recurring,
                  next_time=next_time.isoformat())
     
@@ -1183,7 +1293,7 @@ class ToolManager:
             "extension": metadata.get("extension"),
             "tool": metadata.get("tool"),
             "recurring": metadata.get("recurring"),
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }
 
         if await deliver_webhook(url, payload, self.config,

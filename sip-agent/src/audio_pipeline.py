@@ -122,8 +122,26 @@ class FastVoiceActivityDetector:
         
         self.vad = None
         if VAD_AVAILABLE:
-            self.vad = webrtcvad.Vad(3)  # Mode 3 = most aggressive
-            
+            # 0 (least) .. 3 (most aggressive); clamp so a bad value can't
+            # make webrtcvad raise and silently disable frame-level VAD.
+            try:
+                mode = int(getattr(config, "vad_aggressiveness", 3))
+            except (TypeError, ValueError):
+                mode = 3
+            self.vad = webrtcvad.Vad(max(0, min(3, mode)))
+
+        # 30ms webrtcvad frame, in bytes (16-bit mono).
+        self._frame_bytes = int(self.sample_rate * 0.03) * 2
+        # Partial-frame bytes left over from the previous chunk. The recorder
+        # file grows in 4096-byte steps, so receive_audio() hands back e.g.
+        # 3200 then 896 bytes; evaluating only whole frames per chunk made the
+        # sub-frame tail (and any whole chunk under one frame) unclassifiable.
+        # Carrying the remainder keeps the frame grid aligned to the stream.
+        self._frame_remainder = b""
+        # webrtcvad verdict of the last whole frame — reused for a chunk that
+        # completes no frame of its own (still pending in the remainder).
+        self._last_frame_speech = False
+
         self.speech_frames = deque(maxlen=50)
         self.silence_frames = 0
         # Trailing silence (ms) since the last speech chunk. Measured from the
@@ -155,8 +173,14 @@ class FastVoiceActivityDetector:
         adaptive noise floor: the audio loop calls both has_speech()
         (barge-in check) and process_audio() on the SAME chunk, and letting
         both feed noise_samples would double-count every chunk in the floor.
+        The same flag governs the carried partial-frame remainder: only the
+        stateful (``update_noise=True``) call advances it, so a side-effect-
+        free peek sees the same aligned frames without consuming them.
         """
-        samples = np.frombuffer(audio_chunk, dtype=np.int16)
+        samples = np.frombuffer(audio_chunk[:len(audio_chunk) - (len(audio_chunk) % 2)],
+                                dtype=np.int16)
+        if samples.size == 0:
+            return False
         energy = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
 
         if not self.is_speaking and update_noise:
@@ -166,21 +190,35 @@ class FastVoiceActivityDetector:
                     float(np.percentile(list(self.noise_samples), 30)),
                     self.MIN_NOISE_FLOOR)
 
+        if self.vad:
+            frame_size = self._frame_bytes
+            data = self._frame_remainder + audio_chunk
+            whole = len(data) - (len(data) % frame_size)
+            if update_noise:
+                self._frame_remainder = data[whole:]
+
         if energy < self.noise_floor * 1.5:
+            if self.vad and update_noise:
+                self._last_frame_speech = False
             return False
-            
+
         if self.vad:
             try:
-                frame_size = int(self.sample_rate * 0.03) * 2  # 30ms
-                for i in range(0, len(audio_chunk), frame_size):
-                    frame = audio_chunk[i:i + frame_size]
-                    if len(frame) == frame_size:
-                        if self.vad.is_speech(frame, self.sample_rate):
-                            return True
-                return False
+                if whole == 0:
+                    # No complete frame yet: the chunk extends the frame still
+                    # pending in the remainder, so reuse the last verdict.
+                    return self._last_frame_speech
+                speech = False
+                for i in range(0, whole, frame_size):
+                    if self.vad.is_speech(data[i:i + frame_size], self.sample_rate):
+                        speech = True
+                        break
+                if update_noise:
+                    self._last_frame_speech = speech
+                return speech
             except Exception:
                 pass
-                
+
         return bool(energy > self.noise_floor * 2)
 
     def process_audio(self, audio_chunk: bytes,
@@ -259,11 +297,23 @@ class SessionAudioState:
     # connection cap is reached, or when the connect failed (the session then
     # falls back to the shared batch client).
     realtime: Optional[Any] = None
+    # Pre-roll ring: the most recent non-speech audio (~SPEECH_PAD_MS) heard
+    # while NOT in an utterance. Prepended to the buffer when speech starts so
+    # the soft onset the VAD needed a frame or two to recognize isn't clipped.
+    preroll: bytearray = field(default_factory=bytearray)
+    # ms of pre-roll prepended to the current utterance's buffer; excluded
+    # (with the trailing hangover silence) from the min-speech-duration gate
+    # so a lone click padded with pre-roll/silence still reads as noise.
+    preroll_ms: float = 0.0
 
 
 # ============================================================================
 # Whisper API Client (OpenAI-compatible) - via Speaches
 # ============================================================================
+
+class _NonRetryableSTTError(Exception):
+    """A 4xx from the STT endpoint: retrying the same request can't succeed."""
+
 
 class WhisperAPIClient:
     """
@@ -278,11 +328,20 @@ class WhisperAPIClient:
         self.language = config.whisper_language
         self.client: Optional[httpx.AsyncClient] = None
         self.available = False
+        # Re-probe bookkeeping: an unavailable client (Speaches still booting
+        # when we started) re-checks at most every speech_reprobe_interval_s
+        # instead of staying latched off for the life of the process.
+        self._probe_lock = asyncio.Lock()
+        self._last_probe = 0.0
         
     async def initialize(self):
         """Initialize the API client and ensure model is downloaded."""
         self.client = httpx.AsyncClient(timeout=120.0)  # Longer timeout for model download
-        
+        await self._probe(warm_up=True)
+
+    async def _probe(self, warm_up: bool) -> bool:
+        """Health-check Speaches and mark the client available on success."""
+        self._last_probe = time.monotonic()
         try:
             response = await self.client.get(f"{self.base_url}/health")
             if response.status_code == 200:
@@ -296,12 +355,33 @@ class WhisperAPIClient:
                 # Force the model into memory now; Speaches loads Whisper
                 # lazily on the first transcription, which on a busy GPU can
                 # take minutes and would otherwise stall the first real call.
-                await self._warm_up()
+                if warm_up:
+                    await self._warm_up()
             else:
                 logger.warning(f"Whisper API returned status {response.status_code}")
         except Exception as e:
             logger.warning(f"Whisper API not available: {e}")
             self.available = False
+        return self.available
+
+    async def _maybe_reprobe(self) -> bool:
+        """Re-run the availability probe if the last one is old enough.
+
+        Serialized under a lock so concurrent callers share one probe (and
+        see its outcome) rather than stampeding a recovering Speaches.
+        """
+        if self.available:
+            return True
+        if self.client is None:
+            return False
+        interval = getattr(self.config, "speech_reprobe_interval_s", 15.0)
+        async with self._probe_lock:
+            if self.available:
+                return True
+            if time.monotonic() - self._last_probe < interval:
+                return False
+            logger.info("Re-probing Whisper API (Speaches) availability")
+            return await self._probe(warm_up=False)
             
     async def _ensure_model_downloaded(self):
         """
@@ -359,6 +439,8 @@ class WhisperAPIClient:
         """
         Transcribe audio using OpenAI-compatible API with retry logic.
         """
+        if not self.available and self.client is not None:
+            await self._maybe_reprobe()
         if not self.available or not self.client:
             logger.warning("Whisper API not available")
             Metrics.record_stt_error(self.model, "api_unavailable")
@@ -393,12 +475,23 @@ class WhisperAPIClient:
                     'response_format': 'json'
                 }
                 
+                # Per-request timeout: this runs on the speaking path, so a
+                # hung Speaches must fail fast (STT_TIMEOUT_S), not stall the
+                # caller for the client's 120s model-download default.
                 response = await self.client.post(
                     f"{self.base_url}/v1/audio/transcriptions",
                     files=files,
-                    data=data
+                    data=data,
+                    timeout=self.config.stt_timeout_s,
                 )
-                response.raise_for_status()
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as e:
+                    if e.response is not None and e.response.status_code < 500:
+                        # A 4xx won't fix itself on retry (bad request/model
+                        # not installed): fail this turn without the backoff.
+                        raise _NonRetryableSTTError(str(e)) from e
+                    raise
                 return response.json()
             
             try:
@@ -426,6 +519,11 @@ class WhisperAPIClient:
                 
                 return text
                 
+            except _NonRetryableSTTError as e:
+                span.set_attribute("error", str(e))
+                Metrics.record_stt_error(self.model, "http_4xx")
+                logger.error(f"STT request rejected: {e}")
+                return ""
             except RetryError as e:
                 latency_ms = (time.time() - start_time) * 1000
                 span.set_attribute("stt.latency_ms", latency_ms)
@@ -486,6 +584,11 @@ class SpeachesTTSClient:
         
         # HTTP client
         self.client: Optional[httpx.AsyncClient] = None
+
+        # Re-probe bookkeeping (see WhisperAPIClient._maybe_reprobe).
+        self._probe_lock = asyncio.Lock()
+        self._last_probe = 0.0
+        self._precache_task: Optional[asyncio.Task] = None
         
         # Determine expected sample rate based on model
         if 'kokoro' in self.model.lower():
@@ -496,31 +599,58 @@ class SpeachesTTSClient:
     async def initialize(self):
         """Test connection to Speaches TTS API and ensure model is downloaded."""
         self.client = httpx.AsyncClient(timeout=120.0)  # Longer timeout for model download
-        
+        if await self._probe():
+            # Pre-cache common phrases
+            if self.cache_enabled:
+                await self._precache_phrases()
+
+    async def _probe(self) -> bool:
+        """Health-check Speaches + the TTS model; mark available on success."""
+        self._last_probe = time.monotonic()
         try:
             # Test the health endpoint
             response = await self.client.get(f"{self.base_url}/health")
             if response.status_code != 200:
                 logger.warning(f"Speaches TTS health check failed: {response.status_code}")
-                return
+                return False
                 
             logger.info(f"Speaches TTS available at {self.base_url}")
             
             # Ensure the TTS model is downloaded
             if not await self._ensure_model_downloaded():
                 logger.error(f"Failed to download TTS model: {self.model}")
-                return
+                return False
                 
             self.available = True
             logger.info(f"TTS model: {self.model}, voice: {self.voice}")
-            
-            # Pre-cache common phrases
-            if self.cache_enabled:
-                await self._precache_phrases()
+            return True
                 
         except Exception as e:
             logger.warning(f"Speaches TTS not available: {e}")
             self.available = False
+            return False
+
+    async def _maybe_reprobe(self) -> bool:
+        """Re-run the availability probe if the last one is old enough (at
+        most every speech_reprobe_interval_s, one probe at a time). On
+        recovery the phrase cache is filled in the background."""
+        if self.available:
+            return True
+        if self.client is None:
+            return False
+        interval = getattr(self.config, "speech_reprobe_interval_s", 15.0)
+        async with self._probe_lock:
+            if self.available:
+                return True
+            if time.monotonic() - self._last_probe < interval:
+                return False
+            logger.info("Re-probing Speaches TTS availability")
+            if not await self._probe():
+                return False
+        if self.cache_enabled and not self.audio_cache and (
+                self._precache_task is None or self._precache_task.done()):
+            self._precache_task = asyncio.create_task(self._precache_phrases())
+        return True
             
     async def _ensure_model_downloaded(self) -> bool:
         """
@@ -538,7 +668,10 @@ class SpeachesTTSClient:
                     "input": "test",
                     "response_format": self.response_format,
                 },
-                timeout=10.0
+                # The first synthesis also loads the model into memory, which
+                # on a busy GPU takes far longer than a warm request; a short
+                # timeout here latched TTS off for the process.
+                timeout=max(60.0, float(getattr(self.config, "api_timeout_s", 30.0))),
             )
             
             if test_response.status_code == 200:
@@ -606,10 +739,8 @@ class SpeachesTTSClient:
             try:
                 audio = await self._synthesize_raw(phrase)
                 if audio:
-                    # Only resample raw PCM; compressed formats must not be
-                    # reinterpreted as int16 (see _is_raw_pcm_format).
-                    if self._is_raw_pcm_format():
-                        audio = self._resample(audio, self.tts_sample_rate, self.config.sample_rate)
+                    audio = await self._to_call_pcm(audio)
+                if audio:
                     self.audio_cache[phrase.lower()] = audio
             except Exception as e:
                 logger.warning(f"Failed to cache '{phrase}': {e}")
@@ -618,6 +749,8 @@ class SpeachesTTSClient:
         
     async def close(self):
         """Close the HTTP client."""
+        if self._precache_task and not self._precache_task.done():
+            self._precache_task.cancel()
         if self.client:
             await self.client.aclose()
         
@@ -727,6 +860,8 @@ class SpeachesTTSClient:
             return cached
             
         if not self.available:
+            await self._maybe_reprobe()
+        if not self.available:
             logger.warning("Speaches TTS not available")
             return b''
             
@@ -734,17 +869,9 @@ class SpeachesTTSClient:
         audio = await self._synthesize_raw(text)
         
         if audio:
-            if self._is_raw_pcm_format():
-                # Resample to target rate (usually 16000Hz for SIP)
-                audio = self._resample(audio, self.tts_sample_rate, self.config.sample_rate)
-            else:
-                # Compressed format: resampling as int16 would emit noise. Pass the
-                # encoded bytes through un-resampled rather than corrupting them.
-                logger.warning(
-                    f"TTS_RESPONSE_FORMAT='{self.response_format}' is not raw PCM; "
-                    "skipping resample (audio left at native rate, not int16-resampled)"
-                )
+            audio = await self._to_call_pcm(audio)
 
+        if audio:
             elapsed = (time.time() - start) * 1000
             logger.info(f"Speaches TTS: {elapsed:.0f}ms for '{text[:30]}...'")
 
@@ -764,26 +891,53 @@ class SpeachesTTSClient:
             for i in range(0, len(audio), chunk_size):
                 yield audio[i:i + chunk_size]
                 
+    async def _to_call_pcm(self, audio: bytes) -> bytes:
+        """Convert synthesized bytes to 16-bit mono PCM at config.sample_rate
+        (what SIPHandler.send_audio plays), off the event loop.
+
+        Raw PCM (wav/pcm) is resampled; a compressed TTS_RESPONSE_FORMAT
+        (mp3/opus/flac/...) is decoded first — playing the encoded bytes as
+        PCM would be loud noise. Returns b'' if decoding fails.
+        """
+        if self._is_raw_pcm_format():
+            return await asyncio.to_thread(
+                self._resample, audio, self.tts_sample_rate, self.config.sample_rate)
+        try:
+            return await asyncio.to_thread(
+                decode_audio_to_pcm16, audio, self.config.sample_rate)
+        except ValueError as e:
+            logger.error(f"Could not decode TTS_RESPONSE_FORMAT="
+                         f"'{self.response_format}' audio: {e}")
+            Metrics.record_tts_error(self.model, "decode_failed")
+            return b''
+
     def _resample(self, audio: bytes, from_rate: int, to_rate: int) -> bytes:
-        """Resample audio to target sample rate."""
+        """Resample int16 PCM to the target rate (CPU-bound: run off-loop).
+
+        Polyphase (resample_poly) rather than FFT resample: no wrap-around
+        ringing at the clip edges, and far cheaper for long clips. The result
+        is clipped before the int16 cast — filter overshoot on loud audio
+        otherwise wraps to the opposite rail and pops.
+        """
         if from_rate == to_rate:
             return audio
             
-        samples = np.frombuffer(audio, dtype=np.int16)
+        samples = np.frombuffer(audio[:len(audio) - (len(audio) % 2)], dtype=np.int16)
         if len(samples) == 0:
             return audio
             
         if SCIPY_AVAILABLE:
-            ratio = to_rate / from_rate
-            new_len = int(len(samples) * ratio)
-            resampled = scipy.signal.resample(samples.astype(np.float64), new_len)
+            import math
+            g = math.gcd(int(from_rate), int(to_rate))
+            resampled = scipy.signal.resample_poly(
+                samples.astype(np.float64), int(to_rate) // g, int(from_rate) // g)
         else:
             # Linear interpolation fallback
             ratio = to_rate / from_rate
             new_indices = np.linspace(0, len(samples) - 1, int(len(samples) * ratio))
             resampled = np.interp(new_indices, np.arange(len(samples)), samples.astype(np.float64))
             
-        return resampled.astype(np.int16).tobytes()
+        return np.clip(np.round(resampled), -32768, 32767).astype(np.int16).tobytes()
 
 
 # ============================================================================
@@ -1026,31 +1180,59 @@ class LowLatencyAudioPipeline:
         elif mode == "speculative":
             silence_timeout_ms = self.config.endpoint_min_silence_ms
 
+        was_speaking = state.vad.is_speaking
         is_speech, end_of_utterance = state.vad.process_audio(
             audio_chunk, silence_timeout_ms=silence_timeout_ms)
 
-        if is_speech:
+        # Once an utterance is in progress, EVERY chunk belongs to it — the
+        # inter-word pauses and soft/unvoiced consonants the VAD scores as
+        # non-speech included (dropping them chopped words out of the audio
+        # STT saw). The chunk that ends the utterance is kept too.
+        if is_speech or state.vad.is_speaking or end_of_utterance:
+            if is_speech and not was_speaking and state.preroll:
+                state.buffer.extend(state.preroll)
+                state.preroll_ms = (len(state.preroll) / 2
+                                    / self.config.sample_rate * 1000)
+                state.preroll.clear()
             state.buffer.extend(audio_chunk)
 
             if len(state.buffer) > self.max_buffer_size:
                 logger.warning("Buffer overflow, forcing transcription")
                 return await self._transcribe_buffer(state)
+        else:
+            self._push_preroll(state, audio_chunk)
 
         if end_of_utterance and len(state.buffer) > 0:
             return await self._transcribe_buffer(state)
 
         return None
 
+    def _push_preroll(self, state: SessionAudioState, audio_chunk: bytes) -> None:
+        """Append non-speech audio to the bounded pre-roll ring."""
+        pad_ms = getattr(self.config, "speech_pad_ms", 200) or 0
+        max_bytes = int(self.config.sample_rate * pad_ms / 1000) * 2
+        if max_bytes <= 0:
+            return
+        state.preroll.extend(audio_chunk)
+        excess = len(state.preroll) - max_bytes
+        if excess > 0:
+            excess += excess % 2  # keep int16 sample alignment
+            del state.preroll[:excess]
+
     async def _transcribe_buffer(self, state: SessionAudioState) -> str:
         """Transcribe buffered audio via API."""
         state.metrics.speech_end = time.time()
 
         audio_data = bytes(state.buffer)
+        # Padding that is in the buffer but isn't the caller talking: the
+        # pre-roll prepended at onset and the trailing hangover silence.
+        padding_ms = state.preroll_ms + state.vad.silence_ms
         state.buffer.clear()
+        state.preroll_ms = 0.0
         state.vad.reset()
         
         duration_ms = len(audio_data) / (self.config.sample_rate * 2) * 1000
-        if duration_ms < self.config.min_speech_duration_ms:
+        if duration_ms - padding_ms < self.config.min_speech_duration_ms:
             # A session with its own realtime connection already streamed the
             # sub-threshold audio via push_audio(); clear that buffer so it
             # doesn't bleed into the next turn's transcript. Sessions on the
@@ -1068,6 +1250,7 @@ class LowLatencyAudioPipeline:
         # WebSocket must never be committed on behalf of one session (it
         # could contain another concurrent call's audio). Sessions without
         # their own connection transcribe through the shared batch client.
+        mode_str = "realtime" if state.realtime is not None else "batch"
         if state.realtime is not None:
             # The audio was already streamed via push_audio(); the local VAD
             # just detected end-of-turn, so commit the buffer and wait for
@@ -1075,11 +1258,22 @@ class LowLatencyAudioPipeline:
             result = await state.realtime.commit_and_wait(
                 self.config.realtime_commit_timeout_s
             )
+            if not result and self._stt_batch_client:
+                # Connection down, commit timed out, or the server failed the
+                # item: the caller's words are still in the local buffer, so
+                # transcribe them through the shared batch client rather than
+                # silently dropping the turn.
+                logger.info("Realtime STT returned nothing; "
+                            "falling back to batch STT for this utterance")
+                mode_str = "realtime->batch"
+                result = await self._stt_batch_client.transcribe(audio_data)
         elif (self._stt_manager and self._stt_manager.available
                 and not self._stt_manager.is_realtime):
             # Manager in batch mode (its internal fallback): safe to share.
             result = await self._stt_manager.transcribe(audio_data)
-        elif self._stt_batch_client and self._stt_batch_client.available:
+        elif self._stt_batch_client:
+            # transcribe() re-probes an unavailable client itself
+            # (rate-limited), so a Speaches that was down at boot recovers.
             result = await self._stt_batch_client.transcribe(audio_data)
         else:
             logger.error("No STT client available")
@@ -1088,7 +1282,6 @@ class LowLatencyAudioPipeline:
         state.metrics.stt_end = time.time()
 
         stt_latency = (state.metrics.stt_end - state.metrics.speech_end) * 1000
-        mode_str = "realtime" if state.realtime is not None else "batch"
         logger.info(f"STT ({mode_str}): {stt_latency:.0f}ms for {duration_ms:.0f}ms audio")
         
         return result

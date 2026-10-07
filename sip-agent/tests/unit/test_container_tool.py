@@ -135,8 +135,8 @@ async def test_restart_with_confirm_succeeds(monkeypatch, config_factory):
     tool = make_tool(monkeypatch, config_factory)
     calls = []
 
-    async def fake_request(socket_path, method, path, params=None):
-        calls.append((method, path, params))
+    async def fake_request(socket_path, method, path, params=None, timeout=None):
+        calls.append((method, path, params, timeout))
         return 204, None
 
     monkeypatch.setattr(container_tool, "_docker_request", fake_request)
@@ -145,7 +145,12 @@ async def test_restart_with_confirm_succeeds(monkeypatch, config_factory):
     assert result.status == ToolStatus.SUCCESS
     assert result.message == "Restarting n8n now."
     assert result.data["confirmed"] is True
-    assert calls == [("POST", "/containers/n8n/restart", {"t": 10})]
+    assert len(calls) == 1
+    method, path, params, timeout = calls[0]
+    assert (method, path, params) == ("POST", "/containers/n8n/restart", {"t": 10})
+    # Docker answers only after stop (up to t=10s) + start: the client must
+    # outwait that, or a successful restart is reported as a failure.
+    assert timeout is not None and timeout >= params["t"] + 30
 
 
 # --- failure modes -----------------------------------------------------------

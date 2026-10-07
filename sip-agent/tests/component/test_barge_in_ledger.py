@@ -118,9 +118,15 @@ async def test_barge_in_records_only_heard_prefix(assistant, monkeypatch):
     assert len(assistant_turns) == 1
     content = assistant_turns[0]["content"]
 
-    # A strict, non-empty prefix of the generated response + the marker.
-    assert content.endswith(MARKER)
-    heard = content[:-len(MARKER)]
+    # History: a strict, non-empty prefix of the generated response, with NO
+    # annotation (the model copies anything it sees there). The transcript
+    # carries the marker for readers.
+    assert MARKER not in content
+    record = a.transcripts.get(session.transcript_id)
+    transcript_assistant = [t["content"] for t in record["turns"]
+                            if t["role"] == "assistant"]
+    assert transcript_assistant == [content + MARKER]
+    heard = content
     assert heard
     assert RESPONSE.startswith(heard)
     assert heard != RESPONSE
@@ -129,10 +135,10 @@ async def test_barge_in_records_only_heard_prefix(assistant, monkeypatch):
         "The weather right now is sunny and mild outside. "
         "Later this afternoon clouds will move in from the west.")
 
-    # Transcript store shows the same truncated text.
+    # Transcript store shows the same truncated text, annotated for readers.
     record = a.transcripts.get(session.transcript_id)
     transcript_assistant = [t for t in record["turns"] if t["role"] == "assistant"]
-    assert [t["content"] for t in transcript_assistant] == [content]
+    assert [t["content"] for t in transcript_assistant] == [content + MARKER]
 
     await a._teardown_session()
 
@@ -219,11 +225,11 @@ async def test_barge_in_during_playback_tail_records_only_heard_prefix(
     content = assistant_turns[0]["content"]
     assert content == (
         "The weather right now is sunny and mild outside. "
-        "Later this afternoon clouds will move in from the west." + MARKER)
+        "Later this afternoon clouds will move in from the west.")
 
     record = a.transcripts.get(session.transcript_id)
     transcript_assistant = [t for t in record["turns"] if t["role"] == "assistant"]
-    assert [t["content"] for t in transcript_assistant] == [content]
+    assert [t["content"] for t in transcript_assistant] == [content + MARKER]
 
     await a._teardown_session()
 
@@ -370,7 +376,7 @@ async def test_farewell_barge_in_records_interrupted_goodbye(assistant, monkeypa
     assistant_turns = [m for m in session.conversation_history
                        if m["role"] == "assistant"]
     assert assistant_turns == [
-        {"role": "assistant", "content": GOODBYE + MARKER}]
+        {"role": "assistant", "content": GOODBYE}]
     record = a.transcripts.get(session.transcript_id)
     transcript_assistant = [t for t in record["turns"] if t["role"] == "assistant"]
     assert [t["content"] for t in transcript_assistant] == [GOODBYE + MARKER]

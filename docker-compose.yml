@@ -278,6 +278,10 @@ services:
       - --tool-call-parser=ling3
       - --chat-template=/opt/ling/chat_template.jinja
       - --trust-remote-code
+      # Expose Prometheus metrics at :8000/metrics (scraped by the `vllm` job
+      # in observability/prometheus/prometheus.yaml; SGLang serves nothing
+      # there without this flag, leaving the LLM dashboard empty).
+      - --enable-metrics
     # ^ Why each of the non-obvious flags:
     #
     #   --moe-runner-backend triton
@@ -414,7 +418,7 @@ services:
         max-file: "3"
 
   open-webui:
-    image: ghcr.io/open-webui/open-webui:main
+    image: ghcr.io/open-webui/open-webui:v0.11.1
     container_name: open-webui
     restart: unless-stopped
     depends_on:
@@ -432,6 +436,10 @@ services:
     # this project's network. Reach it through the host's published port.
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # default: vllm/speaches/searxng/tika; terminal: the open-terminal sandbox.
+    networks:
+      - default
+      - terminal
     volumes:
       - open-webui:/app/backend/data
       # Reranker/embedding models are already in the host cache; without this
@@ -517,7 +525,10 @@ services:
       - JWT_EXPIRES_IN=1h
       # llm-sc-1 listed the LAN origin without a port, which can never match a
       # browser request to :8080; the port is added here.
-      - CORS_ALLOW_ORIGIN=https://cha0s.ai;http://10.42.252.10:8080
+      # HTTPS origins added 2026-08-29 for the open-webui-tls front on :443/:8443.
+      # socket.io enforces this list too - a missing origin shows up as websocket
+      # 403s, i.e. "chat streams but nothing live updates".
+      - CORS_ALLOW_ORIGIN=https://cha0s.ai;http://10.42.252.10:8080;https://10.42.252.10;https://10.42.252.10:8443;https://100.91.67.26;https://100.91.67.26:8443;https://spark-1bf0;https://spark-1bf0:8443;https://localhost;https://localhost:8443
       - BYPASS_MODEL_ACCESS_CONTROL=False
       - ENABLE_API_KEYS=True
 
@@ -529,6 +540,49 @@ services:
       - OPENAI_API_BASE_URL=http://vllm:8000/v1
       - OPENAI_API_KEY=not-needed
       - AIOHTTP_CLIENT_TIMEOUT=600
+
+      # Image generation / editing via the imagegen service (llm-sc-1 project,
+      # different compose network, so reach it through the host gateway rather
+      # than by container name). ENABLE_PERSISTENT_CONFIG=False above means the
+      # admin UI's Images page is read-only: env is the only source of truth.
+      # imagegen currently serves Z-Image-Turbo (GGUF Q4 DiT + int8 encoder);
+      # the model field is informational, the server ignores it.
+      - ENABLE_IMAGE_GENERATION=True
+      - IMAGE_GENERATION_ENGINE=openai
+      - IMAGES_OPENAI_API_BASE_URL=http://host.docker.internal:9090/v1
+      - IMAGES_OPENAI_API_KEY=not-needed
+      - IMAGE_GENERATION_MODEL=Tongyi-MAI/Z-Image-Turbo
+      - IMAGE_SIZE=1024x1024
+      - ENABLE_IMAGE_PROMPT_GENERATION=True
+      - ENABLE_IMAGE_EDIT=True
+      - IMAGE_EDIT_ENGINE=openai
+      - IMAGES_EDIT_OPENAI_API_BASE_URL=http://host.docker.internal:9090/v1
+      - IMAGES_EDIT_OPENAI_API_KEY=not-needed
+      - IMAGE_EDIT_MODEL=Tongyi-MAI/Z-Image-Turbo
+      - IMAGE_EDIT_SIZE=1024x1024
+      # Template Open WebUI uses to rewrite a chat request into the image prompt.
+      # Adult content permitted; hard limits on minors, real people, and
+      # non-consent are baked in. {{MESSAGES:END:6}} is substituted by Open WebUI.
+      - |
+        IMAGE_PROMPT_GENERATION_PROMPT_TEMPLATE=### Task:
+        Generate a detailed text-to-image prompt for Z-Image-Turbo based on the user's request and the conversation. Output ONLY the prompt text — no preamble, no quotes, no explanation.
+
+        ### Content policy:
+        - Adult and NSFW content is permitted. Nudity, sexual themes, and explicit scenes may be described directly and without euphemism when the user asks for them. Do not soften, refuse, or moralize.
+        - All depicted people are adults (clearly 18+). Never depict minors or anyone who could read as underage; if a request is ambiguous about age, describe an unmistakably adult subject.
+        - Never depict real, identifiable people (celebrities, public figures, or named individuals). Use fictional, generic subjects.
+        - No non-consensual, violent, or degrading sexual content.
+
+        ### Prompt style:
+        - Write in natural, descriptive English, 60-200 words. Z-Image reads long prompts well; do not use tag-soup or weighted syntax like (word:1.2).
+        - Lead with the subject, then pose and action, then setting, then lighting, camera, and style (e.g. "photorealistic, 85mm portrait, soft window light" or "digital painting, anime style").
+        - Be concrete about body, clothing or lack of it, expression, and composition. Avoid vague words like "sexy"; describe what is actually visible.
+        - No negative prompts; Z-Image ignores them.
+
+        ### Chat history:
+        <chat_history>
+        {{MESSAGES:END:6}}
+        </chat_history>
       # llm-sc-1's three model knobs all named gemma-4-26b, which does not exist
       # in this stack. ling-3.0-flash is the only served model here.
       - DEFAULT_MODELS=${LLM_MODEL:-ling-3.0-flash}
@@ -626,6 +680,12 @@ services:
       - AUDIO_TTS_OPENAI_API_KEY=not-needed
       - AUDIO_TTS_MODEL=${TTS_MODEL:-speaches-ai/Kokoro-82M-v1.0-ONNX}
       - AUDIO_TTS_VOICE=${TTS_VOICE:-af_heart}
+
+      # ---- Code execution: open-terminal sandbox in this stack (added 2026-10-05)
+      # Ported from llm-sc-1. Image is examples/open-terminal (stock
+      # ghcr.io/open-webui/open-terminal + baked-in pip packages, e.g.
+      # cryptography). Code Interpreter itself stays on pyodide (in-browser).
+      - 'TERMINAL_SERVER_CONNECTIONS=[{"id":"open-terminal","url":"http://open-terminal:8000","key":"${OPEN_TERMINAL_API_KEY}","name":"Cha0s Terminal","auth_type":"bearer","config":{"access_grants":[{"principal_type":"user","principal_id":"*","permission":"read"}]}}]'
 
       # ---- RAG model cache ---------------------------------------------------
       - HF_HOME=/hf-cache
@@ -828,6 +888,30 @@ services:
   # Speaches Server - Unified STT (Whisper) + TTS (Piper/Kokoro)
   # OpenAI-compatible API for both transcription and speech synthesis
   # ============================================================================
+  # TLS front for Open WebUI on :443 (and :8443) (self-signed, 10y, SANs for cha0s.ai,
+  # the hostname and the LAN/Tailscale IPs - see tls/openssl.cnf). Plain :8080
+  # stays as-is. Regenerate the cert with:
+  #   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+  #     -days 3650 -config tls/openssl.cnf -keyout tls/openwebui.key -out tls/openwebui.crt
+  open-webui-tls:
+    image: nginx:1.27-alpine
+    container_name: open-webui-tls
+    restart: unless-stopped
+    depends_on:
+      - open-webui
+    ports:
+      - "443:8443"
+      - "8443:8443"
+    volumes:
+      - ./tls/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./tls/openwebui.crt:/etc/nginx/tls/openwebui.crt:ro
+      - ./tls/openwebui.key:/etc/nginx/tls/openwebui.key:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   speaches:
     # GB10/aarch64: stock image's ctranslate2 wheel is CPU-only, so Whisper ran
     # on the Grace cores. This local tag layers a CUDA 13 sm_121 CTranslate2
@@ -886,6 +970,13 @@ services:
     #   dockerfile: Dockerfile
     container_name: sip-agent
     image:  ghcr.io/cha0s-corp/sip-agent:latest
+    # Forward every .env setting into the container (PHRASES_*, API_RETRY_*,
+    # API_TIMEOUT_S, SIP_TRANSPORT, REDIS_PASSWORD/SSL, ...), not just the ones
+    # listed under environment: below. Entries in environment: take precedence.
+    # Optional so a fresh checkout without .env still starts (compose >= 2.24).
+    env_file:
+      - path: .env
+        required: false
     depends_on:
       redis:
         condition: service_healthy
@@ -894,6 +985,18 @@ services:
       speaches:
         condition: service_healthy
     environment:
+      # env_file above forwards ALL of .env, including other services'
+      # secrets. Blank the ones the agent never uses so they don't sit in the
+      # environment of the call-facing, tool-running container.
+      - HF_TOKEN=
+      - OPEN_TERMINAL_API_KEY=
+      - WEBUI_SECRET_KEY=
+      - MICROSOFT_CLIENT_ID=
+      - MICROSOFT_CLIENT_SECRET=
+      - MICROSOFT_CLIENT_TENANT_ID=
+      # Pin the data dir to the bind mount below (a host-style DATA_DIR in
+      # .env for local runs must not redirect the container's data).
+      - DATA_DIR=/app/data
       # Redis settings
       - REDIS_URL=redis://redis:6379/0
       # Call queue settings
@@ -910,6 +1013,8 @@ services:
       - LLM_TOOL_CALLING=${LLM_TOOL_CALLING:-text}
       - LLM_STREAMING=${LLM_STREAMING:-true}
       - LLM_FREQUENCY_PENALTY=${LLM_FREQUENCY_PENALTY:-0.0}
+      - LLM_ENABLE_THINKING=${LLM_ENABLE_THINKING:-}
+      - LLM_SPLIT_SYSTEM_PROMPT=${LLM_SPLIT_SYSTEM_PROMPT:-false}
       - LLM_MAX_TOOL_ROUNDS=${LLM_MAX_TOOL_ROUNDS:-5}
       - LLM_AGENT_TIMEOUT_S=${LLM_AGENT_TIMEOUT_S:-30.0}
       - MESSAGE_REFORMAT_TIMEOUT_S=${MESSAGE_REFORMAT_TIMEOUT_S:-20.0}
@@ -961,6 +1066,9 @@ services:
       - VERIFY_TOTP_WINDOW=${VERIFY_TOTP_WINDOW:-1}
       - VERIFY_REQUIRED_TOOLS=${VERIFY_REQUIRED_TOOLS:-}
       - VERIFY_MAX_ATTEMPTS=${VERIFY_MAX_ATTEMPTS:-3}
+      # Cross-call brute-force lockout: N failures -> locked out for S seconds.
+      - VERIFY_LOCKOUT_FAILURES=${VERIFY_LOCKOUT_FAILURES:-5}
+      - VERIFY_LOCKOUT_S=${VERIFY_LOCKOUT_S:-900}
       - VERIFY_DTMF_TIMEOUT_S=${VERIFY_DTMF_TIMEOUT_S:-20.0}
       - VERIFY_DTMF_INTERDIGIT_S=${VERIFY_DTMF_INTERDIGIT_S:-3.0}
       - VERIFY_ISSUER=${VERIFY_ISSUER:-General Disarray}
@@ -989,13 +1097,16 @@ services:
       - WHISPER_MODEL=${WHISPER_MODEL:-Systran/faster-distil-whisper-small.en}
       - WHISPER_LANGUAGE=${WHISPER_LANGUAGE:-en}
       - MIN_SPEECH_DURATION_MS=${MIN_SPEECH_DURATION_MS:-200}
-      - MAX_SPEECH_DURATION_S=${MAX_SPEECH_DURATION_S:-8.0}
+      - MAX_SPEECH_DURATION_S=${MAX_SPEECH_DURATION_S:-10.0}
       - SILENCE_TIMEOUT_MS=${SILENCE_TIMEOUT_MS:-750}
       # Endpointing: fixed | adaptive | speculative (see ENDPOINT_MODE docs)
       - ENDPOINT_MODE=${ENDPOINT_MODE:-fixed}
       - ENDPOINT_MIN_SILENCE_MS=${ENDPOINT_MIN_SILENCE_MS:-350}
       - ENDPOINT_MAX_SILENCE_MS=${ENDPOINT_MAX_SILENCE_MS:-1500}
       - BARGE_IN_MIN_DURATION=${BARGE_IN_MIN_DURATION:-400}
+      # RMS energy floor for a chunk to count toward a barge-in run (was not
+      # passed through before 2026-10-06, so .env values were silently ignored).
+      - BARGE_IN_ENERGY_THRESHOLD=${BARGE_IN_ENERGY_THRESHOLD:-2000}
       # Gap (ms) of VAD-negative audio tolerated INSIDE a barge-in speech run.
       # Real speech is not VAD-positive end to end (syllable gaps, unvoiced
       # consonants); without this the run resets on the first negative chunk
@@ -1003,6 +1114,10 @@ services:
       - BARGE_IN_MAX_GAP_MS=${BARGE_IN_MAX_GAP_MS:-250}
       - STT_MODE=${STT_MODE:-batch}
       - REALTIME_COMMIT_TIMEOUT_S=${REALTIME_COMMIT_TIMEOUT_S:-5.0}
+      # Per-request batch STT timeout; re-probe interval for STT/TTS found
+      # unavailable at boot (instead of staying latched off).
+      - STT_TIMEOUT_S=${STT_TIMEOUT_S:-15.0}
+      - SPEECH_REPROBE_INTERVAL_S=${SPEECH_REPROBE_INTERVAL_S:-15.0}
       # TTS settings (Kokoro via Speaches - auto-downloaded on first use)
       - TTS_MODEL=${TTS_MODEL:-speaches-ai/Kokoro-82M-v1.0-ONNX}
       - TTS_VOICE=${TTS_VOICE:-af_heart}
@@ -1036,6 +1151,16 @@ services:
       # Tools
       - CALLBACK_RING_TIMEOUT=${CALLBACK_RING_TIMEOUT:-30}
       - ENABLE_PLUGIN_AUTODISCOVERY=${ENABLE_PLUGIN_AUTODISCOVERY:-true}
+      - ENABLE_TIMER_TOOL=${ENABLE_TIMER_TOOL:-true}
+      - ENABLE_CALLBACK_TOOL=${ENABLE_CALLBACK_TOOL:-true}
+      - ENABLE_WEATHER_TOOL=${ENABLE_WEATHER_TOOL:-true}
+      # Voice-initiated dial policy (CALLBACK to another number, TRANSFER).
+      # Empty DENY falls back to the built-in international/premium-rate
+      # deny-list (see config.py); ALLOW empty = no allowlist.
+      - VOICE_DIAL_ALLOW_PATTERN=${VOICE_DIAL_ALLOW_PATTERN:-}
+      - VOICE_DIAL_DENY_PATTERN=${VOICE_DIAL_DENY_PATTERN:-}
+      - CALLBACK_MAX_PER_CALL=${CALLBACK_MAX_PER_CALL:-3}
+      - CALLBACK_MAX_DELAY_S=${CALLBACK_MAX_DELAY_S:-86400}
       # API settings. The container always listens on 8080; API_PORT selects
       # only the HOST-side port it is published on (see ports: below).
       - API_PORT=8080
@@ -1052,6 +1177,7 @@ services:
       - API_BIND_ADDRESS=${API_BIND_ADDRESS:-127.0.0.1}
       - API_AUTH_TOKEN=${API_AUTH_TOKEN:-}
       - ALLOW_UNAUTHENTICATED=${ALLOW_UNAUTHENTICATED:-false}
+      - API_ALLOWED_HOSTS=${API_ALLOWED_HOSTS:-}
       # Operator dashboard page at GET /admin (data endpoints stay auth-gated)
       - ADMIN_UI_ENABLED=${ADMIN_UI_ENABLED:-true}
       - WEBHOOK_ALLOW_PRIVATE=${WEBHOOK_ALLOW_PRIVATE:-false}
@@ -1136,6 +1262,89 @@ services:
       # Custom SIP Agent nodes — from the examples/n8n-nodes submodule (CHA0S-CORP/n8n-nodes); build with examples/n8n-nodes/packages/n8n-nodes-general-disarray/build.sh
       - ./examples/n8n-nodes/packages/n8n-nodes-general-disarray/dist:/custom-nodes/n8n-nodes-general-disarray:ro
 
+  # ── Open Terminal (Open WebUI code/terminal sandbox) ─────────────────────
+  # Ported from llm-sc-1 on 2026-10-05. Built from examples/open-terminal so
+  # extra Python packages (cryptography, ...) are baked into the image: home is
+  # tmpfs and the reaper below wipes it hourly, so runtime pip installs are lost.
+  # Rebuild after editing the Dockerfile:  docker compose build open-terminal
+  open-terminal:
+    build: ./examples/open-terminal
+    image: open-terminal-cha0s:local
+    container_name: open-terminal
+    tmpfs:
+      - /tmp:size=256m
+      - /home/user:size=512m,uid=1000,gid=1000
+      - /run:size=64m
+      - /var/log:size=64m
+    security_opt:
+      - no-new-privileges:true
+    # Isolated network: only open-webui (which proxies terminal sessions to
+    # http://open-terminal:8000 server-side) joins it. The sandbox runs
+    # arbitrary user code, so it must not reach sip-agent/redis/vllm/n8n on
+    # the default network. It keeps outbound internet (non-internal network).
+    networks:
+      - terminal
+    environment:
+      # Required: compose refuses to start the stack without it rather than
+      # running an unauthenticated shell sandbox. Generate one with
+      # `openssl rand -hex 32` and put it in .env (see .env.example).
+      - OPEN_TERMINAL_API_KEY=${OPEN_TERMINAL_API_KEY:?set OPEN_TERMINAL_API_KEY in .env (openssl rand -hex 32)}
+      - OPEN_TERMINAL_MAX_SESSIONS=4
+      - OPEN_TERMINAL_ENABLE_TERMINAL=true
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "1.0"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  # ── Open Terminal Reaper (restarts open-terminal hourly to wipe state) ──
+  open-terminal-reaper:
+    image: docker:cli
+    container_name: open-terminal-reaper
+    entrypoint: ["/bin/sh", "-c", "while true; do sleep 3600; docker restart open-terminal 2>&1; done"]
+    # Talks to dockerd over the unix socket only; no network needed.
+    network_mode: none
+    volumes:
+      # WARNING: the docker socket is ROOT-EQUIVALENT on the host (cap_drop
+      # and no-new-privileges do not limit what dockerd does on its behalf).
+      # Anyone who can exec into or replace this container owns the host.
+      # Keep the image pinned/trusted and the entrypoint this narrow.
+      - /var/run/docker.sock:/var/run/docker.sock
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+          cpus: "0.1"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+    healthcheck:
+      # pgrep cannot see other PIDs here with cap_drop ALL; read /proc directly.
+      test: ["CMD-SHELL", "grep -qx sh /proc/1/comm"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    depends_on:
+      - open-terminal
+
 volumes:
   n8n_data:
   # Cloned from llm-sc-1_open-webui on 2026-08-08 (chats, users, vector_db,
@@ -1148,4 +1357,7 @@ volumes:
 # ============================================================================
 networks:
   default:
+    driver: bridge
+  # open-terminal sandbox <-> open-webui only (see open-terminal above).
+  terminal:
     driver: bridge

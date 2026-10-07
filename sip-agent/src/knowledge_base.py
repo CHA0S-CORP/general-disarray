@@ -70,6 +70,10 @@ class KnowledgeBase:
         self._store = None
         self._index_dir: Path = config.data_dir / "knowledge_index"
         self.ready = False
+        # Memoized `available` (an rglob of the knowledge dir + a find_spec):
+        # the KNOWLEDGE tool checks it on every call, on the event loop.
+        # Documents only change across restarts (see start()).
+        self._available: Optional[bool] = None
 
     # ---- status ------------------------------------------------------------
 
@@ -83,7 +87,15 @@ class KnowledgeBase:
 
     @property
     def available(self) -> bool:
-        """Feature can work: enabled, deps importable, documents present."""
+        """Feature can work: enabled, deps importable, documents present.
+
+        Computed once and cached; start() re-evaluates it.
+        """
+        if self._available is None:
+            self._available = self._compute_available()
+        return self._available
+
+    def _compute_available(self) -> bool:
         if not self.config.knowledge_enabled or not KNOWLEDGE_DEPS_AVAILABLE:
             return False
         if self._embeddings is None:
@@ -106,6 +118,12 @@ class KnowledgeBase:
 
     async def start(self) -> None:
         """Build or load the index off the event loop. Never raises."""
+        # Re-evaluate (documents may have changed), off the event loop.
+        try:
+            self._available = await asyncio.to_thread(self._compute_available)
+        except Exception as e:
+            logger.error(f"Knowledge base check failed: {e}")
+            self._available = False
         if not self.available:
             if self.config.knowledge_enabled and not KNOWLEDGE_DEPS_AVAILABLE:
                 logger.info("Knowledge base disabled: langchain/fastembed not installed")

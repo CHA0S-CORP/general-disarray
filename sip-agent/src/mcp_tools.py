@@ -246,26 +246,40 @@ class _MCPConnection:
         self._ready = asyncio.Event()
         self._stop_event = asyncio.Event()
         self._reapers: set = set()
+        # Serializes start(): two concurrent reconnects (e.g. two calls
+        # finding the session dead at once) must not tear down each other's
+        # freshly-started connection.
+        self._start_lock = asyncio.Lock()
 
     async def start(self) -> bool:
-        """Connect + initialize + list tools. Returns True on success."""
-        await self.stop()
-        self._ready = asyncio.Event()
-        self._stop_event = asyncio.Event()
-        self.session = None
-        self.error = None
-        self._task = asyncio.create_task(
-            self._run(self._stop_event), name=f"mcp-conn-{self.entry.name}")
-        try:
-            await asyncio.wait_for(self._ready.wait(), self.CONNECT_TIMEOUT_S)
-        except asyncio.TimeoutError:
-            self.error = "connection timed out"
+        """Connect + initialize + list tools. Returns True on success.
+
+        Serialized; a caller that queued behind a reconnect which already
+        succeeded reuses that live session instead of restarting it.
+        """
+        async with self._start_lock:
+            if (self.session is not None and self._task is not None
+                    and not self._task.done()):
+                return True
             await self.stop()
-            return False
-        if self.session is None:
-            await self.stop()
-            return False
-        return True
+            ready = asyncio.Event()
+            stop_event = asyncio.Event()
+            self._ready = ready
+            self._stop_event = stop_event
+            self.session = None
+            self.error = None
+            self._task = asyncio.create_task(
+                self._run(stop_event, ready), name=f"mcp-conn-{self.entry.name}")
+            try:
+                await asyncio.wait_for(ready.wait(), self.CONNECT_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                self.error = "connection timed out"
+                await self.stop()
+                return False
+            if self.session is None:
+                await self.stop()
+                return False
+            return True
 
     async def stop(self):
         """Signal the connection task to unwind its contexts and wait for it."""
@@ -318,11 +332,12 @@ class _MCPConnection:
         self._reapers.add(reaper)
         reaper.add_done_callback(self._reapers.discard)
 
-    async def _run(self, stop_event: asyncio.Event):
+    async def _run(self, stop_event: asyncio.Event, ready: asyncio.Event):
         """Owns the transport + session lifecycles start to finish.
 
-        ``stop_event`` is passed in (rather than read off ``self``) so a task
-        abandoned by ``abandon()`` still unwinds on its own event even after
+        ``stop_event`` and ``ready`` are passed in (rather than read off
+        ``self``) so a task abandoned by ``abandon()`` still unwinds on its
+        own event — and signals its own start() — even after a later
         ``start()`` has installed fresh events for a new task.
         """
         try:
@@ -333,23 +348,29 @@ class _MCPConnection:
                     env=self.entry.env or None,
                 )
                 async with stdio_client(params) as (read, write):
-                    await self._session_loop(read, write, stop_event)
+                    await self._session_loop(read, write, stop_event, ready)
             else:
                 async with streamablehttp_client(self.entry.url) as (read, write, _):
-                    await self._session_loop(read, write, stop_event)
+                    await self._session_loop(read, write, stop_event, ready)
         except Exception as e:
-            self.error = str(e)
+            if not stop_event.is_set():
+                self.error = str(e)
             logger.warning(f"MCP server '{self.entry.name}' connection ended: {e}")
         finally:
-            self._ready.set()
+            ready.set()
 
-    async def _session_loop(self, read, write, stop_event: asyncio.Event):
+    async def _session_loop(self, read, write, stop_event: asyncio.Event,
+                            ready: asyncio.Event):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.list_tools()
+            if stop_event.is_set():
+                # Abandoned/stopped while connecting: never install this
+                # session over whatever a later start() set up.
+                return
             self.tools = list(result.tools)
             self.session = session
-            self._ready.set()
+            ready.set()
             try:
                 await stop_event.wait()
             finally:

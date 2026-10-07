@@ -9,22 +9,30 @@ on:
       - 'v*'
     paths:
       - 'sip-agent/**'
+      - '.github/workflows/docker-build.yml'
+      - '.github/workflows/tests.yml'
   pull_request:
     branches:
       - main
     paths:
       - 'sip-agent/**'
+      - '.github/workflows/docker-build.yml'
+      - '.github/workflows/tests.yml'
   release:
     types: [published, created, edited, prereleased]
 env:
-  # Docker Hub
-  DOCKERHUB_REPO: chaoscorp/sip-agent
-  # GitHub Container Registry
+  # GitHub Container Registry (the only registry pushed to)
   GHCR_REPO: ghcr.io/${{ github.repository_owner }}/sip-agent
 
 jobs:
+  # Same unit + component tiers and ruff gate as tests.yml (called, not
+  # copied). Nothing is built or published unless they pass.
+  tests:
+    uses: ./.github/workflows/tests.yml
+
   build:
     name: Build and Push sip-agent Docker Image
+    needs: tests
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -94,10 +102,28 @@ jobs:
           cache-from: |
             type=gha
             type=registry,ref=${{ env.GHCR_REPO }}:buildcache
-          cache-to: type=gha,mode=max
-            # Build args for cache optimization
-          build-args: |
-              BUILDKIT_INLINE_CACHE=1
+          # Write both caches that cache-from reads (the registry buildcache
+          # was read but never written before).
+          cache-to: |
+            type=gha,mode=max
+            type=registry,ref=${{ env.GHCR_REPO }}:buildcache,mode=max
+
+      # PRs: prove the image still builds, without pushing. amd64 only — the
+      # arm64 leg runs PJSIP's build under QEMU and would take far longer; the
+      # multi-arch build still runs on main/tags before anything is published.
+      - name: Build only (pull request - no push)
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@v5
+        with:
+          context: ./sip-agent/
+          file: ./sip-agent/Dockerfile
+          platforms: linux/amd64
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: |
+            type=gha
+            type=registry,ref=${{ env.GHCR_REPO }}:buildcache
 
       - name: Generate build summary
         run: |
@@ -114,9 +140,8 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "### Registries" >> $GITHUB_STEP_SUMMARY
-            echo "- Docker Hub: \`${{ env.DOCKERHUB_REPO }}\`" >> $GITHUB_STEP_SUMMARY
             echo "- GHCR: \`${{ env.GHCR_REPO }}\`" >> $GITHUB_STEP_SUMMARY
           else
             echo "### Note" >> $GITHUB_STEP_SUMMARY
-            echo "PR build - images not pushed to registries" >> $GITHUB_STEP_SUMMARY
+            echo "PR build (linux/amd64 only) - images not pushed to registries" >> $GITHUB_STEP_SUMMARY
           fi

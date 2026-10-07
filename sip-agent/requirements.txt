@@ -15,24 +15,18 @@ soundfile>=0.12.0
 
 # WebSocket for realtime streaming (optional but recommended)
 # Enables low-latency STT via Speaches /v1/realtime WebSocket endpoint
-websockets>=12.0
+# <16: realtime_client imports the legacy websockets.client API (deprecated
+# in 14, slated for removal); tested on 15.x.
+websockets>=12.0,<16
 
 # HTTP clients for API communication
 httpx>=0.25.0
-aiohttp>=3.9.0
-aiofiles>=23.0.0
 
 # OpenAI-compatible client for LLM
 openai>=1.12.0
 
-# Async utilities
-aiocache>=0.12.0
-
 # Redis for call queue
 redis>=5.0.0
-
-# Scheduling (for timers/callbacks)
-APScheduler>=3.10.0
 
 # Timezone support (for plugins)
 pytz>=2023.3
@@ -40,12 +34,8 @@ pytz>=2023.3
 # TOTP (rolling one-time codes) for optional caller identity verification
 pyotp>=2.9.0
 
-# Configuration
-python-dotenv>=1.0.0
+# Request/response models (FastAPI)
 pydantic>=2.0.0
-
-# Logging
-structlog>=23.0.0
 
 # HTTP server for health checks (optional)
 fastapi>=0.109.0

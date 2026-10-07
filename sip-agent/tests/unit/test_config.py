@@ -176,3 +176,84 @@ def test_summary_defaults(config, config_factory):
 
 def test_caller_memory_dir_created(config):
     assert (config.data_dir / "caller_memory").is_dir()
+
+
+def test_thinking_switch_parsing(config, config_factory):
+    """Unset = None (send nothing); true/false parse case-insensitively."""
+    assert config.llm_enable_thinking is None
+    assert config_factory(llm_enable_thinking="false").llm_enable_thinking is False
+    assert config_factory(llm_enable_thinking="TRUE").llm_enable_thinking is True
+    assert config_factory(llm_enable_thinking="0").llm_enable_thinking is False
+    assert config_factory(llm_enable_thinking="").llm_enable_thinking is None
+
+
+def test_split_system_prompt_default_off(config, config_factory):
+    """Off by default: Qwen3.5's template rejects a later system message and
+    gpt-oss drops it. Opt-in only."""
+    assert config.llm_split_system_prompt is False
+    assert config_factory(llm_split_system_prompt="true").llm_split_system_prompt is True
+    assert config_factory(llm_split_system_prompt="1").llm_split_system_prompt is True
+
+
+# --- boolean env parsing (_env_bool) ----------------------------------------
+
+@pytest.mark.parametrize("raw", ["1", "true", "TRUE", "yes", "On", " on "])
+def test_env_bool_truthy_values(config_factory, raw):
+    assert config_factory(knowledge_enabled=raw).knowledge_enabled is True
+    assert config_factory(knowledge_auto_inject=raw).knowledge_auto_inject is True
+
+
+@pytest.mark.parametrize("raw", ["0", "false", "FALSE", "no", "Off"])
+def test_env_bool_falsy_values(config_factory, raw):
+    assert config_factory(knowledge_enabled=raw).knowledge_enabled is False
+    assert config_factory(knowledge_auto_inject=raw).knowledge_auto_inject is False
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "maybe", "enabled"])
+def test_env_bool_blank_or_garbage_keeps_default(config_factory, raw):
+    # default-on stays on, default-off stays off
+    assert config_factory(knowledge_enabled=raw).knowledge_enabled is True
+    assert config_factory(knowledge_auto_inject=raw).knowledge_auto_inject is False
+
+
+def test_env_bool_helper_direct(monkeypatch):
+    from config import _env_bool
+    monkeypatch.delenv("GD_TEST_FLAG", raising=False)
+    assert _env_bool("GD_TEST_FLAG", True) is True
+    assert _env_bool("GD_TEST_FLAG", False) is False
+    monkeypatch.setenv("GD_TEST_FLAG", "yes")
+    assert _env_bool("GD_TEST_FLAG", False) is True
+    monkeypatch.setenv("GD_TEST_FLAG", "0")
+    assert _env_bool("GD_TEST_FLAG", True) is False
+
+
+def test_no_bool_field_uses_lower_eq_true_parsing():
+    """Regression guard: `.lower() == "true"` silently treats 1/yes/on as False."""
+    import re
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[2] / "src" / "config.py").read_text()
+    assert not re.search(r'os\.getenv\([^)]*\)\.lower\(\)\s*==\s*"true"', src)
+
+
+def test_tool_enable_flags(config, config_factory):
+    assert config.enable_timer_tool is True
+    assert config.enable_callback_tool is True
+    assert config.enable_weather_tool is True
+    assert config_factory(enable_timer_tool="no").enable_timer_tool is False
+    assert config_factory(enable_weather_tool="0").enable_weather_tool is False
+
+
+def test_new_policy_defaults(config):
+    assert config.voice_dial_allow_pattern == ""
+    assert config.voice_dial_deny_pattern
+    assert config.callback_max_per_call == 3
+    assert config.callback_max_delay_s == 86400
+    assert config.stt_timeout_s == 15.0
+    assert config.speech_reprobe_interval_s == 15.0
+    assert config.verify_lockout_failures == 5
+    assert config.verify_lockout_s == 900
+
+
+def test_unused_tool_flags_removed(config):
+    assert not hasattr(config, "enable_search_tool")
+    assert not hasattr(config, "enable_calendar_tool")

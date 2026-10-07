@@ -1,0 +1,19 @@
+[req]
+distinguished_name = dn
+x509_extensions = ext
+prompt = no
+[dn]
+CN = cha0s.ai
+O = Cha0s AI
+[ext]
+subjectAltName = @alt
+basicConstraints = CA:FALSE
+keyUsage = digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+[alt]
+DNS.1 = cha0s.ai
+DNS.2 = spark-1bf0
+DNS.3 = localhost
+IP.1 = 10.42.252.10
+IP.2 = 100.91.67.26
+IP.3 = 127.0.0.1

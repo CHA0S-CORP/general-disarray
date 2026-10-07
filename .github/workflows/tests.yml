@@ -6,11 +6,20 @@ on:
     branches:
       - main
   pull_request:
+  # Reused by docker-build.yml so images are only built/published after the
+  # tests pass.
+  workflow_call:
 
 jobs:
   test:
-    name: Unit + component tests
+    name: Unit + component tests (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11: the documented target; 3.12: what the image actually runs
+        # (ubuntu:24.04's python3).
+        python-version: ["3.11", "3.12"]
     defaults:
       run:
         working-directory: sip-agent
@@ -19,7 +28,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: |
             sip-agent/requirements.txt

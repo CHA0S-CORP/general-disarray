@@ -11,19 +11,22 @@ import ipaddress
 import json
 import logging
 import re
+import os
 import socket
 import time
+import uuid
+from collections import OrderedDict
 from urllib.parse import urlparse
 import httpx
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any, TYPE_CHECKING
+from typing import Annotated, Optional, List, Dict, Any, TYPE_CHECKING
 from dataclasses import dataclass
 from enum import Enum
 
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 
 from admin_events import EventBus
@@ -48,6 +51,17 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # Request validation / security helpers
 # ============================================================================
+
+class _CallFailure(Exception):
+    """An expected outbound-call failure whose message is safe to expose
+    (webhook payload, GET /call/{id}). Any other exception is reported to
+    clients only as a generic error — details stay in the server log."""
+
+
+_GENERIC_CALL_ERROR = "Internal error during call"
+
+_CALL_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
 
 class _VerifyCallDone(Exception):
     """Internal signal inside run_verify_call: a terminal non-answer outcome
@@ -82,15 +96,48 @@ def make_auth_dependency(token: str):
     ):
         if not token:
             return
-        provided = x_api_key
-        if not provided and authorization:
-            scheme, _, value = authorization.partition(" ")
-            if scheme.lower() == "bearer":
-                provided = value.strip()
-        if not provided or provided != token:
+        provided = _presented_credential(authorization, x_api_key)
+        # Constant-time compare (bytes: compare_digest rejects non-ASCII str).
+        if not provided or not hmac.compare_digest(
+                provided.encode("utf-8"), token.encode("utf-8")):
             raise HTTPException(status_code=401, detail="Invalid or missing API credentials")
 
     return _verify
+
+
+def _presented_credential(authorization: Optional[str],
+                          x_api_key: Optional[str]) -> Optional[str]:
+    """The API credential a request presents (X-API-Key, else Bearer token)."""
+    if x_api_key:
+        return x_api_key
+    if authorization:
+        scheme, _, value = authorization.partition(" ")
+        if scheme.lower() == "bearer":
+            return value.strip() or None
+    return None
+
+
+_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def csrf_violation(request: Request) -> Optional[str]:
+    """Return a rejection reason if the request self-identifies as a
+    cross-site browser request, else None. See ``csrf_protect``."""
+    fetch_site = request.headers.get("sec-fetch-site")
+    if fetch_site:
+        # Modern browsers: trust the fetch metadata outright ("none" is a
+        # user-initiated navigation; anything not same-origin is rejected).
+        if fetch_site in ("same-origin", "none"):
+            return None
+        return "Cross-site browser requests are not allowed"
+    origin = request.headers.get("origin")
+    if origin:
+        # Older browsers without fetch metadata: compare Origin to Host.
+        host = request.headers.get("host", "")
+        origin_host = urlparse(origin).netloc
+        if not origin_host or not host or origin_host.lower() != host.lower():
+            return "Cross-origin browser requests are not allowed"
+    return None
 
 
 async def csrf_protect(request: Request):
@@ -103,23 +150,111 @@ async def csrf_protect(request: Request):
     requests, so we reject anything that self-identifies as cross-site.
     Non-browser clients (curl, n8n, scripts) send neither header and pass
     through untouched, as do same-origin requests from the admin page.
+
+    ``create_api`` also applies this check to EVERY mutating request via
+    middleware, so new endpoints can't forget it; the dependency form is kept
+    for explicit use.
     """
-    fetch_site = request.headers.get("sec-fetch-site")
-    if fetch_site:
-        # Modern browsers: trust the fetch metadata outright ("none" is a
-        # user-initiated navigation; anything not same-origin is rejected).
-        if fetch_site in ("same-origin", "none"):
+    reason = csrf_violation(request)
+    if reason:
+        raise HTTPException(status_code=403, detail=reason)
+
+
+# Host names that can't be pointed at the agent by a remote attacker's DNS
+# (DNS-rebinding defense in tokenless mode): loopback names plus the
+# special-use / private-use suffixes no public registrant can own.
+_DEFAULT_ALLOWED_HOSTS = frozenset({"localhost", "host.docker.internal"})
+_PRIVATE_HOST_SUFFIXES = (".localhost", ".local", ".internal", ".home.arpa")
+
+
+def _split_host_header(host_header: str) -> str:
+    """Hostname part of a Host header (port and IPv6 brackets stripped)."""
+    host = (host_header or "").strip().lower()
+    if host.startswith("["):
+        end = host.find("]")
+        return host[1:end] if end != -1 else host[1:]
+    if host.count(":") == 1:
+        host = host.split(":", 1)[0]
+    return host.rstrip(".")
+
+
+def host_header_allowed(host_header: Optional[str], extra_allowed=()) -> bool:
+    """Whether a Host header is acceptable for a TOKENLESS API.
+
+    A DNS-rebinding page always arrives with the attacker's own (public)
+    domain in Host, so we accept only names an outside attacker can't
+    control: IP literals, single-label names (docker service names such as
+    ``sip-agent``), ``localhost``/``host.docker.internal``, the reserved
+    private suffixes, and anything listed in API_ALLOWED_HOSTS (exact names,
+    ``*.suffix`` wildcards, or ``*`` to disable the check).
+    """
+    if not host_header:
+        return True  # HTTP/1.0 without Host — not a browser rebinding request
+    host = _split_host_header(host_header)
+    if not host:
+        return False
+    extra = [h.strip().lower().rstrip(".") for h in extra_allowed if h and h.strip()]
+    if "*" in extra:
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    if "." not in host or host in _DEFAULT_ALLOWED_HOSTS:
+        return True
+    if host.endswith(_PRIVATE_HOST_SUFFIXES):
+        return True
+    for allowed in extra:
+        if allowed.startswith("*."):
+            if host.endswith(allowed[1:]):
+                return True
+        elif host == allowed:
+            return True
+    return False
+
+
+class RequestGuardMiddleware:
+    """Pure-ASGI guard applied to every HTTP request (streaming-safe).
+
+    - ``check_host``: enforce ``host_header_allowed`` (tokenless mode only).
+    - CSRF: mutating methods that self-identify as cross-site browser
+      requests are refused with 403 (see ``csrf_violation``).
+    """
+
+    def __init__(self, app, check_host: bool = False, allowed_hosts=()):
+        self.app = app
+        self.check_host = check_host
+        self.allowed_hosts = list(allowed_hosts)
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
             return
-        raise HTTPException(status_code=403,
-                            detail="Cross-site browser requests are not allowed")
-    origin = request.headers.get("origin")
-    if origin:
-        # Older browsers without fetch metadata: compare Origin to Host.
-        host = request.headers.get("host", "")
-        origin_host = urlparse(origin).netloc
-        if not origin_host or not host or origin_host.lower() != host.lower():
-            raise HTTPException(status_code=403,
-                                detail="Cross-origin browser requests are not allowed")
+        request = Request(scope)
+        if self.check_host:
+            host = request.headers.get("host")
+            if not host_header_allowed(host, self.allowed_hosts):
+                log_event(logger, logging.WARNING, "Rejected request with untrusted Host header",
+                          event="api_host_rejected", host=(host or "")[:100])
+                await JSONResponse(status_code=400,
+                                   content={"detail": "Invalid host header"})(scope, receive, send)
+                return
+        if request.method.upper() in _MUTATING_METHODS:
+            reason = csrf_violation(request)
+            if reason:
+                await JSONResponse(status_code=403,
+                                   content={"detail": reason})(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+def _allowed_hosts_setting(config) -> List[str]:
+    """API_ALLOWED_HOSTS as a list."""
+    raw = getattr(config, "api_allowed_hosts", "") or ""
+    if isinstance(raw, (list, tuple, set)):
+        return [str(h) for h in raw]
+    return [h for h in str(raw).split(",") if h.strip()]
 
 
 class RateLimiter:
@@ -130,17 +265,22 @@ class RateLimiter:
     def __init__(self, rpm: int, burst: int):
         self.rate = rpm / 60.0
         self.burst = float(burst)
-        self._buckets: Dict[str, tuple] = {}  # key -> (tokens, last_refill_ts)
+        # key -> (tokens, last_refill_ts), least-recently-used first.
+        self._buckets: "OrderedDict[str, tuple]" = OrderedDict()
 
     def allow(self, key: str) -> bool:
         now = time.monotonic()
-        if len(self._buckets) > self.MAX_BUCKETS:
-            # Drop buckets that have fully refilled — they carry no state.
-            self._buckets = {
-                k: (tokens, last) for k, (tokens, last) in self._buckets.items()
+        if len(self._buckets) >= self.MAX_BUCKETS:
+            # Drop buckets that have fully refilled — they carry no state —
+            # then, if a flood of distinct keys is still over the cap, evict
+            # least-recently-used buckets so memory stays bounded.
+            self._buckets = OrderedDict(
+                (k, (tokens, last)) for k, (tokens, last) in self._buckets.items()
                 if tokens + (now - last) * self.rate < self.burst
-            }
-        tokens, last = self._buckets.get(key, (self.burst, now))
+            )
+            while len(self._buckets) >= self.MAX_BUCKETS:
+                self._buckets.popitem(last=False)
+        tokens, last = self._buckets.pop(key, (self.burst, now))
         tokens = min(self.burst, tokens + (now - last) * self.rate)
         allowed = tokens >= 1.0
         self._buckets[key] = (tokens - 1.0 if allowed else tokens, now)
@@ -150,8 +290,11 @@ class RateLimiter:
 def make_rate_limit_dependency(config):
     """FastAPI dependency enforcing RATE_LIMIT_RPM on mutating endpoints.
 
-    Clients are keyed by their API credential when presented, else by client
-    IP. A no-op when rate limiting is disabled (RATE_LIMIT_RPM=0).
+    With API_AUTH_TOKEN set, clients are keyed by their (normalized) API
+    credential — auth runs first, so only the valid token reaches here.
+    Without a token, clients are keyed by IP: keying on a raw header there
+    would let a caller mint a fresh bucket per request by varying it.
+    A no-op when rate limiting is disabled (RATE_LIMIT_RPM=0).
     """
     if config.rate_limit_rpm <= 0:
         async def _noop():
@@ -162,9 +305,14 @@ def make_rate_limit_dependency(config):
                           config.rate_limit_burst or config.rate_limit_rpm)
 
     async def _limit(request: Request):
-        key = (request.headers.get("X-API-Key")
-               or request.headers.get("Authorization")
-               or (request.client.host if request.client else "unknown"))
+        key = None
+        if config.api_auth_token:
+            credential = _presented_credential(
+                request.headers.get("Authorization"), request.headers.get("X-API-Key"))
+            if credential:
+                key = "cred:" + hashlib.sha256(credential.encode("utf-8")).hexdigest()
+        if key is None:
+            key = "ip:" + (request.client.host if request.client else "unknown")
         if not limiter.allow(key):
             raise HTTPException(status_code=429, detail="Rate limit exceeded; try again later")
 
@@ -207,11 +355,33 @@ def _resolve_allowed_ips(host: str) -> List[str]:
     for addr in addrs:
         # Strip any IPv6 scope id (e.g. 'fe80::1%eth0') before parsing.
         ip = ipaddress.ip_address(addr.split("%", 1)[0])
-        if (ip.is_loopback or ip.is_private or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+        if not _ip_is_public(ip):
             raise ValueError(f"host {host} resolves to disallowed address {addr}")
         validated.append(str(ip))
     return validated
+
+
+# Well-known NAT64 prefix (RFC 6052): Python reports it as global, but the
+# embedded IPv4 address is what a NAT64 gateway actually connects to.
+_NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
+
+
+def _ip_is_public(ip) -> bool:
+    """True only for globally routable unicast addresses.
+
+    ``is_global`` excludes CGNAT/Tailscale (100.64.0.0/10) and the other
+    special-purpose ranges the explicit flags miss; IPv4 embedded in
+    IPv4-mapped (::ffff:a.b.c.d) and NAT64 addresses is checked as IPv4.
+    """
+    if ip.version == 6:
+        if ip.ipv4_mapped is not None:
+            return _ip_is_public(ip.ipv4_mapped)
+        if ip in _NAT64_PREFIX:
+            return _ip_is_public(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
+    if (ip.is_loopback or ip.is_private or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+        return False
+    return ip.is_global
 
 
 async def pin_webhook_target(url: str, config):
@@ -280,6 +450,8 @@ async def deliver_webhook(url: str, payload: Dict[str, Any], config,
         return False
 
     body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    # One id per delivery, identical on every retry, so receivers can dedupe.
+    headers["X-Webhook-Id"] = uuid.uuid4().hex
     if config.webhook_signing_secret:
         ts = str(int(time.time()))
         mac = hmac.new(config.webhook_signing_secret.encode(),
@@ -399,10 +571,28 @@ def tool_result_success(result) -> bool:
 # API Models
 # ============================================================================
 
+# Size bounds for free-text request fields: generous for real use, but they
+# stop a single request from queueing megabytes of TTS / prompt text.
+_MAX_MESSAGE_LEN = 5000      # spoken message bodies
+_MAX_PHRASE_LEN = 1000       # prompts, prefixes/suffixes, spoken phrases
+_MAX_URL_LEN = 2048          # callback URLs
+_MAX_EXTENSION_LEN = 256     # dial targets
+_MAX_TOOL_NAME_LEN = 64
+_MAX_SYNONYMS = 50
+_MAX_CHOICE_OPTIONS = 20
+_ShortText = Annotated[str, Field(max_length=200)]
+
+# Recurrence patterns the scheduler actually implements
+# (tool_manager._reschedule_recurring_call / _advance_recurring).
+SUPPORTED_RECURRENCES = ("daily", "weekdays", "weekends")
+# Upper bound on how far ahead a call may be scheduled.
+_MAX_SCHEDULE_DELAY_S = 366 * 24 * 3600
+
 class ChoiceOption(BaseModel):
     """A choice option for the user."""
-    value: str = Field(..., description="The value to return if selected")
-    synonyms: List[str] = Field(default_factory=list, description="Alternative phrases that map to this choice")
+    value: str = Field(..., max_length=200, description="The value to return if selected")
+    synonyms: List[_ShortText] = Field(default_factory=list, max_length=_MAX_SYNONYMS,
+                                       description="Alternative phrases that map to this choice")
     dtmf: Optional[str] = Field(
         default=None, pattern=r"^[0-9*#]$",
         description="Phone key that selects this option (defaults to its 1-based position)")
@@ -410,8 +600,9 @@ class ChoiceOption(BaseModel):
 
 class ChoicePrompt(BaseModel):
     """Configuration for collecting user choice."""
-    prompt: str = Field(..., description="Question to ask the user")
-    options: List[ChoiceOption] = Field(..., min_length=1, description="Valid choice options")
+    prompt: str = Field(..., max_length=_MAX_PHRASE_LEN, description="Question to ask the user")
+    options: List[ChoiceOption] = Field(..., min_length=1, max_length=_MAX_CHOICE_OPTIONS,
+                                        description="Valid choice options")
     timeout_seconds: int = Field(default=30, ge=1, le=300, description="How long to wait for response")
     repeat_count: int = Field(default=2, ge=1, le=10, description="How many times to repeat prompt if no response")
 
@@ -432,12 +623,12 @@ class ChoiceCallbackModel(BaseModel):
 
 class OutboundCallRequest(ChoiceCallbackModel):
     """Request to initiate an outbound notification call."""
-    message: str = Field(..., description="Message to speak to the recipient")
-    extension: str = Field(..., description="SIP extension or phone number to call")
-    callback_url: Optional[str] = Field(default=None, description="Webhook URL to POST results to (required if choice is specified)")
+    message: str = Field(..., max_length=_MAX_MESSAGE_LEN, description="Message to speak to the recipient")
+    extension: str = Field(..., max_length=_MAX_EXTENSION_LEN, description="SIP extension or phone number to call")
+    callback_url: Optional[str] = Field(default=None, max_length=_MAX_URL_LEN, description="Webhook URL to POST results to (required if choice is specified)")
     ring_timeout: int = Field(default=30, ge=1, le=600, description="Seconds to wait for call to be answered")
     choice: Optional[ChoicePrompt] = Field(default=None, description="Optional choice prompt for collecting response")
-    call_id: Optional[str] = Field(default=None, description="Optional caller-provided ID for tracking")
+    call_id: Optional[str] = Field(default=None, max_length=64, description="Optional caller-provided ID for tracking")
     reformat_for_speech: bool = Field(
         default=False,
         description="Rewrite the message into natural spoken form via the LLM "
@@ -488,7 +679,7 @@ class WebhookPayload(BaseModel):
 
 class ToolExecuteRequest(BaseModel):
     """Request to execute a tool."""
-    tool: Optional[str] = Field(default=None, description="Optional tool name; the path parameter is authoritative. If set, it must match the path.")
+    tool: Optional[str] = Field(default=None, max_length=_MAX_TOOL_NAME_LEN, description="Optional tool name; the path parameter is authoritative. If set, it must match the path.")
     params: Dict[str, Any] = Field(default_factory=dict, description="Parameters to pass to the tool")
     speak_result: bool = Field(default=False, description="Speak the result to the active call")
     call_id: Optional[str] = Field(default=None, description="Specific call to speak to (if multiple calls active)")
@@ -496,15 +687,15 @@ class ToolExecuteRequest(BaseModel):
 
 class ToolCallRequest(ChoiceCallbackModel):
     """Request to execute a tool and call someone with the result."""
-    tool: Optional[str] = Field(default=None, description="Optional tool name; the path parameter is authoritative. If set, it must match the path.")
+    tool: Optional[str] = Field(default=None, max_length=_MAX_TOOL_NAME_LEN, description="Optional tool name; the path parameter is authoritative. If set, it must match the path.")
     params: Dict[str, Any] = Field(default_factory=dict, description="Parameters to pass to the tool")
-    extension: str = Field(..., description="SIP extension or phone number to call")
-    prefix: Optional[str] = Field(default=None, description="Message to speak before the tool result")
-    suffix: Optional[str] = Field(default=None, description="Message to speak after the tool result")
+    extension: str = Field(..., max_length=_MAX_EXTENSION_LEN, description="SIP extension or phone number to call")
+    prefix: Optional[str] = Field(default=None, max_length=_MAX_PHRASE_LEN, description="Message to speak before the tool result")
+    suffix: Optional[str] = Field(default=None, max_length=_MAX_PHRASE_LEN, description="Message to speak after the tool result")
     ring_timeout: int = Field(default=30, ge=1, le=600, description="Seconds to wait for call to be answered")
-    callback_url: Optional[str] = Field(default=None, description="Webhook URL to POST call results to (required if choice is specified)")
+    callback_url: Optional[str] = Field(default=None, max_length=_MAX_URL_LEN, description="Webhook URL to POST call results to (required if choice is specified)")
     choice: Optional[ChoicePrompt] = Field(default=None, description="Optional choice prompt for collecting a spoken response")
-    call_id: Optional[str] = Field(default=None, description="Optional caller-provided ID for tracking")
+    call_id: Optional[str] = Field(default=None, max_length=64, description="Optional caller-provided ID for tracking")
     reformat_for_speech: bool = Field(
         default=False,
         description="Rewrite the composed message into natural spoken form via the LLM")
@@ -517,16 +708,16 @@ class WebhookCallRequest(ChoiceCallbackModel):
     ``message`` and/or a ``tool`` to execute at call time; ``prefix``/``suffix``
     wrap the spoken body, and an optional ``choice`` collects a spoken response.
     """
-    extension: str = Field(..., description="SIP extension or phone number to call")
-    message: Optional[str] = Field(default=None, description="Static message to speak (used as the body when no tool, or alongside a tool)")
-    tool: Optional[str] = Field(default=None, description="Optional tool to execute; its result becomes the spoken body")
+    extension: str = Field(..., max_length=_MAX_EXTENSION_LEN, description="SIP extension or phone number to call")
+    message: Optional[str] = Field(default=None, max_length=_MAX_MESSAGE_LEN, description="Static message to speak (used as the body when no tool, or alongside a tool)")
+    tool: Optional[str] = Field(default=None, max_length=_MAX_TOOL_NAME_LEN, description="Optional tool to execute; its result becomes the spoken body")
     params: Dict[str, Any] = Field(default_factory=dict, description="Parameters to pass to the tool")
-    prefix: Optional[str] = Field(default=None, description="Message to speak before the body")
-    suffix: Optional[str] = Field(default=None, description="Message to speak after the body")
+    prefix: Optional[str] = Field(default=None, max_length=_MAX_PHRASE_LEN, description="Message to speak before the body")
+    suffix: Optional[str] = Field(default=None, max_length=_MAX_PHRASE_LEN, description="Message to speak after the body")
     ring_timeout: int = Field(default=30, ge=1, le=600, description="Seconds to wait for call to be answered")
-    callback_url: Optional[str] = Field(default=None, description="Webhook URL to POST call results to (required if choice is specified)")
+    callback_url: Optional[str] = Field(default=None, max_length=_MAX_URL_LEN, description="Webhook URL to POST call results to (required if choice is specified)")
     choice: Optional[ChoicePrompt] = Field(default=None, description="Optional choice prompt for collecting a spoken response")
-    call_id: Optional[str] = Field(default=None, description="Optional caller-provided ID for tracking")
+    call_id: Optional[str] = Field(default=None, max_length=64, description="Optional caller-provided ID for tracking")
     reformat_for_speech: bool = Field(
         default=False,
         description="Rewrite the composed message into natural spoken form via the LLM")
@@ -550,17 +741,18 @@ class ToolCallResponse(BaseModel):
 
 class ScheduledCallRequest(BaseModel):
     """Request to schedule a call for a future time."""
-    extension: str = Field(..., description="SIP extension or phone number to call")
-    message: Optional[str] = Field(default=None, description="Message to speak (if no tool specified)")
-    tool: Optional[str] = Field(default=None, description="Tool to execute and speak result (e.g., WEATHER)")
+    extension: str = Field(..., max_length=_MAX_EXTENSION_LEN, description="SIP extension or phone number to call")
+    message: Optional[str] = Field(default=None, max_length=_MAX_MESSAGE_LEN, description="Message to speak (if no tool specified)")
+    tool: Optional[str] = Field(default=None, max_length=_MAX_TOOL_NAME_LEN, description="Tool to execute and speak result (e.g., WEATHER)")
     tool_params: Dict[str, Any] = Field(default_factory=dict, description="Parameters for the tool")
-    delay_seconds: Optional[int] = Field(default=None, description="Seconds from now to make the call")
-    at_time: Optional[str] = Field(default=None, description="ISO datetime or HH:MM time to make the call")
-    timezone: Optional[str] = Field(default="America/Los_Angeles", description="Timezone for at_time (default: America/Los_Angeles)")
-    prefix: Optional[str] = Field(default=None, description="Message to speak before tool result")
-    suffix: Optional[str] = Field(default=None, description="Message to speak after tool result")
-    callback_url: Optional[str] = Field(default=None, description="Webhook URL to POST results to")
-    recurring: Optional[str] = Field(default=None, description="Recurrence pattern: 'daily', 'weekdays', 'weekends', or cron expression")
+    delay_seconds: Optional[int] = Field(default=None, ge=0, le=_MAX_SCHEDULE_DELAY_S,
+                                         description="Seconds from now to make the call (max 366 days)")
+    at_time: Optional[str] = Field(default=None, max_length=64, description="ISO datetime or HH:MM time to make the call")
+    timezone: Optional[str] = Field(default="America/Los_Angeles", max_length=64, description="Timezone for at_time (default: America/Los_Angeles)")
+    prefix: Optional[str] = Field(default=None, max_length=_MAX_PHRASE_LEN, description="Message to speak before tool result")
+    suffix: Optional[str] = Field(default=None, max_length=_MAX_PHRASE_LEN, description="Message to speak after tool result")
+    callback_url: Optional[str] = Field(default=None, max_length=_MAX_URL_LEN, description="Webhook URL to POST results to")
+    recurring: Optional[str] = Field(default=None, description="Recurrence pattern: 'daily', 'weekdays' or 'weekends'")
     reformat_for_speech: bool = Field(
         default=False,
         description="Rewrite the composed message into natural spoken form via the LLM at call time")
@@ -579,6 +771,17 @@ class ScheduledCallRequest(BaseModel):
         """Validate that either message or tool is provided."""
         if not self.message and not self.tool:
             raise ValueError("Either message or tool must be provided")
+        return self
+
+    @model_validator(mode='after')
+    def validate_recurring(self):
+        """Reject recurrence patterns the scheduler would silently drop."""
+        if self.recurring is not None:
+            pattern = self.recurring.strip().lower()
+            if pattern not in SUPPORTED_RECURRENCES:
+                raise ValueError(
+                    f"recurring must be one of {list(SUPPORTED_RECURRENCES)}")
+            self.recurring = pattern
         return self
 
 
@@ -608,7 +811,7 @@ class ScheduledCallInfo(BaseModel):
 class VirtualNumberRequest(BaseModel):
     """Request to create an ephemeral inbound extension."""
     number: Optional[str] = Field(
-        default=None,
+        default=None, max_length=32,
         description="Explicit extension (digits/*/#); omit to auto-allocate "
                     "from VIRTUAL_NUMBER_RANGE")
     ttl_s: Optional[int] = Field(
@@ -623,7 +826,7 @@ class VirtualNumberRequest(BaseModel):
         default=None, max_length=500,
         description="Custom greeting spoken instead of the default one")
     callback_url: Optional[str] = Field(
-        default=None,
+        default=None, max_length=_MAX_URL_LEN,
         description="Webhook URL to POST the call outcome (and transcript) to")
     include_transcript: bool = Field(
         default=True,
@@ -633,8 +836,8 @@ class VirtualNumberRequest(BaseModel):
         description="Trigger number: never expires and is not consumed by "
                     "its calls — every call to it fires the webhook until "
                     "the number is deleted (ttl_s is ignored)")
-    events: Optional[List[str]] = Field(
-        default=None,
+    events: Optional[List[_ShortText]] = Field(
+        default=None, max_length=10,
         description="Call-time webhooks to fire: answered (call matched, "
                     "before the greeting), first_speech (caller's first "
                     "utterance), speech (every utterance), completed (call "
@@ -659,8 +862,8 @@ class VerifyRequest(BaseModel):
     """Out-of-band identity check for a caller (no live call needed)."""
     caller_id: str = Field(..., min_length=1, max_length=64,
                            description="Caller id (SIP URI user part)")
-    pin: Optional[str] = Field(default=None, description="Static PIN to check")
-    otp: Optional[str] = Field(default=None, description="One-time (TOTP) code to check")
+    pin: Optional[str] = Field(default=None, max_length=64, description="Static PIN to check")
+    otp: Optional[str] = Field(default=None, max_length=16, description="One-time (TOTP) code to check")
 
     @model_validator(mode="after")
     def _at_least_one_factor(self):
@@ -689,17 +892,17 @@ class VerifyCallRequest(BaseModel):
         description="Caller id whose stored credentials are checked (SIP URI user "
                     "part). Defaults to the extension when omitted.")
     extension: Optional[str] = Field(
-        default=None,
+        default=None, max_length=_MAX_EXTENSION_LEN,
         description="SIP extension or number to dial (defaults to caller_id)")
     method: str = Field(
         default="auto", pattern=r"^(pin|otp|auto)$",
         description="Which factor to require: 'pin', 'otp', or 'auto' (either)")
     pin: Optional[str] = Field(
-        default=None,
+        default=None, max_length=64,
         description="Check the entered code against this PIN for this call "
                     "(instead of the caller's stored/global PIN)")
     totp_secret: Optional[str] = Field(
-        default=None,
+        default=None, max_length=256,
         description="Check the entered code against this base32 TOTP secret for "
                     "this call (instead of the stored/global secret)")
     totp_digits: Optional[int] = Field(
@@ -715,22 +918,23 @@ class VerifyCallRequest(BaseModel):
         default=None, ge=0, le=10,
         description="Clock-skew steps to accept (defaults to VERIFY_TOTP_WINDOW)")
     prompt: Optional[str] = Field(
-        default=None,
+        default=None, max_length=_MAX_PHRASE_LEN,
         description="Custom spoken prompt (defaults to VERIFY_CALL_PROMPT)")
     retry_phrase: Optional[str] = Field(
-        default=None,
+        default=None, max_length=_MAX_PHRASE_LEN,
         description="Spoken line after a wrong code (defaults to VERIFY_CALL_RETRY_PHRASE)")
     success_phrase: Optional[str] = Field(
-        default=None,
+        default=None, max_length=_MAX_PHRASE_LEN,
         description="Spoken line on success (defaults to VERIFY_CALL_SUCCESS_PHRASE)")
     fail_phrase: Optional[str] = Field(
-        default=None,
+        default=None, max_length=_MAX_PHRASE_LEN,
         description="Spoken line on failure (defaults to VERIFY_CALL_FAIL_PHRASE)")
     ring_timeout: int = Field(default=30, ge=1, le=600,
                               description="Seconds to wait for the call to be answered")
     callback_url: Optional[str] = Field(
-        default=None, description="Optional webhook URL to POST the result to")
-    call_id: Optional[str] = Field(default=None, description="Optional caller-provided ID for tracking")
+        default=None, max_length=_MAX_URL_LEN,
+        description="Optional webhook URL to POST the result to")
+    call_id: Optional[str] = Field(default=None, max_length=64, description="Optional caller-provided ID for tracking")
 
 
 class VerifyCallResponse(BaseModel):
@@ -747,9 +951,10 @@ class VerifyCredentialsRequest(BaseModel):
     """Enroll or update a caller's verification factors."""
     caller_id: str = Field(..., min_length=1, max_length=64,
                            description="Caller id (SIP URI user part)")
-    pin: Optional[str] = Field(default=None, description="Static PIN to set/rotate")
+    pin: Optional[str] = Field(default=None, max_length=64, description="Static PIN to set/rotate")
     totp_secret: Optional[str] = Field(
-        default=None, description="Base32 TOTP secret to store (ignored if generate_totp)")
+        default=None, max_length=256,
+        description="Base32 TOTP secret to store (ignored if generate_totp)")
     generate_totp: bool = Field(
         default=False, description="Mint a fresh random TOTP secret for this caller")
 
@@ -808,6 +1013,48 @@ class OutboundCallHandler:
         import time
         return f"out-{int(time.time())}-{self._call_counter}"
         
+    def _spawn(self, coro) -> asyncio.Task:
+        """Run ``coro`` in the background, holding a strong reference."""
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    async def validate_call_request(self, extension: str, callback_url: Optional[str],
+                                    call_id: Optional[str]) -> None:
+        """Every rejection initiate_call can make up front, as a standalone check.
+
+        Endpoints that do work before placing the call (executing a tool) run
+        this FIRST, so an invalid request is refused before the tool runs.
+        Raises RequestRejected: bad dial target / webhook / call_id (400),
+        duplicate call_id (409), or backpressure (429). The duplicate check
+        here is a fast pre-check; enqueue() re-checks atomically.
+        """
+        config = self.assistant.config
+        validate_extension(extension, config)
+        await validate_callback_url(callback_url, config)
+        # Caller-provided IDs become Redis keys and transcript filenames.
+        if call_id and not _CALL_ID_RE.fullmatch(call_id):
+            raise RequestRejected(
+                400, "call_id may only contain letters, digits, '.', '_', '-' (max 64 chars)")
+
+        if self.call_queue:
+            # Only a call that is still queued or processing conflicts —
+            # finished records persist in Redis for 24h and their IDs may
+            # legitimately be reused (retries, recurring call IDs).
+            if call_id:
+                existing = await self.call_queue.get_call(call_id)
+                if existing and existing.status.value in ("queued", "processing"):
+                    raise RequestRejected(409, f"call_id '{call_id}' is already queued or in progress")
+            queue_status = await self.call_queue.get_queue_status()
+            if queue_status.get("queued", 0) >= config.max_queue_depth:
+                raise RequestRejected(429, "Call queue is full; try again later")
+        else:
+            if call_id and call_id in self.pending_calls:
+                raise RequestRejected(409, f"call_id '{call_id}' already in progress")
+            if len(self.pending_calls) >= config.max_direct_concurrent_calls:
+                raise RequestRejected(429, "Too many concurrent calls in progress; try again later")
+
     async def initiate_call(self, request: OutboundCallRequest) -> tuple[str, int]:
         """
         Initiate an outbound call.
@@ -818,13 +1065,10 @@ class OutboundCallHandler:
         """
         config = self.assistant.config
 
-        # Validate dial target and webhook before doing anything else.
-        validate_extension(request.extension, config)
-        await validate_callback_url(request.callback_url, config)
-        # Caller-provided IDs become Redis keys and transcript filenames.
-        if request.call_id and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", request.call_id):
-            raise RequestRejected(
-                400, "call_id may only contain letters, digits, '.', '_', '-' (max 64 chars)")
+        # Validate dial target, webhook, call_id and capacity before doing
+        # anything else.
+        await self.validate_call_request(
+            request.extension, request.callback_url, request.call_id)
 
         # Clamp caller-supplied timeouts to configured maxima so a single
         # request can't monopolise the call pipeline.
@@ -847,30 +1091,25 @@ class OutboundCallHandler:
 
         # Use queue if available
         if self.call_queue:
-            # Reject duplicate caller-provided IDs and apply queue-depth
-            # backpressure. Only a call that is still queued or processing
-            # conflicts — finished records persist in Redis for 24h and their
-            # IDs may legitimately be reused (retries, recurring call IDs).
-            if request.call_id:
-                existing = await self.call_queue.get_call(call_id)
-                if existing and existing.status.value in ("queued", "processing"):
-                    raise RequestRejected(409, f"call_id '{call_id}' is already queued or in progress")
-            queue_status = await self.call_queue.get_queue_status()
-            if queue_status.get("queued", 0) >= config.max_queue_depth:
-                raise RequestRejected(429, "Call queue is full; try again later")
-            queued_call = await self.call_queue.enqueue(call_id, request)
+            # enqueue() re-checks the call_id atomically (WATCH/MULTI), closing
+            # the race between the pre-check above and the RPUSH.
+            from call_queue import DuplicateCallError
+            try:
+                queued_call = await self.call_queue.enqueue(call_id, request)
+            except DuplicateCallError:
+                raise RequestRejected(409, f"call_id '{call_id}' is already queued or in progress")
             return call_id, queued_call.position
         else:
-            # Direct execution (no queue)
+            # Direct execution (no queue). Re-check synchronously: the awaits
+            # above (validation, reformat) may have let a twin request in.
+            # Check+insert has no await in between, so it is atomic here.
             if call_id in self.pending_calls:
                 raise RequestRejected(409, f"call_id '{call_id}' already in progress")
             if len(self.pending_calls) >= config.max_direct_concurrent_calls:
                 raise RequestRejected(429, "Too many concurrent calls in progress; try again later")
             self.pending_calls[call_id] = request
-            task = asyncio.create_task(self._execute_call(call_id, request))
-            # Keep a strong reference so the task isn't GC'd, and drop it on done.
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
+            # Strong reference so the task isn't GC'd; dropped on done.
+            self._spawn(self._execute_call(call_id, request))
             return call_id, 0
         
     async def _execute_call(self, call_id: str, request: OutboundCallRequest):
@@ -920,7 +1159,7 @@ class OutboundCallHandler:
                 # Pre-generate TTS for message
                 message_audio = await self.assistant.audio_pipeline.synthesize(request.message)
                 if not message_audio:
-                    raise Exception("Failed to generate TTS for message")
+                    raise _CallFailure("Failed to generate TTS for message")
                 
                 # Pre-generate TTS for choice prompt if needed
                 choice_audio = None
@@ -1035,10 +1274,12 @@ class OutboundCallHandler:
                     hung_up = True
 
             except Exception as e:
-                error = str(e)
+                # Only deliberate failure messages leave the process; anything
+                # else (library errors, internal state) is logged, not exposed.
+                error = str(e) if isinstance(e, _CallFailure) else _GENERIC_CALL_ERROR
                 logger.error(f"Outbound call error: {e}", exc_info=True)
                 span.record_exception(e)
-                span.set_attribute("call.error", error)
+                span.set_attribute("call.error", str(e))
                 
             finally:
                 # If the call was placed and is still up (e.g. an exception
@@ -1062,9 +1303,11 @@ class OutboundCallHandler:
                 duration = asyncio.get_event_loop().time() - start_time
                 span.set_attribute("call.duration_s", round(duration, 2))
                 
-                # Send webhook if callback_url provided
+                # Send webhook if callback_url provided. Delivered in the
+                # background (strong ref held) so retries/backoff against a
+                # slow receiver don't keep holding this call's queue slot.
                 if request.callback_url:
-                    await self._send_webhook(
+                    self._spawn(self._send_webhook(
                         request.callback_url,
                         WebhookPayload(
                             call_id=call_id,
@@ -1077,7 +1320,7 @@ class OutboundCallHandler:
                             machine_answered=machine_answered,
                             error=error
                         )
-                    )
+                    ))
 
         return status, error
 
@@ -1354,7 +1597,7 @@ class OutboundCallHandler:
             raise RequestRejected(400, "Invalid caller_id")
         validate_extension(extension, config)
         await validate_callback_url(request.callback_url, config)
-        if request.call_id and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", request.call_id):
+        if request.call_id and not _CALL_ID_RE.fullmatch(request.call_id):
             raise RequestRejected(
                 400, "call_id may only contain letters, digits, '.', '_', '-' (max 64 chars)")
 
@@ -1375,6 +1618,10 @@ class OutboundCallHandler:
             raise RequestRejected(
                 400, "No verification credentials configured: supply a pin/totp_secret "
                      "or a caller_id (or global VERIFY_*) with enrolled credentials")
+        # Cross-call brute-force lockout: don't even dial a locked-out caller.
+        if not adhoc and verifier.is_locked_out(caller_id):
+            raise RequestRejected(
+                429, "Too many failed verification attempts for this caller; try again later")
 
         # Concurrency guard (verify calls are not queued — they're interactive).
         if call_id in self.pending_calls:
@@ -1496,7 +1743,7 @@ class OutboundCallHandler:
                 # through to the shared teardown + webhook exit below.
                 pass
             except Exception as e:
-                error = str(e)
+                error = _GENERIC_CALL_ERROR
                 logger.error(f"Verify call error: {e}", exc_info=True)
                 span.record_exception(e)
             finally:
@@ -1595,6 +1842,17 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
             "API_AUTH_TOKEN is not set - REST API endpoints are unauthenticated. "
             "Set API_AUTH_TOKEN and/or bind API_HOST to a trusted interface in production."
         )
+
+    # App-level request guards, applied to every route so a new endpoint can't
+    # forget them:
+    # - CSRF: any mutating request that self-identifies as cross-site browser
+    #   traffic is refused (non-browser clients send no such headers).
+    # - Host allowlist, TOKENLESS mode only: a DNS-rebinding page reaches the
+    #   API under the attacker's own domain, which the token would otherwise
+    #   stop. With a token configured the Host header is not checked.
+    app.add_middleware(RequestGuardMiddleware,
+                       check_host=not assistant.config.api_auth_token,
+                       allowed_hosts=_allowed_hosts_setting(assistant.config))
 
     # Cached dependency probes for /health?deep=true — the TTL keeps repeated
     # monitoring hits from hammering the backends.
@@ -1753,7 +2011,9 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
             logger.error(f"Failed to initiate call: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail="Failed to initiate call")
     
-    @app.get("/call/{call_id}")
+    # Auth-gated: call ids are guessable and the record names the dialed
+    # extension and outcome.
+    @app.get("/call/{call_id}", dependencies=protected)
     async def get_call_status(call_id: str):
         """Get status of a call."""
         # Check queue first
@@ -2019,6 +2279,9 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
         log_event(logger, logging.INFO, f"Tool call request: {actual_tool_name} -> {request.extension}",
                  event="api_tool_call", tool=actual_tool_name, extension=request.extension)
         _require_verified_for(actual_tool_name, None)
+        # Refuse an un-placeable call BEFORE running the tool (side effects).
+        await handler.validate_call_request(
+            request.extension, request.callback_url, request.call_id)
 
         try:
             # Execute the tool first
@@ -2198,19 +2461,27 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
         """
         tool_message = ""
         actual_tool_name = None
+        tool = None
+
+        if request.tool:
+            actual_tool_name = request.tool.upper()
+            tool = assistant.tool_manager.get_tool(actual_tool_name)
+            if not tool:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Tool '{actual_tool_name}' not found. Use GET /tools to list available tools."
+                )
+            # Same VERIFY_REQUIRED_TOOLS gate as /tools/{name}/call.
+            _require_verified_for(actual_tool_name, None)
+        # Refuse an un-placeable call BEFORE running the tool (side effects).
+        await handler.validate_call_request(
+            request.extension, request.callback_url, request.call_id)
 
         try:
             body_parts = []
 
             # Execute the tool (if any) to produce part of the spoken body.
-            if request.tool:
-                actual_tool_name = request.tool.upper()
-                tool = assistant.tool_manager.get_tool(actual_tool_name)
-                if not tool:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Tool '{actual_tool_name}' not found. Use GET /tools to list available tools."
-                    )
+            if tool is not None:
                 log_event(logger, logging.INFO, f"Webhook call: {actual_tool_name} -> {request.extension}",
                          event="api_webhook_call", tool=actual_tool_name, extension=request.extension)
                 result = await tool.execute(request.params)
@@ -2386,13 +2657,32 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
         validate_extension(request.extension, assistant.config)
         await validate_callback_url(request.callback_url, assistant.config)
 
+        # Validate the timezone BEFORE anything is persisted: it is also used
+        # to build the response, and an unknown zone used to 500 there after
+        # the task had already been scheduled.
+        try:
+            tz = pytz.timezone(request.timezone or "America/Los_Angeles")
+        except pytz.UnknownTimeZoneError:
+            raise HTTPException(status_code=400,
+                                detail=f"Unknown timezone '{request.timezone}'")
+
+        # A scheduled tool runs later with no verified call session, so a
+        # VERIFY_REQUIRED_TOOLS tool can never be scheduled over REST.
+        if request.tool:
+            blocked = assistant.tool_manager.verification_block(request.tool, None)
+            if blocked is not None:
+                log_event(logger, logging.INFO,
+                          f"REST schedule of {request.tool.upper()} blocked: caller not verified",
+                          event="verify_gate", tool=request.tool.upper(),
+                          outcome="blocked", source="api_schedule")
+                raise HTTPException(status_code=403, detail=blocked.message)
+
         # Calculate delay
         delay_seconds = request.delay_seconds
         scheduled_time = None
 
         if request.at_time:
             try:
-                tz = pytz.timezone(request.timezone or "America/Los_Angeles")
                 now = datetime.now(tz)
                 
                 # Parse time - either full ISO or just HH:MM
@@ -2427,6 +2717,9 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
             # HTTPException isn't re-wrapped as an "Error parsing time" message.
             if delay_seconds < 0:
                 raise HTTPException(status_code=400, detail="Scheduled time is in the past")
+            if delay_seconds > _MAX_SCHEDULE_DELAY_S:
+                raise HTTPException(status_code=400,
+                                    detail="Scheduled time is too far in the future (max 366 days)")
 
         # Build the task data
         task_data = {
@@ -2457,7 +2750,6 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
         if scheduled_time:
             scheduled_for = scheduled_time.isoformat()
         else:
-            tz = pytz.timezone(request.timezone or "America/Los_Angeles")
             scheduled_for = (datetime.now(tz) + timedelta(seconds=delay_seconds)).isoformat()
         
         log_event(logger, logging.INFO, f"Scheduled call: {task_id} -> {request.extension}",
@@ -2656,12 +2948,17 @@ def create_api(assistant: 'SIPAIAssistant', call_queue: 'CallQueue' = None) -> F
         """
         caller_id = (request.caller_id or "").strip()
         verifier = assistant.verifier
-        ok = False
-        method: Optional[str] = None
-        if request.otp and await verifier.averify_totp(caller_id, request.otp):
-            ok, method = True, "otp"
-        elif request.pin and await verifier.averify_pin(caller_id, request.pin):
-            ok, method = True, "pin"
+        # Cross-call brute-force lockout (VERIFY_LOCKOUT_FAILURES within
+        # VERIFY_LOCKOUT_S), shared with the voice/DTMF paths.
+        retry_after = verifier.lockout_remaining_s(caller_id)
+        if retry_after:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many failed verification attempts; try again later",
+                headers={"Retry-After": str(retry_after)})
+        # One attempt (OTP tried first, then PIN) = one lockout strike.
+        ok, method = await verifier.averify_factors(
+            caller_id, pin=request.pin, otp=request.otp)
         return VerifyResponse(caller_id=caller_id, verified=ok, method=method)
 
     @app.post("/verify/call", response_model=VerifyCallResponse, dependencies=protected)

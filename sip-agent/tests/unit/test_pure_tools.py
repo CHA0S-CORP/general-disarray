@@ -77,3 +77,19 @@ async def test_simon_says_empty_fails():
     tool = SimonSaysTool(assistant=None)
     result = await tool.execute({"text": ""})
     assert result.status == ToolStatus.FAILED
+
+
+async def test_datetime_day_is_not_zero_padded(monkeypatch):
+    """Regression: '%d' made TTS say 'October 06'."""
+    from datetime import datetime as real_datetime
+    import plugins.datetime_tool as dt_module
+
+    class FixedDatetime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return tz.localize(real_datetime(2026, 10, 6, 15, 45))
+
+    monkeypatch.setattr(dt_module, "datetime", FixedDatetime)
+    result = await DateTimeTool(assistant=None).execute(
+        {"format": "datetime", "timezone": "UTC"})
+    assert result.message == "It's 3:45 PM on Tuesday, October 6"

@@ -17,9 +17,11 @@ LLM: [TOOL:WEATHER]
 
 import logging
 import os
+import time
+from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
-from plugins.helpers import fetch_json
+from plugins.helpers import fetch_json, spoken_time_ago
 
 from tool_plugins import BaseTool, ToolResult, ToolStatus
 from logging_utils import log_event
@@ -33,6 +35,22 @@ _HEADERS = {
 }
 
 _UNAVAILABLE = "Current weather conditions are not available right now."
+
+# Station observations older than this are flagged as stale in the speech
+# ("That reading is from about three hours ago").
+_STALE_AFTER_S = 2 * 3600
+
+
+def _observation_age_s(timestamp: Any, now_s: float) -> Optional[float]:
+    """Seconds since an NWS observation timestamp (ISO 8601 with offset);
+    None when missing/unparseable."""
+    try:
+        observed = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if observed.tzinfo is None:
+        return None
+    return max(0.0, now_s - observed.timestamp())
 
 
 async def _fetch_json(url: str, params: Optional[Dict[str, Any]] = None,
@@ -225,6 +243,15 @@ class WeatherTool(BaseTool):
         if not summary:
             return await self._forecast_fallback()
 
+        # NWS "latest" can be hours old when a station stops reporting —
+        # never present it as "right now" without saying so.
+        now_s = time.time()
+        age_s = _observation_age_s(props.get("timestamp"), now_s)
+        stale = age_s is not None and age_s > _STALE_AFTER_S
+        if stale:
+            ago = spoken_time_ago((now_s - age_s) * 1000.0, now_s)
+            summary += f" That reading is from {ago}."
+
         log_event(logger, logging.INFO, f"Weather: {summary}",
                   event="weather_fetch")
         return ToolResult(
@@ -240,6 +267,8 @@ class WeatherTool(BaseTool):
                 "description": description,
                 "station": self._station_name,
                 "source": "observation",
+                "observed_at": props.get("timestamp"),
+                "stale": stale,
             },
         )
 

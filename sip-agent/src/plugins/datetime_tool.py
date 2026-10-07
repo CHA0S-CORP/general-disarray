@@ -93,7 +93,8 @@ class DateTimeTool(BaseTool):
             
         else:  # datetime
             time_str = now.strftime("%I:%M %p").lstrip("0")
-            date_str = now.strftime("%A, %B %d")
+            # Unpadded day: "%d" makes TTS say "October zero six".
+            date_str = f"{now.strftime('%A, %B')} {now.day}"
             message = f"It's {time_str} on {date_str}"
             
         return ToolResult(

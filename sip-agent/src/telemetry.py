@@ -19,10 +19,13 @@ from functools import wraps
 logger = logging.getLogger(__name__)
 
 # Check if OpenTelemetry is enabled
-OTEL_ENABLED = os.environ.get("OTEL_ENABLED", "false").lower() == "true"
+OTEL_ENABLED = os.environ.get("OTEL_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
-# Lazy initialization flags
+# Lazy initialization flags. _init_attempted latches after the first try so a
+# disabled or failed init isn't retried (and re-logged) by every metric/span
+# call that goes through get_tracer()/get_meter().
 _initialized = False
+_init_attempted = False
 _tracer = None
 _meter = None
 
@@ -31,17 +34,30 @@ def is_enabled() -> bool:
     return OTEL_ENABLED
 
 
-def init_telemetry(service_name: str = "sip-agent") -> bool:
+def init_telemetry(service_name: Optional[str] = None) -> bool:
     """
     Initialize OpenTelemetry instrumentation.
-    
+
+    The service name comes from OTEL_SERVICE_NAME when set (standard OTel
+    convention, so the env var wins over the caller's argument), else
+    ``service_name``, else "sip-agent".
+
+    Only the first call does any work: success or failure is latched, so a
+    failed init (missing packages, bad endpoint) is logged once instead of on
+    every metric call.
+
     Returns True if initialization was successful, False otherwise.
     """
-    global _initialized, _tracer, _meter
-    
+    global _initialized, _init_attempted, _tracer, _meter
+
     if _initialized:
         return True
-        
+    if _init_attempted:
+        return False
+    _init_attempted = True
+
+    service_name = os.environ.get("OTEL_SERVICE_NAME") or service_name or "sip-agent"
+
     if not OTEL_ENABLED:
         logger.info("OpenTelemetry disabled (OTEL_ENABLED != 'true')")
         return False

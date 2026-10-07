@@ -113,3 +113,20 @@ def test_category_tools_map_covers_all_categories():
     for category in ("ALERTS", "QUAKES", "KP_INDEX", "WEATHER", "DATETIME",
                      "GPU_STATUS", "WEB_SEARCH", "PROMISED_ACTION"):
         assert category in CATEGORY_TOOLS
+
+
+def test_side_effects_ran_only_read_only_tools_are_safe():
+    from grounding import side_effects_ran
+    assert not side_effects_ran([])
+    assert not side_effects_ran(["WEATHER", "datetime", "WEB_SEARCH"])
+    for name in ("SET_TIMER", "CALLBACK", "TRANSFER", "HANGUP",
+                 "TRIGGER_WORKFLOW", "REMEMBER", "FORGET", "CONTAINER_CTL",
+                 "PERSONA", "SOME_MCP_TOOL"):
+        assert side_effects_ran(["WEATHER", name]), name
+
+
+def test_nudged_content_appends_to_user_text():
+    from grounding import NUDGE, nudged_content
+    assert nudged_content("what time is it").startswith("what time is it")
+    assert NUDGE in nudged_content("what time is it")
+    assert nudged_content("") == NUDGE

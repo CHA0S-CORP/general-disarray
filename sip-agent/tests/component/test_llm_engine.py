@@ -13,6 +13,13 @@ from mock_vllm import ECHO_PHRASE
 
 pytestmark = pytest.mark.component
 
+def _system_text(request):
+    """All system-message content in one request, joined (the prompt is sent
+    as a static + per-turn pair when LLM_SPLIT_SYSTEM_PROMPT is on)."""
+    return "\n".join(m.get("content") or "" for m in request["messages"]
+                      if m.get("role") == "system")
+
+
 
 @pytest_asyncio.fixture
 async def engine(assistant):
@@ -146,7 +153,7 @@ async def test_call_context_reaches_system_prompt(engine):
         [{"role": "user", "content": "hello there"}],
         {"remote_uri": "sip:1001@pbx.lan", "duration": 42.0},
     )
-    system = mock_vllm.REQUESTS[-1]["messages"][0]["content"]
+    system = _system_text(mock_vllm.REQUESTS[-1])
     assert "Caller: 1001" in system          # user part extracted from the URI
     assert "42 seconds" in system
     assert "Caller: unknown" not in system
@@ -177,6 +184,125 @@ async def test_frequency_penalty_sent_when_configured(assistant, config_factory,
     assert mock_vllm.REQUESTS[-1]["frequency_penalty"] == 0.5
 
 
+async def test_thinking_switch_omitted_by_default(engine):
+    """Unset LLM_ENABLE_THINKING -> no chat_template_kwargs in the body."""
+    import mock_vllm
+    await engine.generate_response([{"role": "user", "content": "hello there"}])
+    assert "chat_template_kwargs" not in mock_vllm.REQUESTS[-1]
+
+
+async def test_thinking_switch_sent_when_configured(assistant, config_factory,
+                                                    speaches_url, vllm_url):
+    """LLM_ENABLE_THINKING=false reaches the server as a top-level
+    chat_template_kwargs field (the openai client inlines extra_body)."""
+    import mock_vllm
+    from llm_engine import LLMEngine
+    cfg = config_factory(
+        speaches_api_url=speaches_url,
+        llm_base_url=f"{vllm_url}/v1",
+        llm_model="mock-model",
+        llm_enable_thinking="false",
+    )
+    assert cfg.llm_enable_thinking is False
+    eng = LLMEngine(cfg, assistant.tool_manager)
+    await eng.start()
+    try:
+        await eng.generate_response([{"role": "user", "content": "hello there"}])
+    finally:
+        await eng.stop()
+    assert mock_vllm.REQUESTS[-1]["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+@pytest_asyncio.fixture
+async def split_native_engine(assistant, config_factory):
+    cfg = config_factory(
+        speaches_api_url=assistant.config.speaches_api_url,
+        llm_base_url=assistant.config.llm_base_url,
+        llm_model="mock-model",
+        llm_tool_calling="native",
+        llm_split_system_prompt="true",
+    )
+    eng = LLMEngine(cfg, assistant.tool_manager)
+    await eng.start()
+    yield eng
+    await eng.stop()
+
+
+async def test_system_prompt_split_keeps_static_prefix_stable(split_native_engine):
+    """Split on + native tools: message 0 is the byte-identical base prompt,
+    message 1 carries the per-turn context (clock, caller...). The server's
+    prefix cache depends on message 0 (and the tool schemas after it) not
+    changing between turns or callers."""
+    import mock_vllm
+    engine = split_native_engine
+    ctx = {"remote_uri": "sip:1001@pbx.lan", "duration": 42.0}
+    await engine.generate_response([{"role": "user", "content": "hello there"}], ctx)
+    first = mock_vllm.REQUESTS[-1]["messages"]
+    await engine.generate_response(
+        [{"role": "user", "content": "hello again"}],
+        {"remote_uri": "sip:2002@pbx.lan", "duration": 99.0})
+    second = mock_vllm.REQUESTS[-1]["messages"]
+    for msgs in (first, second):
+        assert msgs[0]["role"] == "system" and msgs[1]["role"] == "system"
+        assert msgs[2]["role"] == "user"
+        assert msgs[0]["content"].startswith(engine.config.system_prompt)
+        assert "Current time:" not in msgs[0]["content"]
+        assert "Caller:" not in msgs[0]["content"]
+        assert "Current time:" in msgs[1]["content"]
+    assert first[0]["content"] == second[0]["content"]
+    assert "Caller: 1001" in first[1]["content"]
+    assert "Caller: 2002" in second[1]["content"]
+
+
+async def test_system_prompt_split_skipped_in_text_mode(assistant, config_factory):
+    """Text-marker mode never splits, even with LLM_SPLIT_SYSTEM_PROMPT on:
+    no native tool schemas follow message 0, so there is no prefix to gain,
+    and a second system message breaks some templates (Qwen3.5 raises,
+    gpt-oss drops it)."""
+    import mock_vllm
+    cfg = config_factory(
+        speaches_api_url=assistant.config.speaches_api_url,
+        llm_base_url=assistant.config.llm_base_url,
+        llm_model="mock-model",
+        llm_split_system_prompt="true",
+    )
+    eng = LLMEngine(cfg, assistant.tool_manager)
+    await eng.start()
+    try:
+        await eng.generate_response(
+            [{"role": "user", "content": "hello there"}],
+            {"remote_uri": "sip:1001@pbx.lan", "duration": 42.0})
+    finally:
+        await eng.stop()
+    msgs = mock_vllm.REQUESTS[-1]["messages"]
+    assert [m["role"] for m in msgs] == ["system", "user"]
+    assert "Caller: 1001" in msgs[0]["content"]
+
+
+async def test_system_prompt_split_can_be_disabled(assistant, config_factory,
+                                                   speaches_url, vllm_url):
+    import mock_vllm
+    from llm_engine import LLMEngine
+    cfg = config_factory(
+        speaches_api_url=speaches_url,
+        llm_base_url=f"{vllm_url}/v1",
+        llm_model="mock-model",
+        llm_split_system_prompt="false",
+    )
+    eng = LLMEngine(cfg, assistant.tool_manager)
+    await eng.start()
+    try:
+        await eng.generate_response(
+            [{"role": "user", "content": "hello there"}],
+            {"remote_uri": "sip:1001@pbx.lan", "duration": 42.0})
+    finally:
+        await eng.stop()
+    msgs = mock_vllm.REQUESTS[-1]["messages"]
+    assert [m["role"] for m in msgs] == ["system", "user"]
+    assert "Current time:" in msgs[0]["content"]
+    assert "Caller: 1001" in msgs[0]["content"]
+
+
 async def test_assistant_wires_caller_context_end_to_end(config_factory,
                                                          speaches_url, vllm_url):
     """Kills the caller_id/remote_uri key-mismatch regression class."""
@@ -195,7 +321,7 @@ async def test_assistant_wires_caller_context_end_to_end(config_factory,
         call = SimpleNamespace(is_active=True, remote_uri="sip:1001@host", media_ready=False)
         session = a._begin_session(call, "inbound", "sip:1001@host")
         await a._generate_response(session, "hello there")
-        system = mock_vllm.REQUESTS[-1]["messages"][0]["content"]
+        system = _system_text(mock_vllm.REQUESTS[-1])
         assert "Caller: 1001" in system
         await a._teardown_session()
     finally:
@@ -431,8 +557,12 @@ async def test_text_grounding_retry_forces_tool(engine):
     # First request answered from memory; the second carried the nudge.
     assert len(mock_vllm.REQUESTS) - before == 2
     nudged = mock_vllm.REQUESTS[-1]["messages"]
-    assert any(mock_vllm.NUDGE_MARKER in str(m.get("content") or "")
-               for m in nudged if m.get("role") == "system")
+    # The nudge rides in the last user turn, never a mid-conversation
+    # system message (Qwen3.5 rejects those; gpt-oss drops them).
+    assert mock_vllm.NUDGE_MARKER in nudged[-1]["content"]
+    assert nudged[-1]["role"] == "user"
+    assert not any(mock_vllm.NUDGE_MARKER in str(m.get("content") or "")
+                   for m in nudged if m.get("role") == "system")
     assert re.search(r"\d{1,2}:\d{2} (AM|PM)", reply), reply
 
 

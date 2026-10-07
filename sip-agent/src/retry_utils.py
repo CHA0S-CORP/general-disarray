@@ -7,14 +7,11 @@ Provides configurable retry logic with exponential backoff for API calls.
 import asyncio
 import logging
 import random
-from typing import TypeVar, Callable, Awaitable, Optional, Tuple, Type, TYPE_CHECKING
+from typing import TypeVar, Callable, Awaitable, Optional, Tuple, Type
 from functools import wraps
 
 from config import Config
 from telemetry import Metrics
-
-if TYPE_CHECKING:
-    import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -63,9 +60,11 @@ async def retry_async(
         from config import get_config
         config = get_config()
         
-    attempts = max_attempts or config.api_retry_attempts
-    delay = base_delay or config.api_retry_base_delay_s
-    max_d = max_delay or config.api_retry_max_delay_s
+    # `is None` (not `or`): an explicit 0 is a real value. attempts is floored
+    # at 1 — API_RETRY_ATTEMPTS=0 means "no retries", never "never call".
+    attempts = max(1, int(config.api_retry_attempts if max_attempts is None else max_attempts))
+    delay = config.api_retry_base_delay_s if base_delay is None else base_delay
+    max_d = config.api_retry_max_delay_s if max_delay is None else max_delay
     
     last_error: Optional[Exception] = None
     
@@ -126,123 +125,3 @@ def with_retry(
             )
         return wrapper
     return decorator
-
-
-class RetryableHTTPClient:
-    """
-    HTTP client wrapper with built-in retry logic.
-    
-    This provides a shared httpx client with retry capabilities
-    to avoid creating new clients for each request.
-    """
-    
-    def __init__(self, config: Optional[Config] = None):
-        if config is None:
-            from config import get_config
-            config = get_config()
-        self.config = config
-        self._client: Optional['httpx.AsyncClient'] = None
-        
-    async def get_client(self) -> 'httpx.AsyncClient':
-        """Get or create the httpx client."""
-        if self._client is None:
-            import httpx
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(self.config.api_timeout_s),
-                follow_redirects=True,
-            )
-        return self._client
-        
-    async def close(self):
-        """Close the client."""
-        if self._client:
-            await self._client.aclose()
-            self._client = None
-            
-    async def post(
-        self,
-        url: str,
-        api_name: str = "http",
-        retryable_exceptions: Optional[Tuple[Type[Exception], ...]] = None,
-        **kwargs
-    ):
-        """
-        Make a POST request with retry logic.
-        
-        Args:
-            url: Request URL
-            api_name: Name for logging/metrics
-            retryable_exceptions: Exception types to retry
-            **kwargs: Arguments passed to httpx.post
-        """
-        import httpx
-        
-        if retryable_exceptions is None:
-            retryable_exceptions = (
-                httpx.HTTPStatusError,
-                httpx.ConnectError,
-                httpx.TimeoutException,
-            )
-            
-        async def do_post():
-            client = await self.get_client()
-            response = await client.post(url, **kwargs)
-            response.raise_for_status()
-            return response
-            
-        return await retry_async(
-            do_post,
-            api_name=api_name,
-            retryable_exceptions=retryable_exceptions,
-            config=self.config,
-        )
-        
-    async def get(
-        self,
-        url: str,
-        api_name: str = "http",
-        retryable_exceptions: Optional[Tuple[Type[Exception], ...]] = None,
-        **kwargs
-    ):
-        """Make a GET request with retry logic."""
-        import httpx
-        
-        if retryable_exceptions is None:
-            retryable_exceptions = (
-                httpx.HTTPStatusError,
-                httpx.ConnectError,
-                httpx.TimeoutException,
-            )
-            
-        async def do_get():
-            client = await self.get_client()
-            response = await client.get(url, **kwargs)
-            response.raise_for_status()
-            return response
-            
-        return await retry_async(
-            do_get,
-            api_name=api_name,
-            retryable_exceptions=retryable_exceptions,
-            config=self.config,
-        )
-
-
-# Global shared HTTP client instance
-_shared_http_client: Optional[RetryableHTTPClient] = None
-
-
-def get_http_client(config: Optional[Config] = None) -> RetryableHTTPClient:
-    """Get the shared HTTP client instance."""
-    global _shared_http_client
-    if _shared_http_client is None:
-        _shared_http_client = RetryableHTTPClient(config)
-    return _shared_http_client
-
-
-async def close_http_client():
-    """Close the shared HTTP client."""
-    global _shared_http_client
-    if _shared_http_client:
-        await _shared_http_client.close()
-        _shared_http_client = None

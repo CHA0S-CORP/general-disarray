@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional
 
 from tool_plugins import BaseTool, ToolResult, ToolStatus
 from logging_utils import log_event
+from plugins.helpers import number_to_words
 
 logger = logging.getLogger(__name__)
 
@@ -87,15 +88,50 @@ def _normalize_answer(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+# Filler that never carries an answer by itself ("it's the", "a").
+_FILLER = frozenset({"a", "an", "the", "it", "s", "is", "its", "of", "i",
+                     "think", "um", "uh", "my", "answer"})
+
+
+def _answer_tokens(text: str) -> List[str]:
+    """Normalized answer as word tokens, with small digit numbers spelled
+    out ("8" -> "eight", "60" -> "sixty") so digit and word forms compare."""
+    tokens: List[str] = []
+    for token in _normalize_answer(text).split():
+        if token.isdigit() and int(token) < 100:
+            tokens.extend(number_to_words(int(token)).split())
+        else:
+            tokens.append(token)
+    return tokens
+
+
+def _contains_run(haystack: List[str], needle: List[str]) -> bool:
+    """Whether `needle` occurs as a contiguous run of whole tokens."""
+    n = len(needle)
+    return n > 0 and any(haystack[i:i + n] == needle
+                         for i in range(len(haystack) - n + 1))
+
+
 def _is_correct(caller_answer: str, accepted_answers: List[str]) -> bool:
-    """Fuzzy match: accept when a normalized accepted answer is contained in
-    the caller's normalized answer, or vice versa ("The Paris" matches "paris")."""
-    caller = _normalize_answer(caller_answer)
+    """Whole-token match after normalization.
+
+    Accept when an accepted answer appears as a contiguous token run in the
+    caller's answer ("The Paris" / "it's 8" match), or when the caller's
+    meaningful tokens appear as a run in an accepted answer ("paris" matches
+    "the city of paris"). Tokens must match whole, so "six" never matches
+    "sixty", "8" never matches "18" and a bare "a" never matches "paris".
+    """
+    caller = _answer_tokens(caller_answer)
     if not caller:
         return False
+    caller_core = [t for t in caller if t not in _FILLER]
     for accepted in accepted_answers:
-        normalized = _normalize_answer(accepted)
-        if normalized and (normalized in caller or caller in normalized):
+        answer = _answer_tokens(accepted)
+        if not answer:
+            continue
+        if _contains_run(caller, answer):
+            return True
+        if caller_core and _contains_run(answer, caller_core):
             return True
     return False
 

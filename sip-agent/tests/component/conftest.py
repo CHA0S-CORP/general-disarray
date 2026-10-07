@@ -105,7 +105,6 @@ class FakeAssistant:
         self.sip_handler = SimpleNamespace()
         self.audio_pipeline = None
         self.llm_engine = StubLLMEngine()
-        self.scheduled_callbacks = []
         # Import here so `src` is on sys.path (set by the root conftest).
         from mcp_tools import MCPManager
         from tool_manager import ToolManager
@@ -122,10 +121,6 @@ class FakeAssistant:
         # so ToolManager.start() exercises _start_mcp_tools' no-op path in
         # every baseline test, exactly as a default deployment does.
         self.mcp_manager = MCPManager(config)
-
-    async def schedule_callback(self, delay, message, destination):
-        self.scheduled_callbacks.append((delay, message, destination))
-        return "cb-test"
 
 
 @pytest.fixture

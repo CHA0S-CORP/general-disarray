@@ -39,11 +39,21 @@ def _allowlist(config) -> List[str]:
     ]
 
 
+# Default Docker API client timeout (status lookups).
+_DEFAULT_TIMEOUT_S = 15.0
+# Graceful-stop window passed to POST /restart (?t=); docker answers only
+# after the container stopped and started again, so the client must wait
+# longer than this or it reports a failure while the restart proceeds.
+_RESTART_STOP_TIMEOUT_S = 10
+_RESTART_CLIENT_TIMEOUT_S = _RESTART_STOP_TIMEOUT_S + 30.0
+
+
 async def _docker_request(
     socket_path: str,
     method: str,
     path: str,
     params: Optional[Dict[str, Any]] = None,
+    timeout: float = _DEFAULT_TIMEOUT_S,
 ) -> Tuple[int, Any]:
     """Issue a Docker Engine API request over the unix socket.
 
@@ -53,7 +63,7 @@ async def _docker_request(
     try:
         transport = httpx.AsyncHTTPTransport(uds=socket_path)
         async with httpx.AsyncClient(
-            transport=transport, base_url="http://docker", timeout=15.0
+            transport=transport, base_url="http://docker", timeout=timeout
         ) as client:
             response = await client.request(method, path, params=params)
             try:
@@ -197,7 +207,9 @@ class ContainerControlTool(BaseTool):
 
         code, _ = await _docker_request(
             self.config.docker_socket_path, "POST",
-            f"/containers/{name}/restart", params={"t": 10},
+            f"/containers/{name}/restart",
+            params={"t": _RESTART_STOP_TIMEOUT_S},
+            timeout=_RESTART_CLIENT_TIMEOUT_S,
         )
 
         if code == 0:

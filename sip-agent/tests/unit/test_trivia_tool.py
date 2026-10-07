@@ -41,6 +41,32 @@ def test_fuzzy_matching():
     assert not _is_correct("", ["paris"])
 
 
+@pytest.mark.parametrize("caller,accepted", [
+    ("six", ["sixty", "60"]),      # word prefix of the right answer
+    ("sixty", ["six", "6"]),
+    ("8", ["eighteen", "18"]),     # digit substring of the right answer
+    ("18", ["eight", "8"]),
+    ("a", ["paris"]),              # one letter is a substring of anything
+    ("the", ["the city of paris"]),
+    ("whale shark", ["blue whale"]),
+])
+def test_substring_false_positives_rejected(caller, accepted):
+    """Regression: two-way substring matching accepted wrong answers."""
+    assert not _is_correct(caller, accepted)
+
+
+@pytest.mark.parametrize("caller,accepted", [
+    ("I think it's sixty", ["sixty", "60"]),
+    ("60", ["sixty"]),             # digit vs word forms
+    ("eight", ["8"]),
+    ("forty two", ["42"]),
+    ("Leonardo da Vinci", ["da vinci"]),
+    ("it's mount everest", ["everest"]),
+])
+def test_whole_token_answers_accepted(caller, accepted):
+    assert _is_correct(caller, accepted)
+
+
 # --- game flow ----------------------------------------------------------------
 
 async def test_ask_answer_score_flow():

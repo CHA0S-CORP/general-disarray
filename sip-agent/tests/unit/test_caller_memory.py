@@ -30,6 +30,33 @@ def test_caller_id_empty():
     assert caller_id_from_uri(None) is None
 
 
+@pytest.mark.parametrize("uri", [
+    "sip:anonymous@anonymous.invalid",
+    '"Anonymous" <sip:anonymous@anonymous.invalid>',
+    "sip:Anonymous@pbx.lan",
+    "sip:unknown@pbx.lan",
+    "sip:restricted@pbx.lan",
+    "sip:PRIVATE@pbx.lan",
+    "sip:unavailable@pbx.lan",
+    "sip:@pbx.lan",
+    "anonymous",
+])
+def test_caller_id_anonymous_callers_get_no_memory(uri):
+    """Withheld caller IDs would all share ONE memory file — one stranger's
+    facts leaking to the next. They get no memory at all."""
+    assert caller_id_from_uri(uri) is None
+
+
+async def test_anonymous_caller_update_writes_nothing(config_factory, tmp_path):
+    store = CallerMemoryStore(config_factory(data_dir=str(tmp_path)))
+    engine = _StubEngine(json.dumps({"facts": ["Name is Eve"],
+                                     "last_call_summary": "s"}))
+    await store.update_from_call("sip:anonymous@anonymous.invalid",
+                                 _transcript("my name is Eve"), engine)
+    assert engine.calls == []
+    assert list((tmp_path / "caller_memory").glob("*.json")) == []
+
+
 # --- store ----------------------------------------------------------------------
 
 class _StubEngine:
@@ -242,3 +269,28 @@ def test_extraction_prompt_excludes_persona_and_oneoffs():
     assert "summary" in p
     summary_guidance = p.split("summary of this latest call", 1)[-1]
     assert "do not mention the persona" in summary_guidance
+
+
+async def test_per_caller_locks_do_not_accumulate(store):
+    """Locks live only while an update holds/awaits them (weak values)."""
+    import gc
+    engine = _StubEngine(json.dumps({"facts": ["f"], "last_call_summary": "s"}))
+    for n in range(5):
+        await store.update_from_call(f"sip:{1000 + n}@pbx",
+                                     _transcript("hello"), engine)
+    gc.collect()
+    assert len(store._locks) == 0
+    assert store.get("1004")["facts"] == ["f"]
+
+
+def test_write_atomic_fsyncs_before_replace(store, monkeypatch):
+    import os as _os
+    order = []
+    real_fsync, real_replace = _os.fsync, _os.replace
+    monkeypatch.setattr(_os, "fsync",
+                        lambda fd: (order.append("fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(_os, "replace",
+                        lambda a, b: (order.append("replace"), real_replace(a, b))[1])
+    assert store.add_fact("1001", "Likes tea")
+    assert order == ["fsync", "replace"]
+    assert store.get("1001")["facts"] == ["Likes tea"]
