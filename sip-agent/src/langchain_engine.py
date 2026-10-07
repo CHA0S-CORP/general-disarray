@@ -24,6 +24,8 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
+import httpx
+
 try:
     from langchain_core.messages import (AIMessage, HumanMessage,
                                          SystemMessage, ToolMessage)
@@ -71,10 +73,20 @@ class LangChainEngine(LLMEngine):
         super().__init__(config, tool_manager)
         self._agent = None
         self._chat = None
+        # The agent's own async HTTP client. langchain-openai >= 1.5 otherwise
+        # shares an lru_cache'd module-level client, which stays bound to the
+        # first event loop that used it ("Event loop is closed" afterwards).
+        self._http_client: Optional[httpx.AsyncClient] = None
         self._lc_tools: List[Any] = []
         # Whether the backend accepts tool_choice="required"; probed once,
         # cached so a vLLM that rejects it costs a single failed request.
         self._tool_choice_supported = True
+
+    async def stop(self):
+        if self._http_client is not None:
+            await self._http_client.aclose()
+            self._http_client = None
+        await super().stop()
 
     def _clock_paused(self) -> bool:
         """True while a tool is waiting on the caller (keypad entry): that wait
@@ -128,6 +140,8 @@ class LangChainEngine(LLMEngine):
             "top_p": self.config.llm_top_p,
             "timeout": 60.0,
         }
+        self._http_client = httpx.AsyncClient(timeout=60.0)
+        chat_kwargs["http_async_client"] = self._http_client
         if self.config.llm_frequency_penalty:
             chat_kwargs["frequency_penalty"] = self.config.llm_frequency_penalty
         # Same per-request thinking switch the classic engine sends
